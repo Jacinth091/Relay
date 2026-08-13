@@ -3,12 +3,18 @@
 //! Presentation-framework types do not belong in this crate.
 
 mod project_registry;
+mod repository_safety;
 
 use std::path::Path;
 
 pub use project_registry::{
     ExpectedRemote, GitHubRepositoryMetadata, ProjectKey, ProjectRegistry, ProjectRegistryError,
     RegisterProject, TrustedProject, default_config_path,
+};
+pub use repository_safety::{
+    BranchState, GitInspectionOperation, NormalizedRemote, RepositoryEligibility,
+    RepositoryInspection, RepositorySafetyFailure, RepositoryStatus,
+    inspect_trusted_project_repository,
 };
 
 /// Minimal Relay application state.
@@ -55,6 +61,14 @@ impl Relay {
         key: impl AsRef<str>,
     ) -> Result<&TrustedProject, ProjectRegistryError> {
         self.project_registry.get(key)
+    }
+
+    pub fn inspect_project_repository(
+        &self,
+        key: impl AsRef<str>,
+    ) -> Result<RepositoryInspection, ProjectRegistryError> {
+        let project = self.resolve_project(key)?;
+        Ok(inspect_trusted_project_repository(project))
     }
 
     pub fn register_project(

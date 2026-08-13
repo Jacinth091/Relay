@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://relay.local/schemas/clarification-request-v1.schema.json",
+  "title": "Relay Clarification or Decision Request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "request_id",
+    "task_id",
+    "execution_id",
+    "kind",
+    "summary",
+    "blocking_reason",
+    "question",
+    "resume_point"
+  ],
+  "properties": {
+    "protocol_version": {
+      "const": 1
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "execution_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "needs_clarification",
+        "needs_decision"
+      ]
+    },
+    "category": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "work_attempted": {
+      "type": "string"
+    },
+    "work_completed": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "blocking_reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "question": {
+      "type": "string",
+      "minLength": 1
+    },
+    "options": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "label"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "benefits": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "costs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "executor_assessment": {
+      "type": "string"
+    },
+    "repository_state": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "verification_state": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "resume_point": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://relay.local/schemas/resolution-packet-v1.schema.json",
+  "title": "Relay Resolution Packet v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "resolution_id",
+    "request_id",
+    "task_id",
+    "decision",
+    "implementation_direction",
+    "work_disposition"
+  ],
+  "properties": {
+    "protocol_version": {
+      "const": 1
+    },
+    "resolution_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "decision": {
+      "type": "string",
+      "minLength": 1
+    },
+    "rationale": {
+      "type": "string"
+    },
+    "implementation_direction": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "scope": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "work_disposition": {
+      "type": "string",
+      "enum": [
+        "keep_and_continue",
+        "revise_existing_work",
+        "restart_execution",
+        "revert_partial_work",
+        "cancel_task"
+      ]
+    }
+  }
+}

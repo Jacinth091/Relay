@@ -1,0 +1,32 @@
+{
+  "protocol_version": 1,
+  "project": "example-project",
+  "title": "Implement an approved change",
+  "stack": "chatgpt-codex",
+  "source": {
+    "kind": "conversational_ai",
+    "provider": "openai"
+  },
+  "task": {
+    "goal": "Implement the behavior approved during planning.",
+    "requirements": [
+      "Preserve existing behavior outside the requested change."
+    ],
+    "constraints": [
+      "Do not redesign unrelated modules.",
+      "Do not push automatically."
+    ],
+    "verification": [
+      "Run relevant tests.",
+      "Run type checking or equivalent validation."
+    ]
+  },
+  "ambiguity_policy": "needs_input",
+  "extensions": {
+    "openai": {
+      "codex": {
+        "use_project_skills": true
+      }
+    }
+  }
+}

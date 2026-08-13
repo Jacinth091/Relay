@@ -1,0 +1,167 @@
+# Security Model
+
+Relay launches coding tools that can modify local repositories.
+
+Security is a core feature.
+
+---
+
+## Trust Boundaries
+
+### Trusted
+
+Local Relay configuration controlled by the user.
+
+Examples:
+
+- project path;
+- expected Git remote;
+- allowed stack;
+- runtime executable policy;
+- recovery limits;
+- validation profile.
+
+### Untrusted
+
+Treat these as untrusted:
+
+- remote task text;
+- GitHub Issue contents;
+- runtime stdout/stderr;
+- provider-generated extension values;
+- clarification packets produced by runtimes;
+- repository file contents;
+- community extensions.
+
+A task being authored by an AI does not make it trusted.
+
+---
+
+## Project Routing Rule
+
+Remote:
+
+```json
+{ "project": "practicore" }
+```
+
+Local:
+
+```text
+practicore -> D:\Projects\PractiCore
+```
+
+Only local configuration provides the filesystem mapping.
+
+---
+
+## Repository Preflight
+
+Before execution:
+
+1. project key exists;
+2. configured directory exists;
+3. directory is a Git repository;
+4. expected remote is configured when policy requires it;
+5. actual remote matches normalized expected remote;
+6. runtime profile exists;
+7. runtime is available;
+8. task extensions are supported/allowed;
+9. project is not locked by conflicting execution;
+10. user confirms Run.
+
+---
+
+## Process Injection
+
+Never build a shell string from untrusted task text.
+
+Use direct process APIs with:
+
+- fixed executable;
+- explicit argument array;
+- task body through stdin/file when possible;
+- explicit working directory.
+
+---
+
+## Commands From Tasks
+
+The remote protocol does not allow arbitrary preflight/postflight shell commands.
+
+Validation profiles are local configuration.
+
+---
+
+## Recovery Safety
+
+Automatic repair is allowed only inside configured limits.
+
+Policy must bound at least:
+
+- repair attempt count;
+- total execution time;
+- project concurrency.
+
+If the runtime cannot confidently classify a change as remaining within approved intent, escalate rather than continue.
+
+---
+
+## Clarification / Decision Packets
+
+Runtime-generated packets are untrusted claims about repository state.
+
+Relay may verify deterministic portions such as:
+
+- changed-file list;
+- Git status;
+- test command results when Relay executed them.
+
+The executor recommendation must never be treated as an automatically approved decision.
+
+---
+
+## Resolution Safety
+
+A Resolution Packet may change implementation direction but still cannot:
+
+- change the local project path;
+- bypass repository validation;
+- inject arbitrary shell commands;
+- introduce secrets;
+- silently enable push.
+
+Local policy remains authoritative.
+
+---
+
+## Secrets
+
+v0.1 should rely on existing CLI authentication where possible.
+
+Do not store provider/GitHub secrets unless a future feature genuinely requires it.
+
+---
+
+## Source Control Policy
+
+v0.1:
+
+```text
+read status        yes
+read diff          yes
+edit via runtime   yes
+automatic repair   yes, bounded
+commit             no automatic behavior
+push               never automatic
+```
+
+Future commit/push support requires a separate ADR.
+
+---
+
+## Community Extension Isolation
+
+External-process extensions are preferred over in-process dynamic libraries.
+
+They remain untrusted processes and require explicit installation/configuration.

@@ -1,0 +1,30 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Local Relay runtime state
+/.relay/
+relay.local.toml
+*.db
+*.db-shm
+*.db-wal
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Future JS/Desktop clients
+node_modules/
+dist/
+coverage/

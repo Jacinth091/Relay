@@ -1,0 +1,3 @@
+interface:
+  display_name: "Relay Handoff"
+  short_description: "Send approved coding work to Relay or resolve Relay blockers"

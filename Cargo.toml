@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "apps/relay-tui",
+    "crates/relay-core",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+repository = "https://github.com/Jacinth091/Relay"
+publish = false

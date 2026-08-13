@@ -3,18 +3,31 @@
 //! Presentation-framework types do not belong in this crate.
 
 mod project_registry;
+mod repository_safety;
+mod task_ingress;
 
 use std::path::Path;
+
+pub use relay_protocol::{AmbiguityPolicy, HandoffTask};
 
 pub use project_registry::{
     ExpectedRemote, GitHubRepositoryMetadata, ProjectKey, ProjectRegistry, ProjectRegistryError,
     RegisterProject, TrustedProject, default_config_path,
+};
+pub use repository_safety::{
+    BranchState, GitInspectionOperation, NormalizedRemote, RepositoryEligibility,
+    RepositoryInspection, RepositorySafetyFailure, RepositoryStatus,
+    inspect_trusted_project_repository,
+};
+pub use task_ingress::{
+    ImportedTask, SubmissionTransport, TaskId, TaskImportCandidate, TaskIngressError,
 };
 
 /// Minimal Relay application state.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Relay {
     project_registry: ProjectRegistry,
+    reviewed_task: Option<ImportedTask>,
 }
 
 impl Relay {
@@ -25,7 +38,10 @@ impl Relay {
 
     /// Creates Relay from an already validated project registry.
     pub fn with_project_registry(project_registry: ProjectRegistry) -> Self {
-        Self { project_registry }
+        Self {
+            project_registry,
+            reviewed_task: None,
+        }
     }
 
     /// Loads Relay's trusted local project registry from a TOML config path.
@@ -55,6 +71,14 @@ impl Relay {
         key: impl AsRef<str>,
     ) -> Result<&TrustedProject, ProjectRegistryError> {
         self.project_registry.get(key)
+    }
+
+    pub fn inspect_project_repository(
+        &self,
+        key: impl AsRef<str>,
+    ) -> Result<RepositoryInspection, ProjectRegistryError> {
+        let project = self.resolve_project(key)?;
+        Ok(inspect_trusted_project_repository(project))
     }
 
     pub fn register_project(

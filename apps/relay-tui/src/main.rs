@@ -7,7 +7,10 @@ use std::{
 };
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -53,7 +56,8 @@ fn initialize_terminal() -> Result<Tui, Box<dyn Error>> {
     enable_raw_mode()?;
 
     let mut stdout = io::stdout();
-    if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
+        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
         let _ = disable_raw_mode();
         return Err(error.into());
     }
@@ -63,7 +67,7 @@ fn initialize_terminal() -> Result<Tui, Box<dyn Error>> {
         Ok(terminal) => Ok(terminal),
         Err(error) => {
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
             Err(error.into())
         }
     }
@@ -71,11 +75,15 @@ fn initialize_terminal() -> Result<Tui, Box<dyn Error>> {
 
 fn restore_terminal(terminal: &mut Tui) -> Result<(), Box<dyn Error>> {
     let raw_mode_result = disable_raw_mode();
-    let alternate_screen_result = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let terminal_modes_result = execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    );
     let cursor_result = terminal.show_cursor();
 
     raw_mode_result?;
-    alternate_screen_result?;
+    terminal_modes_result?;
     cursor_result?;
     Ok(())
 }
@@ -493,11 +501,11 @@ fn task_preview_text(candidate: &TaskImportCandidate) -> String {
     format!(
         "Task ID: created after Import\n{}\n\nSubmission transport: {:?}\nValidation: VALID\n\nActions: Import / Cancel",
         handoff_summary_text(
-            &candidate.handoff,
-            candidate.project_key.as_str(),
-            candidate.project_name.as_deref()
+            candidate.handoff(),
+            candidate.project_key().as_str(),
+            candidate.project_name()
         ),
-        candidate.submission_transport
+        candidate.submission_transport()
     )
 }
 
@@ -947,6 +955,43 @@ mod tests {
     }
 
     #[test]
+    fn multiline_json_paste_event_waits_for_explicit_validation() {
+        let mut state = app_state_with_project();
+
+        state.start_paste_task();
+        handle_event(&mut state, Event::Paste(task_json())).unwrap();
+
+        assert_eq!(state.screen, Screen::PasteTask);
+        assert!(state.task_candidate.is_none());
+        assert!(state.relay.reviewed_task().is_none());
+
+        state.submit_paste_task();
+
+        assert_eq!(state.screen, Screen::TaskPreview);
+        assert!(state.task_candidate.is_some());
+    }
+
+    #[test]
+    fn multiline_markdown_paste_event_waits_for_explicit_validation() {
+        let mut state = app_state_with_project();
+
+        state.start_paste_task();
+        handle_event(&mut state, Event::Paste(task_markdown())).unwrap();
+
+        assert_eq!(state.screen, Screen::PasteTask);
+        assert!(state.task_candidate.is_none());
+        assert!(state.relay.reviewed_task().is_none());
+
+        state.submit_paste_task();
+
+        assert_eq!(state.screen, Screen::TaskPreview);
+        assert!(
+            task_preview_text(state.task_candidate.as_ref().unwrap())
+                .contains("Implement local ingress")
+        );
+    }
+
+    #[test]
     fn file_import_validation_error_is_visible() {
         let mut state = app_state_with_project();
 
@@ -1065,6 +1110,13 @@ mod tests {
             "ambiguity_policy": "needs_clarification"
         }"#
         .to_owned()
+    }
+
+    fn task_markdown() -> String {
+        format!(
+            "# Presentation title ignored\n\n<!-- relay:task:start -->\n```json\n{}\n```\n<!-- relay:task:end -->",
+            task_json()
+        )
     }
 
     fn unique_temp_path(name: &str) -> PathBuf {

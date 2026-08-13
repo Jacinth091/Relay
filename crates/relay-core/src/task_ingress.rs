@@ -41,10 +41,28 @@ pub enum SubmissionTransport {
 /// Validated task ready for user confirmation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskImportCandidate {
-    pub handoff: HandoffTask,
-    pub project_key: ProjectKey,
-    pub project_name: Option<String>,
-    pub submission_transport: SubmissionTransport,
+    handoff: HandoffTask,
+    project_key: ProjectKey,
+    project_name: Option<String>,
+    submission_transport: SubmissionTransport,
+}
+
+impl TaskImportCandidate {
+    pub fn handoff(&self) -> &HandoffTask {
+        &self.handoff
+    }
+
+    pub fn project_key(&self) -> &ProjectKey {
+        &self.project_key
+    }
+
+    pub fn project_name(&self) -> Option<&str> {
+        self.project_name.as_deref()
+    }
+
+    pub fn submission_transport(&self) -> SubmissionTransport {
+        self.submission_transport
+    }
 }
 
 /// Reviewable in-memory task created after explicit import confirmation.
@@ -195,10 +213,10 @@ mod tests {
 
         let candidate = relay.preview_local_paste(TASK_JSON).unwrap();
 
-        assert_eq!(candidate.project_key.as_str(), "relay");
-        assert_eq!(candidate.project_name.as_deref(), Some("Relay"));
+        assert_eq!(candidate.project_key().as_str(), "relay");
+        assert_eq!(candidate.project_name(), Some("Relay"));
         assert_eq!(
-            candidate.submission_transport,
+            candidate.submission_transport(),
             SubmissionTransport::LocalPaste
         );
     }
@@ -208,7 +226,7 @@ mod tests {
         let relay = relay_with_project("relay");
         let candidate = relay.preview_local_paste(TASK_JSON).unwrap();
 
-        assert_eq!(candidate.project_key.as_str(), "relay");
+        assert_eq!(candidate.project_key().as_str(), "relay");
     }
 
     #[test]
@@ -264,9 +282,12 @@ mod tests {
     fn local_file_and_paste_provenance_remain_distinct_from_source() {
         let mut relay = relay_with_project("relay");
         let paste = relay.preview_local_paste(TASK_JSON).unwrap();
-        assert_eq!(paste.submission_transport, SubmissionTransport::LocalPaste);
         assert_eq!(
-            paste.handoff.source.as_ref().unwrap().provider,
+            paste.submission_transport(),
+            SubmissionTransport::LocalPaste
+        );
+        assert_eq!(
+            paste.handoff().source.as_ref().unwrap().provider,
             "openai".to_owned()
         );
 
@@ -274,7 +295,7 @@ mod tests {
         fs::write(&file, TASK_JSON).unwrap();
         let file_candidate = relay.preview_local_file(&file).unwrap();
         assert_eq!(
-            file_candidate.submission_transport,
+            file_candidate.submission_transport(),
             SubmissionTransport::LocalFile
         );
 
@@ -299,7 +320,7 @@ mod tests {
 
         let candidate = relay.preview_local_paste(&json).unwrap();
 
-        assert_eq!(candidate.project_key.as_str(), "relay");
+        assert_eq!(candidate.project_key().as_str(), "relay");
     }
 
     #[test]
@@ -316,8 +337,8 @@ mod tests {
 
         let candidate = relay.preview_local_file(&file).unwrap();
 
-        assert_eq!(candidate.handoff.title, "Implement local ingress");
-        assert_eq!(candidate.project_key.as_str(), "relay");
+        assert_eq!(candidate.handoff().title, "Implement local ingress");
+        assert_eq!(candidate.project_key().as_str(), "relay");
     }
 
     #[test]
@@ -326,7 +347,7 @@ mod tests {
 
         let candidate = relay.preview_local_paste(TASK_JSON).unwrap();
 
-        assert_eq!(candidate.project_key.as_str(), "relay");
+        assert_eq!(candidate.project_key().as_str(), "relay");
         assert!(relay.inspect_project_repository("relay").is_ok());
     }
 

@@ -22,14 +22,18 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let config_path = default_config_path();
-    let (relay, feedback) = match Relay::load_from_config_path(&config_path) {
-        Ok(relay) => (relay, format!("Config: {}", config_path.display())),
+    let (relay, registry_writable, feedback) = match Relay::load_from_config_path(&config_path) {
+        Ok(relay) => (relay, true, format!("Config: {}", config_path.display())),
         Err(error) => (
             Relay::new(),
-            format!("Config error at {}: {error}", config_path.display()),
+            false,
+            format!(
+                "Config error at {}: {error}\nProject registration is disabled until the config is fixed.",
+                config_path.display()
+            ),
         ),
     };
-    let mut state = AppState::new(relay, config_path, feedback);
+    let mut state = AppState::new(relay, config_path, registry_writable, feedback);
     let mut terminal = initialize_terminal()?;
 
     let run_result = run(&mut terminal, &mut state);
@@ -167,7 +171,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn Error
                 Ok(false)
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                state.start_add_project();
+                state.try_start_add_project();
                 Ok(false)
             }
             _ => Ok(false),
@@ -179,7 +183,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn Error
                 Ok(false)
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                state.start_add_project();
+                state.try_start_add_project();
                 Ok(false)
             }
             _ => Ok(false),
@@ -238,8 +242,14 @@ fn project_listing(relay: &Relay, feedback: &str) -> String {
 
 fn help_text(state: &AppState) -> &'static str {
     match state.screen {
-        Screen::Dashboard => "P: projects  A: add project  Q / Esc: quit",
-        Screen::Projects => "A: add project  D / Esc: dashboard  Q: quit",
+        Screen::Dashboard if state.registry_writable => {
+            "P: projects  A: add project  Q / Esc: quit"
+        }
+        Screen::Dashboard => "P: projects  Q / Esc: quit",
+        Screen::Projects if state.registry_writable => {
+            "A: add project  D / Esc: dashboard  Q: quit"
+        }
+        Screen::Projects => "D / Esc: dashboard  Q: quit",
         Screen::AddProject => "Tab: next field  Enter: register  Esc: projects",
     }
 }
@@ -253,6 +263,7 @@ fn add_field_line(state: &AppState, field: AddProjectField, label: &str, value: 
 struct AppState {
     relay: Relay,
     config_path: PathBuf,
+    registry_writable: bool,
     screen: Screen,
     add_project: AddProjectForm,
     add_field: AddProjectField,
@@ -260,14 +271,24 @@ struct AppState {
 }
 
 impl AppState {
-    fn new(relay: Relay, config_path: PathBuf, feedback: String) -> Self {
+    fn new(relay: Relay, config_path: PathBuf, registry_writable: bool, feedback: String) -> Self {
         Self {
             relay,
             config_path,
+            registry_writable,
             screen: Screen::Dashboard,
             add_project: AddProjectForm::default(),
             add_field: AddProjectField::Key,
             feedback,
+        }
+    }
+
+    fn try_start_add_project(&mut self) {
+        if self.registry_writable {
+            self.start_add_project();
+        } else {
+            self.feedback =
+                "Project registration is disabled until the config is fixed.".to_owned();
         }
     }
 
@@ -290,6 +311,12 @@ impl AppState {
     }
 
     fn submit_add_project(&mut self) -> Result<(), Box<dyn Error>> {
+        if !self.registry_writable {
+            self.feedback =
+                "Project registration is disabled until the config is fixed.".to_owned();
+            return Ok(());
+        }
+
         let github = self.add_project.github_metadata()?;
         let request = RegisterProject {
             key: self.add_project.key.clone(),
@@ -418,6 +445,10 @@ fn non_empty_field(value: &str) -> Option<String> {
 mod tests {
     use super::*;
     use relay_core::ProjectRegistry;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn empty_relay_maps_to_expected_dashboard_message() {
@@ -449,5 +480,44 @@ mod tests {
         assert!(listing.contains("relay (Relay)"));
         assert!(listing.contains("https://github.com/Jacinth091/Relay.git"));
         assert!(listing.contains("chatgpt-codex"));
+    }
+
+    #[test]
+    fn add_project_does_not_overwrite_invalid_existing_config() {
+        let config_path = unique_temp_path("invalid-existing-config").join("config.toml");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let invalid_config = "[projects.relay";
+        fs::write(&config_path, invalid_config).unwrap();
+
+        let mut state = AppState::new(
+            Relay::new(),
+            config_path.clone(),
+            false,
+            "Config error".to_owned(),
+        );
+        state.add_project = AddProjectForm {
+            key: "relay".to_owned(),
+            path: std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            expected_remote: String::new(),
+            default_stack: "chatgpt-codex".to_owned(),
+            github_owner: String::new(),
+            github_repo: String::new(),
+        };
+
+        state.submit_add_project().unwrap();
+
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), invalid_config);
+        assert!(state.feedback.contains("registration is disabled"));
+    }
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("relay-tui-{name}-{nanos}"))
     }
 }

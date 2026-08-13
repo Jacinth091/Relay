@@ -11,4 +11,6 @@ name = "relay"
 path = "src/main.rs"
 
 [dependencies]
+crossterm = "0.28.1"
+ratatui = "0.29.0"
 relay-core = { path = "../../crates/relay-core" }

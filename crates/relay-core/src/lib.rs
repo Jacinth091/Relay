@@ -1,13 +1,20 @@
 //! Provider-agnostic Relay core.
 //!
-//! M1 introduces only the minimal application state needed by the first
-//! presentation client. Presentation-framework types do not belong in this
-//! crate.
+//! Presentation-framework types do not belong in this crate.
+
+mod project_registry;
+
+use std::path::Path;
+
+pub use project_registry::{
+    ExpectedRemote, GitHubRepositoryMetadata, ProjectKey, ProjectRegistry, ProjectRegistryError,
+    RegisterProject, TrustedProject, default_config_path,
+};
 
 /// Minimal Relay application state.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Relay {
-    configured_projects: usize,
+    project_registry: ProjectRegistry,
 }
 
 impl Relay {
@@ -16,12 +23,52 @@ impl Relay {
         Self::default()
     }
 
+    /// Creates Relay from an already validated project registry.
+    pub fn with_project_registry(project_registry: ProjectRegistry) -> Self {
+        Self { project_registry }
+    }
+
+    /// Loads Relay's trusted local project registry from a TOML config path.
+    pub fn load_from_config_path(path: impl AsRef<Path>) -> Result<Self, ProjectRegistryError> {
+        Ok(Self::with_project_registry(ProjectRegistry::load(path)?))
+    }
+
     /// Returns the number of configured projects currently visible to Relay.
-    ///
-    /// M1 intentionally provides no project loading or mutation behavior; that
-    /// belongs to the Project Registry milestone.
     pub fn configured_project_count(&self) -> usize {
-        self.configured_projects
+        self.project_registry.len()
+    }
+
+    pub fn project_registry(&self) -> &ProjectRegistry {
+        &self.project_registry
+    }
+
+    pub fn project_registry_mut(&mut self) -> &mut ProjectRegistry {
+        &mut self.project_registry
+    }
+
+    pub fn list_projects(&self) -> impl ExactSizeIterator<Item = &TrustedProject> {
+        self.project_registry.list()
+    }
+
+    pub fn resolve_project(
+        &self,
+        key: impl AsRef<str>,
+    ) -> Result<&TrustedProject, ProjectRegistryError> {
+        self.project_registry.get(key)
+    }
+
+    pub fn register_project(
+        &mut self,
+        request: RegisterProject,
+    ) -> Result<&TrustedProject, ProjectRegistryError> {
+        self.project_registry.register(request)
+    }
+
+    pub fn save_project_registry(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<(), ProjectRegistryError> {
+        self.project_registry.save(path)
     }
 }
 

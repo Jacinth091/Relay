@@ -1,4 +1,6 @@
 use std::{
+    env,
+    ffi::OsStr,
     fmt, io,
     path::{Path, PathBuf},
     process::Command,
@@ -7,6 +9,15 @@ use std::{
 use crate::{ProjectKey, TrustedProject};
 
 const DEFAULT_REMOTE_NAME: &str = "origin";
+const GIT_REPOSITORY_SELECTION_ENV: [&str; 6] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+];
+const GIT_CONFIG_INJECTION_ENV: [&str; 2] = ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"];
 
 /// Read-only repository preflight result for a trusted Relay project.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,11 +161,18 @@ pub enum BranchState {
 }
 
 pub fn inspect_trusted_project_repository(project: &TrustedProject) -> RepositoryInspection {
+    inspect_trusted_project_repository_with_env(project, &[])
+}
+
+fn inspect_trusted_project_repository_with_env(
+    project: &TrustedProject,
+    env_overrides: &[(&str, &OsStr)],
+) -> RepositoryInspection {
     if let Err(reason) = ensure_git_available() {
         return RepositoryInspection::not_eligible(project, reason);
     }
 
-    if let Err(reason) = ensure_worktree(project.local_path()) {
+    if let Err(reason) = ensure_worktree(project.local_path(), env_overrides) {
         return RepositoryInspection::not_eligible(project, reason);
     }
 
@@ -180,7 +198,8 @@ pub fn inspect_trusted_project_repository(project: &TrustedProject) -> Repositor
     let actual_remote = match git_output(
         Some(project.local_path()),
         GitInspectionOperation::RemoteUrl,
-        ["config", "--get", "remote.origin.url"],
+        ["config", "--local", "--get", "remote.origin.url"],
+        env_overrides,
     ) {
         Ok(remote) if !remote.trim().is_empty() => remote,
         Ok(_) | Err(GitOutputError::CommandFailed { .. }) => {
@@ -226,7 +245,7 @@ pub fn inspect_trusted_project_repository(project: &TrustedProject) -> Repositor
         );
     }
 
-    let status = match inspect_status(project.local_path()) {
+    let status = match inspect_status(project.local_path(), env_overrides) {
         Ok(status) => status,
         Err(reason) => {
             return RepositoryInspection::not_eligible_with_remotes(
@@ -242,7 +261,7 @@ pub fn inspect_trusted_project_repository(project: &TrustedProject) -> Repositor
 }
 
 fn ensure_git_available() -> Result<(), RepositorySafetyFailure> {
-    let output = git_output(None, GitInspectionOperation::Version, ["--version"])
+    let output = git_output(None, GitInspectionOperation::Version, ["--version"], &[])
         .map_err(|_| RepositorySafetyFailure::GitUnavailable)?;
 
     if output.starts_with("git version ") {
@@ -252,11 +271,15 @@ fn ensure_git_available() -> Result<(), RepositorySafetyFailure> {
     }
 }
 
-fn ensure_worktree(path: &Path) -> Result<(), RepositorySafetyFailure> {
+fn ensure_worktree(
+    path: &Path,
+    env_overrides: &[(&str, &OsStr)],
+) -> Result<(), RepositorySafetyFailure> {
     match git_output(
         Some(path),
         GitInspectionOperation::WorktreeCheck,
         ["rev-parse", "--is-inside-work-tree"],
+        env_overrides,
     ) {
         Ok(output) if output == "true" => Ok(()),
         Ok(output) if output == "false" => Err(RepositorySafetyFailure::NotGitWorktree),
@@ -269,11 +292,15 @@ fn ensure_worktree(path: &Path) -> Result<(), RepositorySafetyFailure> {
     }
 }
 
-fn inspect_status(path: &Path) -> Result<RepositoryStatus, RepositorySafetyFailure> {
+fn inspect_status(
+    path: &Path,
+    env_overrides: &[(&str, &OsStr)],
+) -> Result<RepositoryStatus, RepositorySafetyFailure> {
     let branch = git_output(
         Some(path),
         GitInspectionOperation::BranchName,
         ["branch", "--show-current"],
+        env_overrides,
     )
     .map_err(|error| error.into_failure(GitInspectionOperation::BranchName))?;
 
@@ -282,6 +309,7 @@ fn inspect_status(path: &Path) -> Result<RepositoryStatus, RepositorySafetyFailu
             Some(path),
             GitInspectionOperation::HeadCommit,
             ["rev-parse", "--short", "HEAD"],
+            env_overrides,
         )
         .map_err(|error| error.into_failure(GitInspectionOperation::HeadCommit))?;
         if commit.is_empty() || commit.chars().any(char::is_whitespace) {
@@ -298,7 +326,15 @@ fn inspect_status(path: &Path) -> Result<RepositoryStatus, RepositorySafetyFailu
     let porcelain = git_output(
         Some(path),
         GitInspectionOperation::StatusPorcelain,
-        ["status", "--porcelain=v1", "--untracked-files=all"],
+        [
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ],
+        env_overrides,
     )
     .map_err(|error| error.into_failure(GitInspectionOperation::StatusPorcelain))?;
 
@@ -422,6 +458,7 @@ fn git_output<const N: usize>(
     path: Option<&Path>,
     _operation: GitInspectionOperation,
     args: [&str; N],
+    env_overrides: &[(&str, &OsStr)],
 ) -> Result<String, GitOutputError> {
     let mut command = Command::new("git");
 
@@ -429,6 +466,10 @@ fn git_output<const N: usize>(
         command.arg("-C").arg(path);
     }
     command.args(args);
+    for (key, value) in env_overrides {
+        command.env(key, value);
+    }
+    sanitize_git_environment(&mut command);
 
     let output = command.output().map_err(GitOutputError::Io)?;
     if !output.status.success() {
@@ -440,6 +481,36 @@ fn git_output<const N: usize>(
     String::from_utf8(output.stdout)
         .map(|output| output.trim().to_owned())
         .map_err(|_| GitOutputError::MalformedUtf8)
+}
+
+fn sanitize_git_environment(command: &mut Command) {
+    for key in GIT_REPOSITORY_SELECTION_ENV {
+        command.env_remove(key);
+    }
+    for key in git_config_injection_env_keys() {
+        command.env_remove(key);
+    }
+}
+
+fn git_config_injection_env_keys() -> impl Iterator<Item = String> {
+    let fixed = GIT_CONFIG_INJECTION_ENV
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let indexed = env::vars_os().filter_map(|(key, _)| {
+        let key = key.to_string_lossy().into_owned();
+        let upper = key.to_ascii_uppercase();
+        (upper.starts_with("GIT_CONFIG_KEY_") || upper.starts_with("GIT_CONFIG_VALUE_"))
+            .then_some(key)
+    });
+    let bounded_slots = (0..256).flat_map(|slot| {
+        [
+            format!("GIT_CONFIG_KEY_{slot}"),
+            format!("GIT_CONFIG_VALUE_{slot}"),
+        ]
+    });
+
+    fixed.into_iter().chain(bounded_slots).chain(indexed)
 }
 
 #[cfg(test)]
@@ -520,6 +591,85 @@ mod tests {
             RepositoryEligibility::NotEligible(RepositorySafetyFailure::MissingRemote {
                 name: "origin".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn global_origin_remote_does_not_satisfy_missing_local_origin() {
+        let repo = temp_git_repo("global-origin-ignored");
+        commit_empty(&repo);
+        let global_config = temp_dir("global-config").join("gitconfig");
+        fs::write(
+            &global_config,
+            format!("[remote \"origin\"]\n    url = {EXPECTED_HTTPS}\n"),
+        )
+        .unwrap();
+
+        let overrides = [("GIT_CONFIG_GLOBAL", global_config.as_os_str())];
+        let inspection = inspect_project_with_env(&repo, Some(EXPECTED_HTTPS), &overrides);
+
+        assert_eq!(
+            inspection.eligibility,
+            RepositoryEligibility::NotEligible(RepositorySafetyFailure::MissingRemote {
+                name: "origin".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn command_scope_config_cannot_inject_origin_remote() {
+        let repo = temp_git_repo("command-config-ignored");
+        commit_empty(&repo);
+        let overrides = [
+            ("GIT_CONFIG_COUNT", OsStr::new("1")),
+            ("GIT_CONFIG_KEY_0", OsStr::new("remote.origin.url")),
+            ("GIT_CONFIG_VALUE_0", OsStr::new(EXPECTED_HTTPS)),
+        ];
+
+        let inspection = inspect_project_with_env(&repo, Some(EXPECTED_HTTPS), &overrides);
+
+        assert_eq!(
+            inspection.eligibility,
+            RepositoryEligibility::NotEligible(RepositorySafetyFailure::MissingRemote {
+                name: "origin".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn inherited_repository_selection_env_cannot_redirect_inspection() {
+        let trusted = temp_git_repo("trusted-env-target");
+        git(
+            &trusted,
+            [
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/Jacinth091/Wrong.git",
+            ],
+        );
+        commit_empty(&trusted);
+        let attacker = temp_git_repo("attacker-env-target");
+        git(&attacker, ["remote", "add", "origin", EXPECTED_HTTPS]);
+        commit_empty(&attacker);
+        let attacker_git_dir = attacker.join(".git");
+        let attacker_index = attacker_git_dir.join("index");
+        let overrides = [
+            ("GIT_DIR", attacker_git_dir.as_os_str()),
+            ("GIT_WORK_TREE", attacker.as_os_str()),
+            ("GIT_COMMON_DIR", attacker_git_dir.as_os_str()),
+            ("GIT_INDEX_FILE", attacker_index.as_os_str()),
+        ];
+
+        let inspection = inspect_project_with_env(&trusted, Some(EXPECTED_HTTPS), &overrides);
+
+        assert!(matches!(
+            inspection.eligibility,
+            RepositoryEligibility::NotEligible(RepositorySafetyFailure::RemoteMismatch { .. })
+        ));
+        assert_eq!(
+            inspection.normalized_actual_remote.unwrap().identity(),
+            "github.com/jacinth091/wrong"
         );
     }
 
@@ -708,6 +858,43 @@ mod tests {
     }
 
     #[test]
+    fn status_inspection_does_not_refresh_index_bytes() {
+        let repo = temp_git_repo("status-index-read-only");
+        git(&repo, ["remote", "add", "origin", EXPECTED_HTTPS]);
+        fs::write(repo.join("tracked.txt"), "before").unwrap();
+        git(&repo, ["add", "tracked.txt"]);
+        commit_with_message(&repo, "tracked");
+        fs::write(repo.join("tracked.txt"), "after").unwrap();
+        let index = repo.join(".git").join("index");
+        let before = fs::read(&index).unwrap();
+
+        let inspection = inspect_project(&repo, Some(EXPECTED_HTTPS));
+
+        assert!(inspection.is_eligible());
+        assert!(!inspection.status.unwrap().clean);
+        assert_eq!(fs::read(&index).unwrap(), before);
+    }
+
+    #[test]
+    fn repository_configured_fsmonitor_is_not_executed() {
+        let repo = temp_git_repo("fsmonitor-disabled");
+        git(&repo, ["remote", "add", "origin", EXPECTED_HTTPS]);
+        commit_empty(&repo);
+        let marker = repo.join("fsmonitor-ran.txt");
+        let hook = write_fsmonitor_hook(&repo, &marker);
+        let hook_value = hook.to_string_lossy().into_owned();
+        git(&repo, ["config", "core.fsmonitor", &hook_value]);
+
+        let inspection = inspect_project(&repo, Some(EXPECTED_HTTPS));
+
+        assert!(inspection.is_eligible());
+        assert!(
+            !marker.exists(),
+            "fsmonitor hook marker should not be created"
+        );
+    }
+
+    #[test]
     fn non_github_path_case_is_preserved() {
         let upper = normalize_remote("https://git.example.test/Team/Relay.git").unwrap();
         let lower = normalize_remote("https://git.example.test/team/relay.git").unwrap();
@@ -717,6 +904,14 @@ mod tests {
     }
 
     fn inspect_project(path: &Path, expected_remote: Option<&str>) -> RepositoryInspection {
+        inspect_project_with_env(path, expected_remote, &[])
+    }
+
+    fn inspect_project_with_env(
+        path: &Path,
+        expected_remote: Option<&str>,
+        env_overrides: &[(&str, &OsStr)],
+    ) -> RepositoryInspection {
         let mut registry = ProjectRegistry::empty();
         registry
             .register(RegisterProject {
@@ -730,7 +925,7 @@ mod tests {
             .unwrap();
         let project = registry.get("relay").unwrap();
 
-        inspect_trusted_project_repository(project)
+        inspect_trusted_project_repository_with_env(project, env_overrides)
     }
 
     fn temp_git_repo(name: &str) -> PathBuf {
@@ -754,6 +949,10 @@ mod tests {
     }
 
     fn commit_empty(repo: &Path) {
+        commit_with_message(repo, "initial");
+    }
+
+    fn commit_with_message(repo: &Path, message: &str) {
         git(
             repo,
             [
@@ -764,9 +963,38 @@ mod tests {
                 "commit",
                 "--allow-empty",
                 "-m",
-                "initial",
+                message,
             ],
         );
+    }
+
+    fn write_fsmonitor_hook(repo: &Path, marker: &Path) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let hook = repo.join("fsmonitor.cmd");
+            fs::write(
+                &hook,
+                format!("@echo off\r\necho ran>\"{}\"\r\n", marker.display()),
+            )
+            .unwrap();
+            hook
+        }
+
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let hook = repo.join("fsmonitor.sh");
+            fs::write(
+                &hook,
+                format!("#!/bin/sh\nprintf ran > '{}'\n", marker.display()),
+            )
+            .unwrap();
+            let mut permissions = fs::metadata(&hook).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&hook, permissions).unwrap();
+            hook
+        }
     }
 
     fn current_branch(repo: &Path) -> String {

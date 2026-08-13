@@ -63,12 +63,33 @@ Before execution:
 2. configured directory exists;
 3. directory is a Git repository;
 4. expected remote is configured when policy requires it;
-5. actual remote matches normalized expected remote;
+5. actual repository-local remote matches normalized expected remote;
 6. runtime profile exists;
 7. runtime is available;
 8. task extensions are supported/allowed;
 9. project is not locked by conflicting execution;
 10. user confirms Run.
+
+Repository preflight invokes `git` directly with explicit arguments, never
+through a shell. Relay removes inherited Git repository-selection environment
+such as `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE`,
+`GIT_OBJECT_DIRECTORY`, and `GIT_ALTERNATE_OBJECT_DIRECTORIES` before
+inspection commands run. Relay also removes Git command-scope config injection
+environment such as `GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`, and indexed
+`GIT_CONFIG_KEY_N` / `GIT_CONFIG_VALUE_N` values.
+
+Remote lookup reads repository-local configuration only:
+
+```text
+git -C <trusted-path> config --local --get remote.origin.url
+```
+
+Status inspection disables optional locking/index refresh and repository
+FSMonitor hooks:
+
+```text
+git -C <trusted-path> --no-optional-locks -c core.fsmonitor=false status --porcelain=v1 --untracked-files=all
+```
 
 ### Remote Normalization
 

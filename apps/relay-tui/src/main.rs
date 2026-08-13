@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     error::Error,
     io::{self, Stdout},
     path::PathBuf,
@@ -17,8 +18,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use relay_core::{
-    BranchState, GitHubRepositoryMetadata, RegisterProject, Relay, RepositoryEligibility,
-    RepositorySafetyFailure, default_config_path,
+    BranchState, GitHubRepositoryMetadata, ProjectKey, RegisterProject, Relay,
+    RepositoryEligibility, RepositoryInspection, RepositorySafetyFailure, default_config_path,
 };
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -117,7 +118,7 @@ fn render_dashboard(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn render_projects(frame: &mut Frame, state: &AppState, area: Rect) {
-    let body = project_listing(&state.relay, &state.feedback);
+    let body = project_listing(&state.relay, &state.repository_inspections, &state.feedback);
     let projects = Paragraph::new(body)
         .wrap(Wrap { trim: false })
         .block(Block::default().title(" Projects ").borders(Borders::ALL));
@@ -170,7 +171,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn Error
         Screen::Dashboard => match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => Ok(true),
             KeyCode::Char('p') | KeyCode::Char('P') => {
-                state.screen = Screen::Projects;
+                state.enter_projects();
                 Ok(false)
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -183,6 +184,10 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn Error
             KeyCode::Char('q') | KeyCode::Char('Q') => Ok(true),
             KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => {
                 state.screen = Screen::Dashboard;
+                Ok(false)
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                state.refresh_repository_inspections();
                 Ok(false)
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -217,7 +222,11 @@ fn dashboard_status(relay: &Relay) -> String {
     }
 }
 
-fn project_listing(relay: &Relay, feedback: &str) -> String {
+fn project_listing(
+    relay: &Relay,
+    repository_inspections: &BTreeMap<ProjectKey, RepositoryInspection>,
+    feedback: &str,
+) -> String {
     if relay.configured_project_count() == 0 {
         return format!("No projects configured.\n\n{feedback}");
     }
@@ -230,12 +239,12 @@ fn project_listing(relay: &Relay, feedback: &str) -> String {
             .unwrap_or("not configured");
         let default_stack = project.default_stack().unwrap_or("not configured");
         let name = project.name().unwrap_or(project.key().as_str());
-        let repository = match relay.inspect_project_repository(project.key().as_str()) {
-            Ok(inspection) => {
+        let repository = repository_inspections
+            .get(project.key())
+            .map(|inspection| {
                 repository_inspection_line(&inspection.eligibility, &inspection.status)
-            }
-            Err(error) => format!("Registry error: {error}"),
-        };
+            })
+            .unwrap_or_else(|| "not inspected".to_owned());
         lines.push(format!(
             "{} ({})\n  Path: {}\n  Expected remote: {}\n  Default stack: {}\n  Repository: {}",
             project.key(),
@@ -309,9 +318,9 @@ fn help_text(state: &AppState) -> &'static str {
         }
         Screen::Dashboard => "P: projects  Q / Esc: quit",
         Screen::Projects if state.registry_writable => {
-            "A: add project  D / Esc: dashboard  Q: quit"
+            "R: refresh  A: add project  D / Esc: dashboard  Q: quit"
         }
-        Screen::Projects => "D / Esc: dashboard  Q: quit",
+        Screen::Projects => "R: refresh  D / Esc: dashboard  Q: quit",
         Screen::AddProject => "Tab: next field  Enter: register  Esc: projects",
     }
 }
@@ -329,6 +338,7 @@ struct AppState {
     screen: Screen,
     add_project: AddProjectForm,
     add_field: AddProjectField,
+    repository_inspections: BTreeMap<ProjectKey, RepositoryInspection>,
     feedback: String,
 }
 
@@ -341,8 +351,27 @@ impl AppState {
             screen: Screen::Dashboard,
             add_project: AddProjectForm::default(),
             add_field: AddProjectField::Key,
+            repository_inspections: BTreeMap::new(),
             feedback,
         }
+    }
+
+    fn enter_projects(&mut self) {
+        self.refresh_repository_inspections();
+        self.screen = Screen::Projects;
+    }
+
+    fn refresh_repository_inspections(&mut self) {
+        self.repository_inspections = self
+            .relay
+            .list_projects()
+            .filter_map(|project| {
+                self.relay
+                    .inspect_project_repository(project.key().as_str())
+                    .ok()
+                    .map(|inspection| (project.key().clone(), inspection))
+            })
+            .collect();
     }
 
     fn try_start_add_project(&mut self) {
@@ -403,6 +432,7 @@ impl AppState {
                     "Registered project '{key}' in {}",
                     self.config_path.display()
                 );
+                self.refresh_repository_inspections();
                 self.screen = Screen::Projects;
             }
             Err(error) => {
@@ -519,8 +549,11 @@ mod tests {
 
     #[test]
     fn empty_project_screen_lists_empty_state() {
-        assert!(project_listing(&Relay::new(), "ready").contains("No projects configured."));
-        assert!(project_listing(&Relay::new(), "ready").contains("ready"));
+        assert!(
+            project_listing(&Relay::new(), &BTreeMap::new(), "ready")
+                .contains("No projects configured.")
+        );
+        assert!(project_listing(&Relay::new(), &BTreeMap::new(), "ready").contains("ready"));
     }
 
     #[test]
@@ -537,11 +570,50 @@ mod tests {
             })
             .unwrap();
         let relay = Relay::with_project_registry(registry);
-        let listing = project_listing(&relay, "ready");
+        let listing = project_listing(&relay, &BTreeMap::new(), "ready");
 
         assert!(listing.contains("relay (Relay)"));
         assert!(listing.contains("https://github.com/Jacinth091/Relay.git"));
         assert!(listing.contains("chatgpt-codex"));
+    }
+
+    #[test]
+    fn project_listing_uses_cached_repository_inspection() {
+        let dir = unique_temp_path("cached-inspection");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".git"), "not a git repository").unwrap();
+        let mut registry = ProjectRegistry::empty();
+        registry
+            .register(RegisterProject {
+                key: "Relay".to_owned(),
+                name: Some("Relay".to_owned()),
+                local_path: dir.clone(),
+                expected_remote: Some("https://github.com/Jacinth091/Relay.git".to_owned()),
+                default_stack: None,
+                github: None,
+            })
+            .unwrap();
+        let key = ProjectKey::parse("relay").unwrap();
+        let relay = Relay::with_project_registry(registry);
+        let mut cache = BTreeMap::new();
+        cache.insert(
+            key.clone(),
+            RepositoryInspection {
+                project_key: key,
+                local_path: dir,
+                normalized_expected_remote: None,
+                normalized_actual_remote: None,
+                status: Some(relay_core::RepositoryStatus {
+                    branch_state: BranchState::Branch("main".to_owned()),
+                    clean: true,
+                }),
+                eligibility: RepositoryEligibility::Eligible,
+            },
+        );
+
+        let listing = project_listing(&relay, &cache, "ready");
+
+        assert!(listing.contains("Repository: eligible; branch main; clean"));
     }
 
     #[test]

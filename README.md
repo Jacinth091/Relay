@@ -290,7 +290,7 @@ Local Git repository
                                                    or NEEDS_DECISION
 ```
 
-The v0.1 reference workflow uses GitHub because it provides a practical durable bridge before Relay Direct is implemented.
+The v0.1 reference workflow uses GitHub because it provides a practical durable bridge before Relay Direct is implemented. When this mailbox transport is used, each user/team configures its own repository; private visibility is the recommended default. Relay does not provide a maintainer-owned shared mailbox service.
 
 When direct Relay MCP access is available, it becomes the preferred planner submission path:
 
@@ -412,7 +412,7 @@ Ratatui is the first presentation layer, not the architecture.
 
 ## Technology Direction
 
-Relay Foundation v1.6 chooses:
+Relay Foundation v1.7 chooses:
 
 ```text
 Core language       Rust, stable, Edition 2024
@@ -655,6 +655,7 @@ Start here:
 - [`docs/installation.md`](docs/installation.md) — proposed future installation experience.
 - [`docs/first-run-setup.md`](docs/first-run-setup.md) — proposed setup wizard and onboarding flow.
 - [`docs/github-integration.md`](docs/github-integration.md) — local GitHub detection, compatibility ingress, and optional bindings.
+- [`docs/github-mailbox-setup.md`](docs/github-mailbox-setup.md) — user-owned private bootstrap mailbox setup and routing behavior.
 - [`docs/submission-and-bindings.md`](docs/submission-and-bindings.md) — submission transports, canonical local state, and optional external bindings.
 - [`docs/clarification-protocol.md`](docs/clarification-protocol.md)
 - [`docs/runtime-stack-model.md`](docs/runtime-stack-model.md)

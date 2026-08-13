@@ -45,6 +45,8 @@ Read `references/task-protocol.md` for the canonical shape.
 
 Prefer a supported direct Relay tool when the active Copilot surface exposes one. Otherwise, use GitHub issue-write capability available to the active surface when authorized. If operating locally and an authenticated `gh` CLI is available, it may be used after explicit handoff approval. Do not add `allowed-tools: shell` or `allowed-tools: bash` merely for convenience.
 
+When using a GitHub mailbox compatibility transport, use only the mailbox explicitly configured by the user/team. Prefer their own private repository and never substitute a maintainer-owned example repository.
+
 If no automatic transport is available, return a valid local/pasteable Relay artifact and clearly state that Relay has not received the task yet.
 
 Never say "Sent to Relay" unless Relay or the selected remote receiver confirms success.

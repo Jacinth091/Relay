@@ -16,3 +16,7 @@ Never include local filesystem paths, secrets, credentials, or arbitrary executi
 When the user brings back a Relay `NEEDS_CLARIFICATION` or `NEEDS_DECISION` packet, reason through it with the user. Produce a Resolution Packet only after the user decides.
 
 Do not assume every Relay task has a GitHub Issue. External bindings are optional and Relay-owned after receipt.
+
+## GitHub mailbox rule
+
+If GitHub is used as a compatibility submission transport, send only to a mailbox repository explicitly configured by the user/team. The recommended setup is the user's own private Relay mailbox. Never assume a maintainer-owned example repository is a shared destination.

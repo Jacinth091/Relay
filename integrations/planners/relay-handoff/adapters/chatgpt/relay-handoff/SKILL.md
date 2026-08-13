@@ -45,6 +45,8 @@ Read `references/task-protocol.md` for the canonical shape.
 
 Use a configured Relay direct tool/MCP connection when this ChatGPT environment exposes one. If Relay Direct is unavailable, a connected write-capable GitHub integration may be used as a compatibility transport to the configured Relay mailbox.
 
+When using the GitHub mailbox transport, use only the mailbox explicitly configured by the user/team. The recommended mailbox is their own private repository. Never substitute a maintainer-owned example repository or another user's mailbox. If no mailbox is configured, fall back to a local/pasteable Relay artifact rather than guessing.
+
 If no automatic transport is available, return a valid local/pasteable Relay artifact and clearly state that Relay has not received the task yet.
 
 Never say "Sent to Relay" unless Relay or the selected remote receiver confirms success.

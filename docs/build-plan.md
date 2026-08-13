@@ -10,7 +10,7 @@ The goal is to prove boundaries in small vertical slices.
 
 Done when:
 
-- Foundation v1.6 documentation is committed;
+- Foundation v1.7 documentation is committed;
 - Rust toolchain is installed;
 - Cargo workspace root exists;
 - empty architecture is not over-generated.

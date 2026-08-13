@@ -44,3 +44,9 @@ Always supported through generated `.relay.json`, readable `.relay.md`, or paste
 ## Core alignment
 
 The adapter conforms to `../../core/PLANNER_SPEC.md`. ChatGPT-specific UI metadata and tool routing must never redefine Relay task semantics.
+
+## GitHub mailbox bootstrap
+
+If ChatGPT cannot reach Relay Direct/MCP but has authorized GitHub issue-write capability, configure the adapter to use a mailbox repository owned by the user/team. Private visibility is the recommended default. Do not use a Relay maintainer's example repository as a shared service.
+
+The same mailbox may carry tasks for multiple Relay projects because every HandoffTask identifies its logical `project` key. Users with Relay Direct/MCP do not need a mailbox.

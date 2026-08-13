@@ -45,6 +45,8 @@ Read `references/task-protocol.md` for the canonical shape.
 
 Prefer a configured Relay MCP/direct tool. If Relay Direct is unavailable, use an authorized GitHub mechanism available in the Claude Code environment, such as a configured GitHub MCP server or an authenticated local `gh` CLI. Do not pre-authorize unrestricted shell access merely for handoff convenience.
 
+When using a GitHub mailbox compatibility transport, use only the mailbox explicitly configured by the user/team. Prefer their own private repository and never substitute a maintainer-owned example repository.
+
 If no automatic transport is available, return a valid local/pasteable Relay artifact and clearly state that Relay has not received the task yet.
 
 Never say "Sent to Relay" unless Relay or the selected remote receiver confirms success.

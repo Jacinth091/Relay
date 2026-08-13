@@ -28,12 +28,18 @@ Exact provider configuration is host-specific and may change. Keep it in the hos
 
 ```text
 submission: provider-github
-repository: <user-configured private handoff repository>
+repository: <user-or-team-owned private Relay mailbox>
 default_stack: <user-configured stack>
 ready_label: relay-ready (optional)
 ```
 
 The repository is a task mailbox. It is not the target project repository and does not provide a local execution path.
+
+Each Relay user/team must create or select its **own** mailbox repository when using this transport. Private visibility is the recommended default because handoff Issues may contain implementation and planning context. The mailbox name is user-defined; example names in Relay documentation are not shared Relay services.
+
+Never default to a Relay maintainer's mailbox, another user's repository, or a hard-coded example destination.
+
+One mailbox may receive tasks for many Relay projects because every HandoffTask carries exactly one logical `project` key.
 
 GitHub submission is a compatibility transport when a planner cannot reach Relay directly. It is not required when Relay Direct is available.
 

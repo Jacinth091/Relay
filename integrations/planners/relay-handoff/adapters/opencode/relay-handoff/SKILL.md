@@ -45,6 +45,8 @@ Read `references/task-protocol.md` for the canonical shape.
 
 Prefer a configured Relay MCP/direct tool. If Relay Direct is unavailable, use an authorized GitHub tool/MCP integration or authenticated local `gh` CLI when available in the selected OpenCode environment.
 
+When using a GitHub mailbox compatibility transport, use only the mailbox explicitly configured by the user/team. Prefer their own private repository and never substitute a maintainer-owned example repository.
+
 If no automatic transport is available, return a valid local/pasteable Relay artifact and clearly state that Relay has not received the task yet.
 
 Never say "Sent to Relay" unless Relay or the selected remote receiver confirms success.

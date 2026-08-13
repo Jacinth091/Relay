@@ -36,6 +36,16 @@ Local Relay
 
 Relay can reliably inspect its own local GitHub configuration. It generally cannot and should not infer whether a cloud planner currently has a GitHub connector unless that planner exposes the capability through a supported interface.
 
+## Mailbox ownership
+
+When GitHub is used as the bootstrap planner-to-Relay transport, the mailbox must be a repository selected or created by the Relay user/team. Relay must never assume a maintainer-owned example repository is available for other users.
+
+Private visibility is the recommended default because handoff Issues may contain implementation and planning context. The repository name is user-defined; names such as `relay-handoff`, `relay-mailbox`, or `ai-handoff` are examples only.
+
+One private mailbox may receive tasks for many local Relay projects because every HandoffTask carries exactly one logical `project` key. Relay resolves that key through its trusted local Project Registry.
+
+See `github-mailbox-setup.md`.
+
 ## v0.1 compatibility path
 
 The first ChatGPT reference flow may be:

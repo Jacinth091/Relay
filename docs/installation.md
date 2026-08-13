@@ -37,6 +37,8 @@ If no Relay configuration exists, launching `relay` should open the first-run se
 
 See `first-run-setup.md`.
 
+If the user selects the GitHub mailbox bootstrap transport, setup should also guide them to create or select their own private Relay mailbox repository. See `github-mailbox-setup.md`. Direct/MCP users do not need a mailbox.
+
 ## Troubleshooting commands
 
 A small optional CLI surface is still useful:

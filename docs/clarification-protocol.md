@@ -1,6 +1,6 @@
 # Clarification and Resolution Protocol
 
-Status: **Foundation v1.6 draft**
+Status: **Foundation v1.7 draft**
 
 This protocol defines how Relay explains an implementation blocker and how a planner/user resolves it.
 

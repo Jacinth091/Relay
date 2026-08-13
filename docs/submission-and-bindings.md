@@ -48,7 +48,7 @@ The exact persisted names may evolve, but the distinction must remain.
 When the user explicitly says **Send this to Relay**, a planner adapter should use the strongest supported path available:
 
 1. **Relay Direct** — submit to Relay through a supported direct interface such as MCP.
-2. **Provider-native remote transport** — for example, create the configured Relay mailbox GitHub Issue when the planner host has authorized issue-write capability.
+2. **Provider-native remote transport** — for example, create an Issue in the user's configured private Relay mailbox when the planner host has authorized issue-write capability. The mailbox is user-owned configuration, not a Relay-maintainer service.
 3. **Local artifact/paste fallback** — produce a canonical Relay task for import when no automatic transport is available.
 
 A planner must not claim that a task was sent unless an external receiver confirms success.
@@ -186,6 +186,8 @@ Relay's GitHub adapter may handle:
 - result publication.
 
 The first local implementation should use the authenticated `gh` executable rather than asking users to paste GitHub tokens into Relay.
+
+When a GitHub mailbox is used, each user/team should configure its own repository. Private visibility is the recommended default, and a single mailbox may carry handoffs for multiple logical Relay projects. See `github-mailbox-setup.md`.
 
 ## Canonical Identity
 

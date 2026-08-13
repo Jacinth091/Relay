@@ -79,6 +79,26 @@ Local file / paste          universal fallback
 
 If Relay Direct is unavailable, setup should not fail. Local file/paste remains usable.
 
+### GitHub mailbox setup
+
+When the user chooses the GitHub compatibility transport, Relay should require them to create or select **their own mailbox repository**. The recommended default is a private repository owned by the user or their organization.
+
+Setup must not preconfigure a Relay maintainer's mailbox or treat an example repository name as a shared service.
+
+The intended flow is:
+
+```text
+Create/select user's private mailbox repository
+    -> authenticate local GitHub access
+    -> configure mailbox in Relay
+    -> authorize planner write access if needed
+    -> test read/write capability
+```
+
+One mailbox can carry handoffs for multiple Relay projects because each HandoffTask includes one logical `project` key.
+
+Users with Relay Direct/MCP may skip mailbox setup entirely. See `github-mailbox-setup.md`.
+
 ## Optional External Binding
 
 After direct/local receipt, the user may choose whether Relay mirrors task lifecycle to an external system.

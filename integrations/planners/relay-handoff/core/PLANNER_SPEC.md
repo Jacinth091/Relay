@@ -1,6 +1,6 @@
 # Relay Handoff Planner Specification
 
-Status: Foundation v1.6
+Status: Foundation v1.7
 
 This is the provider-neutral behavioral specification for any conversational planner that interoperates with Relay.
 
@@ -96,7 +96,9 @@ Only report success after Relay confirms acceptance.
 
 If direct Relay submission is unavailable but the host has another supported authorized transport, use it.
 
-The initial compatibility example is a write-capable GitHub integration that creates an Issue in the configured Relay mailbox repository.
+The initial compatibility example is a write-capable GitHub integration that creates an Issue in the configured **user-owned Relay mailbox repository**. The recommended mailbox is private and is created/selected by the user or their team during setup.
+
+Never assume a Relay maintainer's example mailbox is a shared destination for users.
 
 This is a transport choice, not the definition of a Relay handoff.
 

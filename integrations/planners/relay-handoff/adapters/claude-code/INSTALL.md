@@ -38,6 +38,8 @@ Prefer a configured Relay Direct/MCP connection when Relay exposes one. If that 
 
 A direct Relay handoff does not require a GitHub Issue. Relay may create an optional GitHub binding afterward according to local configuration.
 
+If GitHub is used as the bootstrap compatibility transport, configure a mailbox repository owned by the user/team. Private visibility is the recommended default. Do not use a Relay maintainer's example repository as a shared mailbox. One mailbox can carry handoffs for multiple Relay projects because each task includes its logical `project` key.
+
 ## Official reference
 
 https://code.claude.com/docs/en/skills

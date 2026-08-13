@@ -70,6 +70,29 @@ Before execution:
 9. project is not locked by conflicting execution;
 10. user confirms Run.
 
+### Remote Normalization
+
+Repository remote comparison uses a normalized identity of:
+
+```text
+host/repository-path
+```
+
+For v0.1, Relay recognizes these common equivalent forms:
+
+```text
+https://github.com/owner/repo.git
+https://github.com/owner/repo
+git@github.com:owner/repo.git
+ssh://git@github.com/owner/repo.git
+```
+
+Relay lowercases hosts for all remotes. Relay lowercases repository paths only
+for `github.com`; paths for other hosts remain case-sensitive because Relay
+does not assume self-hosted Git repository identity rules. Relay strips a final
+`.git` suffix and rejects malformed, ambiguous, or whitespace-containing remote
+strings instead of guessing.
+
 ---
 
 ## Process Injection

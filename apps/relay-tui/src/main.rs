@@ -16,7 +16,10 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use relay_core::{GitHubRepositoryMetadata, RegisterProject, Relay, default_config_path};
+use relay_core::{
+    BranchState, GitHubRepositoryMetadata, RegisterProject, Relay, RepositoryEligibility,
+    RepositorySafetyFailure, default_config_path,
+};
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -227,17 +230,76 @@ fn project_listing(relay: &Relay, feedback: &str) -> String {
             .unwrap_or("not configured");
         let default_stack = project.default_stack().unwrap_or("not configured");
         let name = project.name().unwrap_or(project.key().as_str());
+        let repository = match relay.inspect_project_repository(project.key().as_str()) {
+            Ok(inspection) => {
+                repository_inspection_line(&inspection.eligibility, &inspection.status)
+            }
+            Err(error) => format!("Registry error: {error}"),
+        };
         lines.push(format!(
-            "{} ({})\n  Path: {}\n  Expected remote: {}\n  Default stack: {}",
+            "{} ({})\n  Path: {}\n  Expected remote: {}\n  Default stack: {}\n  Repository: {}",
             project.key(),
             name,
             project.local_path().display(),
             expected_remote,
-            default_stack
+            default_stack,
+            repository
         ));
     }
 
     format!("{}\n\n{feedback}", lines.join("\n\n"))
+}
+
+fn repository_inspection_line(
+    eligibility: &RepositoryEligibility,
+    status: &Option<relay_core::RepositoryStatus>,
+) -> String {
+    match eligibility {
+        RepositoryEligibility::Eligible => {
+            let Some(status) = status else {
+                return "eligible; status unavailable".to_owned();
+            };
+            format!(
+                "eligible; {}; {}",
+                branch_state_text(&status.branch_state),
+                if status.clean { "clean" } else { "dirty" }
+            )
+        }
+        RepositoryEligibility::NotEligible(reason) => {
+            format!("not eligible; {}", safety_failure_text(reason))
+        }
+    }
+}
+
+fn branch_state_text(branch_state: &BranchState) -> String {
+    match branch_state {
+        BranchState::Branch(branch) => format!("branch {branch}"),
+        BranchState::Detached { commit } => format!("detached at {commit}"),
+    }
+}
+
+fn safety_failure_text(reason: &RepositorySafetyFailure) -> String {
+    match reason {
+        RepositorySafetyFailure::GitUnavailable => "git unavailable".to_owned(),
+        RepositorySafetyFailure::NotGitWorktree => "not a Git worktree".to_owned(),
+        RepositorySafetyFailure::MissingExpectedRemote => "missing expected remote".to_owned(),
+        RepositorySafetyFailure::MissingRemote { name } => format!("missing remote {name}"),
+        RepositorySafetyFailure::GitCommandFailed { operation, .. } => {
+            format!("git inspection failed during {operation:?}")
+        }
+        RepositorySafetyFailure::MalformedExpectedRemote { .. } => {
+            "malformed expected remote".to_owned()
+        }
+        RepositorySafetyFailure::MalformedActualRemote { .. } => {
+            "malformed actual remote".to_owned()
+        }
+        RepositorySafetyFailure::RemoteMismatch { expected, actual } => {
+            format!("remote mismatch: expected {expected}, actual {actual}")
+        }
+        RepositorySafetyFailure::UnexpectedGitOutput { operation, .. } => {
+            format!("unexpected git output during {operation:?}")
+        }
+    }
 }
 
 fn help_text(state: &AppState) -> &'static str {

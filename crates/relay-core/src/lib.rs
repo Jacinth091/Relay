@@ -4,8 +4,11 @@
 
 mod project_registry;
 mod repository_safety;
+mod task_ingress;
 
 use std::path::Path;
+
+pub use relay_protocol::{AmbiguityPolicy, HandoffTask};
 
 pub use project_registry::{
     ExpectedRemote, GitHubRepositoryMetadata, ProjectKey, ProjectRegistry, ProjectRegistryError,
@@ -16,11 +19,15 @@ pub use repository_safety::{
     RepositoryInspection, RepositorySafetyFailure, RepositoryStatus,
     inspect_trusted_project_repository,
 };
+pub use task_ingress::{
+    ImportedTask, SubmissionTransport, TaskId, TaskImportCandidate, TaskIngressError,
+};
 
 /// Minimal Relay application state.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Relay {
     project_registry: ProjectRegistry,
+    reviewed_task: Option<ImportedTask>,
 }
 
 impl Relay {
@@ -31,7 +38,10 @@ impl Relay {
 
     /// Creates Relay from an already validated project registry.
     pub fn with_project_registry(project_registry: ProjectRegistry) -> Self {
-        Self { project_registry }
+        Self {
+            project_registry,
+            reviewed_task: None,
+        }
     }
 
     /// Loads Relay's trusted local project registry from a TOML config path.

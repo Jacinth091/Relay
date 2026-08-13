@@ -17,6 +17,10 @@ impl TaskId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    pub fn parse(input: impl AsRef<str>) -> Result<Self, uuid::Error> {
+        Uuid::parse_str(input.as_ref()).map(Self)
+    }
 }
 
 impl Default for TaskId {
@@ -36,6 +40,15 @@ impl fmt::Display for TaskId {
 pub enum SubmissionTransport {
     LocalFile,
     LocalPaste,
+}
+
+impl SubmissionTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalFile => "local-file",
+            Self::LocalPaste => "local-paste",
+        }
+    }
 }
 
 /// Validated task ready for user confirmation.
@@ -62,6 +75,17 @@ impl TaskImportCandidate {
 
     pub fn submission_transport(&self) -> SubmissionTransport {
         self.submission_transport
+    }
+
+    /// Consumes a validated candidate and assigns Relay-owned task identity.
+    pub fn into_imported_task(self) -> ImportedTask {
+        ImportedTask {
+            id: TaskId::new(),
+            handoff: self.handoff,
+            project_key: self.project_key,
+            project_name: self.project_name,
+            submission_transport: self.submission_transport,
+        }
     }
 }
 
@@ -114,13 +138,11 @@ impl Relay {
     }
 
     pub fn confirm_task_import(&mut self, candidate: TaskImportCandidate) -> &ImportedTask {
-        self.reviewed_task = Some(ImportedTask {
-            id: TaskId::new(),
-            handoff: candidate.handoff,
-            project_key: candidate.project_key,
-            project_name: candidate.project_name,
-            submission_transport: candidate.submission_transport,
-        });
+        self.accept_imported_task(candidate.into_imported_task())
+    }
+
+    pub fn accept_imported_task(&mut self, imported: ImportedTask) -> &ImportedTask {
+        self.reviewed_task = Some(imported);
 
         self.reviewed_task
             .as_ref()

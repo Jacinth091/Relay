@@ -23,12 +23,14 @@ use ratatui::{
 use relay_core::{
     AmbiguityPolicy, BranchState, GitHubRepositoryMetadata, HandoffTask, ProjectKey,
     RegisterProject, Relay, RepositoryEligibility, RepositoryInspection, RepositorySafetyFailure,
-    TaskImportCandidate, default_config_path,
+    SqliteStore, StoredTask, TaskImportCandidate, default_config_path, default_database_path,
+    list_stored_tasks,
 };
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn Error>> {
     let config_path = default_config_path();
     let (relay, registry_writable, feedback) = match Relay::load_from_config_path(&config_path) {
         Ok(relay) => (relay, true, format!("Config: {}", config_path.display())),
@@ -41,15 +43,52 @@ fn main() -> Result<(), Box<dyn Error>> {
             ),
         ),
     };
-    let mut state = AppState::new(relay, config_path, registry_writable, feedback);
+    let database_path = default_database_path();
+    let (store, durable_tasks, database_feedback) = open_store(&database_path).await;
+    let mut state = AppState::new_with_store(
+        relay,
+        config_path,
+        registry_writable,
+        database_path,
+        store,
+        durable_tasks,
+        format!("{feedback}\n{database_feedback}"),
+    );
     let mut terminal = initialize_terminal()?;
 
-    let run_result = run(&mut terminal, &mut state);
+    let run_result = run(&mut terminal, &mut state).await;
     let restore_result = restore_terminal(&mut terminal);
 
     run_result?;
     restore_result?;
     Ok(())
+}
+
+async fn open_store(path: &std::path::Path) -> (Option<SqliteStore>, Vec<StoredTask>, String) {
+    match SqliteStore::open(path).await {
+        Ok(store) => match list_stored_tasks(&store).await {
+            Ok(tasks) => {
+                let feedback = format!("Database: {}", path.display());
+                (Some(store), tasks, feedback)
+            }
+            Err(error) => (
+                None,
+                Vec::new(),
+                format!(
+                    "Database error at {}: {error}\nTask import is disabled until the database is fixed.",
+                    path.display()
+                ),
+            ),
+        },
+        Err(error) => (
+            None,
+            Vec::new(),
+            format!(
+                "Database error at {}: {error}\nTask import is disabled until the database is fixed.",
+                path.display()
+            ),
+        ),
+    }
 }
 
 fn initialize_terminal() -> Result<Tui, Box<dyn Error>> {
@@ -88,11 +127,11 @@ fn restore_terminal(terminal: &mut Tui) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn run(terminal: &mut Tui, state: &mut AppState) -> Result<(), Box<dyn Error>> {
+async fn run(terminal: &mut Tui, state: &mut AppState) -> Result<(), Box<dyn Error>> {
     loop {
         terminal.draw(|frame| render(frame, state))?;
 
-        if event::poll(Duration::from_millis(250))? && handle_event(state, event::read()?)? {
+        if event::poll(Duration::from_millis(250))? && handle_event(state, event::read()?).await? {
             return Ok(());
         }
     }
@@ -120,7 +159,7 @@ fn render(frame: &mut Frame, state: &AppState) {
 }
 
 fn render_dashboard(frame: &mut Frame, state: &AppState, area: Rect) {
-    let body = format!("{}\n\n{}", dashboard_status(&state.relay), state.feedback);
+    let body = format!("{}\n\n{}", dashboard_status(state), state.feedback);
     let dashboard = Paragraph::new(body)
         .wrap(Wrap { trim: true })
         .block(Block::default().title(" Relay ").borders(Borders::ALL));
@@ -251,9 +290,9 @@ fn render_task_review(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_widget(review, area);
 }
 
-fn handle_event(state: &mut AppState, event: Event) -> Result<bool, Box<dyn Error>> {
+async fn handle_event(state: &mut AppState, event: Event) -> Result<bool, Box<dyn Error>> {
     match event {
-        Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(state, key),
+        Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(state, key).await,
         Event::Paste(text) if state.screen == Screen::PasteTask => {
             state.paste_text.push_str(&text);
             Ok(false)
@@ -262,7 +301,7 @@ fn handle_event(state: &mut AppState, event: Event) -> Result<bool, Box<dyn Erro
     }
 }
 
-fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn Error>> {
+async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn Error>> {
     match state.screen {
         Screen::Dashboard => match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => Ok(true),
@@ -357,7 +396,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn Error
         }
         Screen::TaskPreview => match key.code {
             KeyCode::Char('i') | KeyCode::Char('I') | KeyCode::Enter => {
-                state.confirm_task_import();
+                state.confirm_task_import().await;
                 Ok(false)
             }
             KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Esc => {
@@ -382,11 +421,17 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn Error
     }
 }
 
-fn dashboard_status(relay: &Relay) -> String {
-    match relay.configured_project_count() {
+fn dashboard_status(state: &AppState) -> String {
+    let projects = match state.relay.configured_project_count() {
         0 => "No projects configured.".to_owned(),
         count => format!("{count} projects configured."),
-    }
+    };
+    let tasks = match state.durable_tasks.len() {
+        0 => "No durable tasks.".to_owned(),
+        1 => "1 durable task.".to_owned(),
+        count => format!("{count} durable tasks."),
+    };
+    format!("{projects}\n{tasks}")
 }
 
 fn project_listing(
@@ -558,6 +603,9 @@ struct AppState {
     relay: Relay,
     config_path: PathBuf,
     registry_writable: bool,
+    database_path: PathBuf,
+    store: Option<SqliteStore>,
+    durable_tasks: Vec<StoredTask>,
     screen: Screen,
     add_project: AddProjectForm,
     add_field: AddProjectField,
@@ -569,11 +617,35 @@ struct AppState {
 }
 
 impl AppState {
+    #[cfg(test)]
     fn new(relay: Relay, config_path: PathBuf, registry_writable: bool, feedback: String) -> Self {
+        Self::new_with_store(
+            relay,
+            config_path,
+            registry_writable,
+            PathBuf::from("relay-state.sqlite3"),
+            None,
+            Vec::new(),
+            feedback,
+        )
+    }
+
+    fn new_with_store(
+        relay: Relay,
+        config_path: PathBuf,
+        registry_writable: bool,
+        database_path: PathBuf,
+        store: Option<SqliteStore>,
+        durable_tasks: Vec<StoredTask>,
+        feedback: String,
+    ) -> Self {
         Self {
             relay,
             config_path,
             registry_writable,
+            database_path,
+            store,
+            durable_tasks,
             screen: Screen::Dashboard,
             add_project: AddProjectForm::default(),
             add_field: AddProjectField::Key,
@@ -670,15 +742,37 @@ impl AppState {
         }
     }
 
-    fn confirm_task_import(&mut self) {
+    async fn confirm_task_import(&mut self) {
+        let Some(store) = &self.store else {
+            self.feedback = format!(
+                "Task import is disabled until the database is fixed: {}",
+                self.database_path.display()
+            );
+            return;
+        };
+
         let Some(candidate) = self.task_candidate.take() else {
             self.feedback = "No validated task is ready to import.".to_owned();
             return;
         };
 
-        let task_id = self.relay.confirm_task_import(candidate).id.to_string();
-        self.feedback = format!("Imported Relay task {task_id}. Execution has not started.");
-        self.screen = Screen::TaskReview;
+        match self
+            .relay
+            .confirm_task_import_with_store(store, candidate.clone())
+            .await
+        {
+            Ok(stored) => {
+                let task_id = stored.id.to_string();
+                self.durable_tasks.push(stored);
+                self.feedback =
+                    format!("Imported Relay task {task_id}. Execution has not started.");
+                self.screen = Screen::TaskReview;
+            }
+            Err(error) => {
+                self.task_candidate = Some(candidate);
+                self.feedback = format!("Failed to persist Relay task: {error}");
+            }
+        }
     }
 
     fn cancel_task_import(&mut self) {
@@ -846,7 +940,17 @@ mod tests {
 
     #[test]
     fn empty_relay_maps_to_expected_dashboard_message() {
-        assert_eq!(dashboard_status(&Relay::new()), "No projects configured.");
+        let state = AppState::new(
+            Relay::new(),
+            unique_temp_path("config").join("relay.toml"),
+            true,
+            "ready".to_owned(),
+        );
+
+        assert_eq!(
+            dashboard_status(&state),
+            "No projects configured.\nNo durable tasks."
+        );
     }
 
     #[test]
@@ -933,9 +1037,9 @@ mod tests {
         assert_eq!(state.screen, Screen::PasteTask);
     }
 
-    #[test]
-    fn paste_import_validation_preview_and_confirm_create_reviewable_task() {
-        let mut state = app_state_with_project();
+    #[tokio::test]
+    async fn paste_import_validation_preview_and_confirm_create_reviewable_task() {
+        let mut state = app_state_with_project_with_store().await;
 
         state.start_paste_task();
         state.paste_text = task_json();
@@ -947,19 +1051,22 @@ mod tests {
             task_preview_text(state.task_candidate.as_ref().unwrap()).contains("Validation: VALID")
         );
 
-        state.confirm_task_import();
+        state.confirm_task_import().await;
 
         assert_eq!(state.screen, Screen::TaskReview);
         assert!(state.relay.reviewed_task().is_some());
+        assert_eq!(state.durable_tasks.len(), 1);
         assert!(state.feedback.contains("Execution has not started"));
     }
 
-    #[test]
-    fn multiline_json_paste_event_waits_for_explicit_validation() {
+    #[tokio::test]
+    async fn multiline_json_paste_event_waits_for_explicit_validation() {
         let mut state = app_state_with_project();
 
         state.start_paste_task();
-        handle_event(&mut state, Event::Paste(task_json())).unwrap();
+        handle_event(&mut state, Event::Paste(task_json()))
+            .await
+            .unwrap();
 
         assert_eq!(state.screen, Screen::PasteTask);
         assert!(state.task_candidate.is_none());
@@ -971,12 +1078,14 @@ mod tests {
         assert!(state.task_candidate.is_some());
     }
 
-    #[test]
-    fn multiline_markdown_paste_event_waits_for_explicit_validation() {
+    #[tokio::test]
+    async fn multiline_markdown_paste_event_waits_for_explicit_validation() {
         let mut state = app_state_with_project();
 
         state.start_paste_task();
-        handle_event(&mut state, Event::Paste(task_markdown())).unwrap();
+        handle_event(&mut state, Event::Paste(task_markdown()))
+            .await
+            .unwrap();
 
         assert_eq!(state.screen, Screen::PasteTask);
         assert!(state.task_candidate.is_none());
@@ -1022,13 +1131,13 @@ mod tests {
         assert!(state.task_candidate.is_none());
     }
 
-    #[test]
-    fn no_run_action_exists_in_task_review_help_or_text() {
-        let mut state = app_state_with_project();
+    #[tokio::test]
+    async fn no_run_action_exists_in_task_review_help_or_text() {
+        let mut state = app_state_with_project_with_store().await;
         state.start_paste_task();
         state.paste_text = task_json();
         state.submit_paste_task();
-        state.confirm_task_import();
+        state.confirm_task_import().await;
 
         assert_eq!(
             help_text(&state),
@@ -1093,6 +1202,13 @@ mod tests {
             true,
             "ready".to_owned(),
         )
+    }
+
+    async fn app_state_with_project_with_store() -> AppState {
+        let mut state = app_state_with_project();
+        state.database_path = unique_temp_path("state").join("relay.sqlite3");
+        state.store = Some(SqliteStore::in_memory().await.unwrap());
+        state
     }
 
     fn task_json() -> String {

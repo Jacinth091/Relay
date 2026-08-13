@@ -118,6 +118,23 @@ Use explicit database migrations from the beginning.
 
 Database schema version and Relay protocol versions are separate.
 
+## Current Implementation
+
+M5 initializes Relay's embedded SQLite store through SQLx migrations owned by
+the `relay-store` crate in `crates/relay-store/migrations`.
+
+Accepted local file and paste imports are persisted as canonical `ready` task
+records before the TUI enters task review. Relay Core converts validated domain
+objects into store DTOs, and validates stored DTOs back into domain objects on
+load. The validated `HandoffTask v1` payload is stored with Relay-owned task
+identity, submission transport, project key, task state, source metadata, and
+timestamps.
+
+The initial schema also creates tables for optional external bindings,
+executions, clarification/decision requests, resolutions, and durable events so
+later milestones can add lifecycle behavior without replacing the canonical
+task store.
+
 ## Export / Backup
 
 A future export command may package:

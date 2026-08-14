@@ -1348,6 +1348,8 @@ impl AppState {
         if let Some(task) = self.health_refresh.take() {
             task.abort();
         }
+        self.runtime_health = CodexRuntimeHealth::Checking;
+        self.git_health = ToolHealth::Checking;
         self.health_refresh = Some(tokio::spawn(collect_health()));
     }
 
@@ -1578,6 +1580,21 @@ impl AppState {
         }
         if !self.runtime_health.is_ready() {
             return format!("unavailable: {}", self.runtime_health.display_status());
+        }
+        let Ok(project) = self.relay.resolve_project(task.project_key.as_str()) else {
+            return "unavailable: project is not registered".to_owned();
+        };
+        let effective_stack = task
+            .handoff
+            .stack
+            .as_deref()
+            .or_else(|| project.default_stack());
+        match effective_stack {
+            Some("chatgpt-codex") => {}
+            Some(stack) => {
+                return format!("unavailable: unsupported runtime stack '{stack}'");
+            }
+            None => return "unavailable: no runtime stack is configured".to_owned(),
         }
         if !task.handoff.extensions.is_empty() {
             return "unavailable: unsupported task extensions".to_owned();
@@ -2714,6 +2731,17 @@ mod tests {
             git_health_marker(&ToolHealth::Unavailable("missing".to_owned())),
             "× Git"
         );
+    }
+
+    #[tokio::test]
+    async fn starting_health_refresh_invalidates_previous_readiness() {
+        let mut state = app_state_with_project();
+        state.begin_health_refresh();
+        assert!(matches!(state.runtime_health, CodexRuntimeHealth::Checking));
+        assert!(matches!(state.git_health, ToolHealth::Checking));
+        if let Some(task) = state.health_refresh.take() {
+            task.abort();
+        }
     }
 
     fn app_state_with_project() -> AppState {

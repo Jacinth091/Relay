@@ -18,7 +18,7 @@ use relay_runtime::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
     sync::mpsc,
     time::timeout,
@@ -26,6 +26,9 @@ use tokio::{
 use uuid::Uuid;
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CODEX_JSONL_FRAME_BYTES: usize = 256 * 1024;
+const MAX_CODEX_RESULT_BYTES: u64 = 64 * 1024;
+const MAX_CODEX_RESULT_TEXT_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexRuntimeConfig {
@@ -118,11 +121,13 @@ impl CodexRuntime {
                 String::from_utf8_lossy(&output.stdout).trim().to_owned()
             }
             Ok(output) => {
-                return CodexRuntimeHealth::NotInstalled {
+                return CodexRuntimeHealth::DiscoveryFailed {
                     error: safe_process_error(&output.stderr, "codex --version returned a failure"),
                 };
             }
-            Err(DiscoveryError::Spawn(error)) => return CodexRuntimeHealth::NotInstalled { error },
+            Err(DiscoveryError::Spawn(error)) => {
+                return CodexRuntimeHealth::DiscoveryFailed { error };
+            }
             Err(DiscoveryError::Timeout) => {
                 return CodexRuntimeHealth::DiscoveryFailed {
                     error: "codex --version timed out".to_owned(),
@@ -199,6 +204,8 @@ impl CodexRuntime {
             "never".to_owned(),
             "exec".to_owned(),
             "--ignore-user-config".to_owned(),
+            "--ignore-rules".to_owned(),
+            "--ephemeral".to_owned(),
             "--strict-config".to_owned(),
             "--json".to_owned(),
             "--color".to_owned(),
@@ -207,6 +214,8 @@ impl CodexRuntime {
             "workspace-write".to_owned(),
             "-c".to_owned(),
             "sandbox_workspace_write.writable_roots=[]".to_owned(),
+            "-c".to_owned(),
+            "sandbox_workspace_write.network_access=false".to_owned(),
             "--cd".to_owned(),
             request.trusted_working_dir.display().to_string(),
             "--output-schema".to_owned(),
@@ -268,6 +277,13 @@ impl Runtime for CodexRuntime {
                     "execution cancelled before Codex start".to_owned(),
                 ));
             }
+            if let Some(stack) = request.intent.requested_stack.as_deref()
+                && stack != "chatgpt-codex"
+            {
+                return Err(RuntimeError::StartFailed(format!(
+                    "unsupported runtime stack '{stack}'"
+                )));
+            }
             let temp = RuntimeTempFiles::create()?;
             let executable = runtime
                 .resolve_executable()
@@ -285,6 +301,7 @@ impl Runtime for CodexRuntime {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
+            sanitize_git_environment(&mut command);
             let mut child = command.spawn().map_err(|error| {
                 RuntimeError::StartFailed(format!(
                     "could not start configured Codex executable '{}': {error}",
@@ -437,6 +454,16 @@ fn render_item_event(event: &Value) -> Option<String> {
             }
         }
         "file_change" => {
+            if item.get("status").and_then(Value::as_str) == Some("failed") {
+                return Some(format!(
+                    "× Codex file change failed: {}",
+                    bounded_event_text(
+                        item.get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("file change failed")
+                    )
+                ));
+            }
             let changes = item.get("changes").and_then(Value::as_array)?;
             let rendered = changes
                 .iter()
@@ -456,6 +483,14 @@ fn render_item_event(event: &Value) -> Option<String> {
                 .collect::<Vec<_>>();
             (!rendered.is_empty()).then(|| rendered.join("\n"))
         }
+        "error" => Some(format!(
+            "× Codex: {}",
+            bounded_event_text(
+                item.get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("runtime error")
+            )
+        )),
         "reasoning" => Some("› Codex is analyzing the task".to_owned()),
         _ => None,
     }
@@ -488,27 +523,47 @@ async fn read_stdout(
     stdout: tokio::process::ChildStdout,
     tx: mpsc::Sender<RuntimeEvent>,
 ) -> Result<StreamState, String> {
-    let mut lines = BufReader::new(stdout).lines();
+    let mut reader = BufReader::new(stdout);
+    let mut pending = Vec::new();
+    let mut chunk = [0_u8; 8 * 1024];
     let mut state = StreamState::default();
-    while let Some(line) = lines.next_line().await.map_err(|error| error.to_string())? {
-        let event: Value = serde_json::from_str(&line)
-            .map_err(|error| format!("malformed Codex JSONL: {error}"))?;
-        let kind = event
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        match kind {
-            "turn.completed" => state.turn_completed = true,
-            "turn.failed" => state.turn_failed = true,
-            _ => {}
+    loop {
+        let read = reader
+            .read(&mut chunk)
+            .await
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            if !pending.is_empty() {
+                return Err("Codex JSONL ended with an unterminated frame".to_owned());
+            }
+            break;
         }
-        if let Some(rendered) = render_codex_json_event(&event) {
-            let _ = tx
-                .send(RuntimeEvent::Output {
-                    stream: RuntimeOutputStream::Stdout,
-                    bytes: rendered,
-                })
-                .await;
+        pending.extend_from_slice(&chunk[..read]);
+        if pending.len() > MAX_CODEX_JSONL_FRAME_BYTES {
+            return Err("Codex JSONL frame exceeded the 256 KiB limit".to_owned());
+        }
+        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            let line = pending.drain(..=newline).collect::<Vec<_>>();
+            let line = String::from_utf8_lossy(&line[..line.len() - 1]);
+            let event: Value = serde_json::from_str(&line)
+                .map_err(|error| format!("malformed Codex JSONL: {error}"))?;
+            let kind = event
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            match kind {
+                "turn.completed" => state.turn_completed = true,
+                "turn.failed" => state.turn_failed = true,
+                _ => {}
+            }
+            if let Some(rendered) = render_codex_json_event(&event) {
+                let _ = tx
+                    .send(RuntimeEvent::Output {
+                        stream: RuntimeOutputStream::Stdout,
+                        bytes: rendered,
+                    })
+                    .await;
+            }
         }
     }
     Ok(state)
@@ -518,12 +573,20 @@ async fn read_stderr(
     stderr: tokio::process::ChildStderr,
     tx: mpsc::Sender<RuntimeEvent>,
 ) -> Result<(), String> {
-    let mut lines = BufReader::new(stderr).lines();
-    while let Some(line) = lines.next_line().await.map_err(|error| error.to_string())? {
+    let mut reader = BufReader::new(stderr);
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let read = reader
+            .read(&mut chunk)
+            .await
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
         let _ = tx
             .send(RuntimeEvent::Output {
                 stream: RuntimeOutputStream::Stderr,
-                bytes: format!("{line}\n").into_bytes(),
+                bytes: chunk[..read].to_vec(),
             })
             .await;
     }
@@ -581,12 +644,30 @@ impl RuntimeTempFiles {
         })
     }
     async fn read_result(&self) -> Result<RelayResult, String> {
-        let bytes = tokio::fs::read(&self.result_path)
+        let metadata = tokio::fs::metadata(&self.result_path)
             .await
             .map_err(|error| format!("missing Codex structured result: {error}"))?;
-        serde_json::from_slice(&bytes)
-            .map_err(|error| format!("invalid Codex structured result: {error}"))
+        if metadata.len() > MAX_CODEX_RESULT_BYTES {
+            return Err("Codex structured result exceeded the 64 KiB limit".to_owned());
+        }
+        let bytes = tokio::fs::read(&self.result_path)
+            .await
+            .map_err(|error| format!("could not read Codex structured result: {error}"))?;
+        let mut result: RelayResult = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("invalid Codex structured result: {error}"))?;
+        result.summary = bounded_result_text(&result.summary);
+        result.verification_summary = bounded_result_text(&result.verification_summary);
+        Ok(result)
     }
+}
+
+fn bounded_result_text(input: &str) -> String {
+    let mut safe = input
+        .chars()
+        .filter(|character| *character == '\n' || *character == '\t' || !character.is_control())
+        .collect::<String>();
+    truncate_utf8_to_bytes(&mut safe, MAX_CODEX_RESULT_TEXT_BYTES);
+    safe
 }
 impl Drop for RuntimeTempFiles {
     fn drop(&mut self) {
@@ -704,15 +785,39 @@ fn launcher_command(executable: &Path, args: &[String]) -> Command {
     command
 }
 
+fn sanitize_git_environment(command: &mut Command) {
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+    ] {
+        command.env_remove(key);
+    }
+    for (key, _) in env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_CONFIG_KEY_")
+            || key.to_string_lossy().starts_with("GIT_CONFIG_VALUE_")
+        {
+            command.env_remove(key);
+        }
+    }
+}
+
 async fn discover_command(
     executable: &Path,
     args: &[&str],
 ) -> Result<std::process::Output, DiscoveryError> {
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
-    match timeout(
-        DISCOVERY_TIMEOUT,
-        launcher_command(executable, &args).output(),
-    )
+    match timeout(DISCOVERY_TIMEOUT, {
+        let mut command = launcher_command(executable, &args);
+        command.kill_on_drop(true);
+        sanitize_git_environment(&mut command);
+        command.output()
+    })
     .await
     {
         Ok(Ok(output)) => Ok(output),
@@ -737,18 +842,25 @@ fn required_exec_flags_present(output: &std::process::Output) -> bool {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    [
+    let required = [
         "--json",
         "--ignore-user-config",
+        "--ignore-rules",
+        "--ephemeral",
         "--strict-config",
         "--sandbox",
         "--cd",
         "--output-schema",
         "--output-last-message",
         "-c",
-    ]
-    .iter()
-    .all(|flag| help.contains(flag))
+    ];
+    required.iter().all(|flag| {
+        help.lines().any(|line| {
+            line.split_whitespace()
+                .map(|token| token.trim_matches(|character| matches!(character, ',' | ':')))
+                .any(|token| token == *flag)
+        })
+    })
 }
 
 #[cfg(test)]
@@ -783,11 +895,18 @@ mod tests {
         assert!(spec.args.contains(&"--json".to_owned()));
         assert!(spec.args.contains(&"workspace-write".to_owned()));
         assert!(spec.args.contains(&"--ignore-user-config".to_owned()));
+        assert!(spec.args.contains(&"--ignore-rules".to_owned()));
+        assert!(spec.args.contains(&"--ephemeral".to_owned()));
         assert!(spec.args.contains(&"--strict-config".to_owned()));
         assert!(
             spec.args
                 .windows(2)
                 .any(|args| args == ["-c", "sandbox_workspace_write.writable_roots=[]"])
+        );
+        assert!(
+            spec.args
+                .windows(2)
+                .any(|args| { args == ["-c", "sandbox_workspace_write.network_access=false"] })
         );
         assert!(!spec.args.iter().any(|arg| arg.contains("git push")
             || arg.contains("full-auto")
@@ -856,6 +975,12 @@ mod tests {
         let rendered = String::from_utf8(render_codex_json_event(&command).unwrap()).unwrap();
         assert!(rendered.contains("✓ cargo test"));
         assert!(rendered.contains("running 3 tests"));
+        let failed_change = serde_json::json!({"type":"item.completed","item":{"type":"file_change","status":"failed","message":"patch rejected","changes":[]}});
+        let rendered = String::from_utf8(render_codex_json_event(&failed_change).unwrap()).unwrap();
+        assert!(rendered.contains("file change failed"));
+        let item_error = serde_json::json!({"type":"item.completed","item":{"type":"error","message":"tool failed"}});
+        let rendered = String::from_utf8(render_codex_json_event(&item_error).unwrap()).unwrap();
+        assert!(rendered.contains("tool failed"));
     }
 
     #[test]

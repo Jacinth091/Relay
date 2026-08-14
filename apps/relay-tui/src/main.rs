@@ -1169,12 +1169,24 @@ impl AppState {
     }
 
     async fn ensure_scheduler_driver(&mut self, scheduler: Arc<ExecutionScheduler<FakeRuntime>>) {
-        // Queue insertion is the synchronization point: an old driver may have become idle
-        // while submit awaited SQLite and scheduler mutex work.
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(1)).await;
         self.reap_finished_scheduler_driver().await;
-        if self.scheduler_driver.is_none() {
+        self.scheduler_snapshot = scheduler.snapshot().await;
+        self.start_scheduler_driver_if_queued(scheduler);
+    }
+
+    fn start_scheduler_driver_if_queued(
+        &mut self,
+        scheduler: Arc<ExecutionScheduler<FakeRuntime>>,
+    ) {
+        let has_queued_work = self.scheduler_snapshot.tasks.iter().any(|task| {
+            matches!(
+                task.status,
+                SchedulerTaskStatus::QueuedReady
+                    | SchedulerTaskStatus::QueuedGlobal
+                    | SchedulerTaskStatus::QueuedProject
+            )
+        });
+        if self.scheduler_driver.is_none() && !self.scheduler_rebind_pending && has_queued_work {
             self.scheduler_driver = Some(tokio::spawn(
                 async move { scheduler.run_until_idle().await },
             ));
@@ -1221,6 +1233,9 @@ impl AppState {
             && self.scheduler_snapshot.tasks.is_empty()
         {
             self.rebind_scheduler_if_idle();
+        }
+        if let Some(scheduler) = self.scheduler.clone() {
+            self.start_scheduler_driver_if_queued(scheduler);
         }
     }
 
@@ -2033,6 +2048,35 @@ mod tests {
         }));
 
         state.submit_selected_task().await;
+        assert!(state.scheduler_driver.is_some());
+        for _ in 0..20 {
+            state.tick().await;
+            if state.last_reports.contains_key(&task_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(state.last_reports.contains_key(&task_id));
+    }
+
+    #[tokio::test]
+    async fn tick_starts_a_driver_for_queued_work_without_one() {
+        let mut state = app_state_with_eligible_project_with_store().await;
+        state.start_paste_task();
+        state.paste_text = task_json();
+        state.submit_paste_task();
+        state.confirm_task_import().await;
+        let task_id = state.selected_task.unwrap();
+        state
+            .scheduler
+            .as_ref()
+            .unwrap()
+            .submit(task_id)
+            .await
+            .unwrap();
+
+        assert!(state.scheduler_driver.is_none());
+        state.tick().await;
         assert!(state.scheduler_driver.is_some());
         for _ in 0..20 {
             state.tick().await;

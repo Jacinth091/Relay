@@ -3,6 +3,7 @@ members = [
     "apps/relay-tui",
     "crates/relay-core",
     "crates/relay-protocol",
+    "crates/relay-store",
 ]
 resolver = "3"
 

@@ -14,3 +14,4 @@ path = "src/main.rs"
 crossterm = "0.28.1"
 ratatui = "0.29.0"
 relay-core = { path = "../../crates/relay-core" }
+tokio = { version = "1.43.0", features = ["macros", "rt"] }

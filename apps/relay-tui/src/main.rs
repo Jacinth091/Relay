@@ -353,6 +353,9 @@ fn codex_health_detail(health: &CodexRuntimeHealth, runtime: &CodexRuntime) -> S
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| "no supported executable resolved".to_owned());
     match health {
+        CodexRuntimeHealth::Checking => {
+            "  health probe pending; Run remains blocked until verification completes".to_owned()
+        }
         CodexRuntimeHealth::Available { version } => {
             format!("  {executable}\n  {version}\n✓ Codex authentication and exec compatibility")
         }
@@ -1466,9 +1469,7 @@ impl AppState {
             durable_tasks,
             selected_task: None,
             scheduler,
-            runtime_health: CodexRuntimeHealth::Available {
-                version: "test runtime".to_owned(),
-            },
+            runtime_health: CodexRuntimeHealth::Checking,
             git_health: "not checked".to_owned(),
             github_cli_health: "not checked (optional M10 prerequisite)".to_owned(),
             health_refresh: None,
@@ -2704,17 +2705,21 @@ mod tests {
             })
             .unwrap();
 
-        AppState::new(
+        let mut state = AppState::new(
             Relay::with_project_registry(registry),
             unique_temp_path("config").join("relay.toml"),
             true,
             "ready".to_owned(),
-        )
+        );
+        state.runtime_health = CodexRuntimeHealth::Available {
+            version: "test runtime".to_owned(),
+        };
+        state
     }
 
     async fn app_state_with_project_with_store() -> AppState {
         let state = app_state_with_project();
-        AppState::new_with_store(
+        let mut state = AppState::new_with_store(
             state.relay,
             state.config_path,
             state.registry_writable,
@@ -2722,7 +2727,11 @@ mod tests {
             Some(SqliteStore::in_memory().await.unwrap()),
             Vec::new(),
             "ready".to_owned(),
-        )
+        );
+        state.runtime_health = CodexRuntimeHealth::Available {
+            version: "test runtime".to_owned(),
+        };
+        state
     }
 
     async fn app_state_with_eligible_project_with_store() -> AppState {
@@ -2766,7 +2775,7 @@ mod tests {
                 github: None,
             })
             .unwrap();
-        AppState::new_with_store(
+        let mut state = AppState::new_with_store(
             Relay::with_project_registry(registry),
             unique_temp_path("config").join("relay.toml"),
             true,
@@ -2774,7 +2783,11 @@ mod tests {
             Some(SqliteStore::in_memory().await.unwrap()),
             Vec::new(),
             "ready".to_owned(),
-        )
+        );
+        state.runtime_health = CodexRuntimeHealth::Available {
+            version: "test runtime".to_owned(),
+        };
+        state
     }
 
     fn task_json() -> String {

@@ -50,6 +50,7 @@ impl Default for CodexRuntimeConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodexRuntimeHealth {
+    Checking,
     Available {
         version: String,
     },
@@ -76,6 +77,7 @@ impl CodexRuntimeHealth {
 
     pub fn display_status(&self) -> &'static str {
         match self {
+            Self::Checking => "Codex health check pending",
             Self::Available { .. } => "Codex available",
             Self::NotInstalled { .. } => "Codex not installed",
             Self::NotAuthenticated { .. } => "Codex not authenticated",

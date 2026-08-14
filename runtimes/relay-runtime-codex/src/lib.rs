@@ -336,6 +336,23 @@ impl Runtime for CodexRuntime {
     }
 }
 
+async fn terminate_process_tree(child: &mut tokio::process::Child) {
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let pid = pid.to_string();
+        let mut taskkill = Command::new("taskkill");
+        taskkill
+            .args(["/T", "/F", "/PID", pid.as_str()])
+            .kill_on_drop(true);
+        let _ = taskkill.status().await;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = child.kill().await;
+    }
+    let _ = child.wait().await;
+}
+
 async fn run_child(
     mut child: tokio::process::Child,
     stdout: tokio::process::ChildStdout,
@@ -352,8 +369,7 @@ async fn run_child(
         tokio::select! {
             status = child.wait() => break status.map_err(|error| error.to_string()),
             _ = cancellation.cancelled() => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                terminate_process_tree(&mut child).await;
                 stdout_reader.abort();
                 stderr_reader.abort();
                 let _ = tx.send(RuntimeEvent::Outcome(RuntimeOutcome::new(RuntimeOutcomeKind::Cancelled, "Codex execution cancelled"))).await;
@@ -363,15 +379,13 @@ async fn run_child(
                 match result {
                     Ok(Ok(state)) => stdout_result = Some(Ok(state)),
                     Ok(Err(error)) => {
-                        let _ = child.kill().await;
-                        let _ = child.wait().await;
+                        terminate_process_tree(&mut child).await;
                         stderr_reader.abort();
                         let _ = tx.send(RuntimeEvent::InvalidOutput { reason: error }).await;
                         return;
                     }
                     Err(error) => {
-                        let _ = child.kill().await;
-                        let _ = child.wait().await;
+                        terminate_process_tree(&mut child).await;
                         stderr_reader.abort();
                         let _ = tx.send(RuntimeEvent::InvalidOutput { reason: format!("stdout reader failed: {error}") }).await;
                         return;
@@ -382,15 +396,13 @@ async fn run_child(
                 match result {
                     Ok(Ok(())) => stderr_result = Some(Ok(())),
                     Ok(Err(error)) => {
-                        let _ = child.kill().await;
-                        let _ = child.wait().await;
+                        terminate_process_tree(&mut child).await;
                         stdout_reader.abort();
                         let _ = tx.send(RuntimeEvent::InvalidOutput { reason: error }).await;
                         return;
                     }
                     Err(error) => {
-                        let _ = child.kill().await;
-                        let _ = child.wait().await;
+                        terminate_process_tree(&mut child).await;
                         stdout_reader.abort();
                         let _ = tx.send(RuntimeEvent::InvalidOutput { reason: format!("stderr reader failed: {error}") }).await;
                         return;
@@ -835,7 +847,9 @@ fn launcher_command(executable: &Path, args: &[String]) -> Command {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"))
     {
         let mut command = Command::new("cmd.exe");
-        command.arg("/C").arg(executable).args(args);
+        command.args(["/D", "/C", "call"]);
+        command.arg(executable);
+        command.args(args);
         return command;
     }
     let mut command = Command::new(executable);
@@ -1069,5 +1083,26 @@ mod tests {
         std::fs::write(&file, b"fixture").unwrap();
         assert_eq!(resolve_executable(&file, true).unwrap(), file);
         let _ = std::fs::remove_file(file);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_cmd_launcher_preserves_argument_boundaries() {
+        let root = std::env::temp_dir().join(format!("relay-codex cmd {}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("codex.cmd");
+        std::fs::write(&script, "@echo off\r\necho %1\r\n").unwrap();
+        let args = vec!["value with spaces & symbols".to_owned()];
+        let output = launcher_command(&script, &args).output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "status={:?} stderr={:?} stdout={:?}",
+            output.status,
+            output.stderr,
+            output.stdout
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("value with spaces & symbols"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

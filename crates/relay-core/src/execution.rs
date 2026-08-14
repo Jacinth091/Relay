@@ -542,30 +542,14 @@ async fn run_task<R: Runtime>(
     };
 
     if cancellation.is_cancelled() {
-        let _ = crate::update_stored_task_state(
+        return finish_pre_claim_cancellation(
             &store,
+            &event_tx,
             queued.task_id,
-            TaskState::Ready,
-            TaskState::Cancelled,
+            preflight.stored.project_key,
+            output,
         )
         .await;
-        send(
-            &event_tx,
-            CoreExecutionEvent::ExecutionCancelled {
-                task_id: queued.task_id,
-                execution_id: None,
-            },
-        );
-        return ExecutionReport {
-            task_id: queued.task_id,
-            project_key: preflight.stored.project_key,
-            execution_id: None,
-            final_state: Some(TaskState::Cancelled),
-            outcome: Some(RuntimeOutcomeKind::Cancelled),
-            outcome_summary: Some("execution cancelled before runtime start".to_owned()),
-            persistence_error: None,
-            output: output.snapshot(),
-        };
     }
 
     let execution_id = ExecutionId::new();
@@ -1104,6 +1088,57 @@ async fn begin_repair(
         },
     );
     Ok(TaskState::Repairing)
+}
+
+async fn finish_pre_claim_cancellation(
+    store: &SqliteStore,
+    event_tx: &broadcast::Sender<CoreExecutionEvent>,
+    task_id: TaskId,
+    project_key: ProjectKey,
+    output: BoundedOutputBuffer,
+) -> ExecutionReport {
+    if let Err(error) =
+        crate::update_stored_task_state(store, task_id, TaskState::Ready, TaskState::Cancelled)
+            .await
+    {
+        return persistence_failed_report(
+            event_tx,
+            task_id,
+            project_key,
+            None,
+            error.to_string(),
+            output,
+        );
+    }
+
+    send(
+        event_tx,
+        CoreExecutionEvent::ExecutionCancelled {
+            task_id,
+            execution_id: None,
+        },
+    );
+    send(
+        event_tx,
+        CoreExecutionEvent::ExecutionFinished {
+            task_id,
+            execution_id: None,
+            final_state: TaskState::Cancelled,
+            outcome: RuntimeOutcomeKind::Cancelled,
+            summary: "execution cancelled before runtime start".to_owned(),
+        },
+    );
+
+    ExecutionReport {
+        task_id,
+        project_key,
+        execution_id: None,
+        final_state: Some(TaskState::Cancelled),
+        outcome: Some(RuntimeOutcomeKind::Cancelled),
+        outcome_summary: Some("execution cancelled before runtime start".to_owned()),
+        persistence_error: None,
+        output: output.snapshot(),
+    }
 }
 
 struct FinishPlan<'a> {
@@ -1775,6 +1810,44 @@ mod tests {
         assert_eq!(reports[0].outcome, None);
         assert!(reports[0].persistence_error.is_some());
         assert_task_state(&fixture.store, task, TaskState::Cancelled).await;
+    }
+
+    #[tokio::test]
+    async fn pre_claim_cancellation_persistence_conflict_fails_closed() {
+        let fixture = Fixture::new(&[("a", true)]).await;
+        let task = fixture
+            .import_task("a", "pre claim cancellation persistence failure")
+            .await;
+        let stored = get_stored_task(&fixture.store, task)
+            .await
+            .unwrap()
+            .unwrap();
+        crate::update_stored_task_state(&fixture.store, task, TaskState::Ready, TaskState::Running)
+            .await
+            .unwrap();
+        let (event_tx, mut events) = broadcast::channel(4);
+
+        let report = finish_pre_claim_cancellation(
+            &fixture.store,
+            &event_tx,
+            task,
+            stored.project_key,
+            BoundedOutputBuffer::new(1024),
+        )
+        .await;
+
+        assert_eq!(report.final_state, None);
+        assert_eq!(report.outcome, None);
+        assert!(report.persistence_error.is_some());
+        assert_task_state(&fixture.store, task, TaskState::Running).await;
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            CoreExecutionEvent::ExecutionPersistenceFailed {
+                task_id,
+                execution_id: None,
+                ..
+            } if task_id == task
+        ));
     }
 
     async fn run_tasks<R: Runtime>(

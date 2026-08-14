@@ -1085,6 +1085,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "relay-runtime-codex"
+version = "0.1.0"
+dependencies = [
+ "relay-protocol",
+ "relay-runtime",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "relay-runtime-fake"
 version = "0.1.0"
 dependencies = [
@@ -1109,6 +1122,7 @@ dependencies = [
  "ratatui",
  "relay-core",
  "relay-runtime",
+ "relay-runtime-codex",
  "relay-runtime-fake",
  "tokio",
 ]
@@ -1671,6 +1685,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

@@ -28,7 +28,11 @@ use relay_core::{
     SchedulerTaskStatus, SqliteStore, StoredTask, TaskId, TaskImportCandidate, TaskState,
     default_config_path, default_database_path, list_stored_tasks,
 };
-use relay_runtime::RuntimeOutputStream;
+use relay_runtime::{
+    CancellationToken, Runtime, RuntimeCapabilities, RuntimeIdentity, RuntimeOutputStream,
+    RuntimeRequest, RuntimeStartFuture,
+};
+use relay_runtime_codex::{CodexRuntime, CodexRuntimeHealth};
 use relay_runtime_fake::FakeRuntime;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -60,6 +64,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         durable_tasks,
         format!("{feedback}\n{database_feedback}"),
     );
+    state.runtime_health = CodexRuntime::default().discover().await;
     let mut terminal = initialize_terminal()?;
 
     let run_result = run(&mut terminal, &mut state).await;
@@ -292,20 +297,36 @@ fn render_task_review(frame: &mut Frame, state: &AppState, area: Rect) {
             let preflight = state.ui_preflight(task);
             let action = if task.state == TaskState::Ready && preflight == "eligible" {
                 "\n\n[R] Run  [B] Back"
-            } else if matches!(task.state, TaskState::Done | TaskState::Failed | TaskState::Cancelled) {
+            } else if matches!(
+                task.state,
+                TaskState::Done | TaskState::Failed | TaskState::Cancelled
+            ) {
                 "\n\n[Enter] View result  [B] Back"
-            } else if matches!(task.state, TaskState::NeedsClarification | TaskState::NeedsDecision) {
+            } else if matches!(
+                task.state,
+                TaskState::NeedsClarification | TaskState::NeedsDecision
+            ) {
                 "\n\nATTENTION REQUIRED: external resolution is required.\n[B] Back"
-            } else { "\n\n[B] Back" };
+            } else {
+                "\n\n[B] Back"
+            };
             format!(
-                "Task: {}\nProject: {}\nRuntime: Relay Fake Runtime\nProfile: fake/default\nState: {}\nRepository: {}\n\n{}{}",
+                "Task: {}\nProject: {}\nRuntime: {}\nState: {}\nRepository: {}\n\n{}{}",
                 task.id,
                 task.project_key,
+                state.runtime_label(),
                 task.state.as_str(),
                 preflight,
                 handoff_summary_text(
-                    &task.handoff, task.project_key.as_str(), state.relay.resolve_project(task.project_key.as_str()).ok().and_then(|p| p.name())
-                ), action
+                    &task.handoff,
+                    task.project_key.as_str(),
+                    state
+                        .relay
+                        .resolve_project(task.project_key.as_str())
+                        .ok()
+                        .and_then(|p| p.name())
+                ),
+                action
             )
         })
         .unwrap_or_else(|| "No durable task selected.".to_owned());
@@ -321,8 +342,9 @@ fn render_execution(frame: &mut Frame, state: &AppState, area: Rect) {
     let body = state.selected_task.and_then(|id| state.execution_views.get(&id).map(|view| (id, view))).map(|(id, view)| {
         let task = state.durable_tasks.iter().find(|task| task.id == id);
         let output = view.output.iter().cloned().collect::<Vec<_>>().join("");
-        format!("Task: {id}\nProject: {}\nRuntime: Relay Fake Runtime\nScheduler: {}\nPhase: {}\nRepair: {}\nElapsed: {}s\n{}\n\nOutput:\n{}\n\n[C] Cancel  [B] Background / Tasks",
+        format!("Task: {id}\nProject: {}\nRuntime: {}\nScheduler: {}\nPhase: {}\nRepair: {}\nElapsed: {}s\n{}\n\nOutput:\n{}\n\n[C] Cancel  [B] Background / Tasks",
             task.map(|task| task.project_key.as_str()).unwrap_or("unknown"),
+            state.runtime_label(),
             view.scheduler_status.as_ref().map(scheduler_status_text).unwrap_or("not scheduled"),
             view.durable_state.map(|state| state.as_str()).unwrap_or("state pending"), view.repair_attempt,
             view.started_at.map(|started| started.elapsed().as_secs()).unwrap_or(0),
@@ -340,8 +362,8 @@ fn render_result(frame: &mut Frame, state: &AppState, area: Rect) {
     let body = state.selected_stored_task().map(|task| {
         let report = state.last_reports.get(&task.id);
         let repository = state.relay.inspect_project_repository(task.project_key.as_str()).ok().map(|i| repository_inspection_line(&i.eligibility, &i.status)).unwrap_or_else(|| "unavailable".to_owned());
-        format!("Task: {}\nProject: {}\nRuntime: Relay Fake Runtime\nState: {}\nOutcome: {}\nVerification: {}\nRepairs: {}\nRepository: {}\n\nSummary:\n{}\n\n[T] Tasks  [D] Dashboard  [N] New Task",
-            task.id, task.project_key, task.state.as_str(), report.and_then(|r| r.outcome).map(|o| o.as_str()).unwrap_or("not confirmed"),
+        format!("Task: {}\nProject: {}\nRuntime: {}\nState: {}\nOutcome: {}\nVerification: {}\nRepairs: {}\nRepository: {}\n\nSummary:\n{}\n\n[T] Tasks  [D] Dashboard  [N] New Task",
+            task.id, task.project_key, state.runtime_label(), task.state.as_str(), report.and_then(|r| r.outcome).map(|o| o.as_str()).unwrap_or("not confirmed"),
             if task.state == TaskState::Done { "PASS" } else { "not available" }, state.execution_views.get(&task.id).map(|v| v.repair_attempt).unwrap_or(0), repository,
             report.and_then(|r| r.outcome_summary.as_deref()).unwrap_or("No confirmed execution report."))
     }).unwrap_or_else(|| "No durable task selected.".to_owned());
@@ -848,6 +870,52 @@ fn add_field_line(state: &AppState, field: AddProjectField, label: &str, value: 
     format!("{marker} {label}: {value}")
 }
 
+/// TUI-local production/test selection. Core remains generic over `Runtime`.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+enum AppRuntime {
+    Codex(CodexRuntime),
+    Fake(FakeRuntime),
+}
+
+impl Default for AppRuntime {
+    fn default() -> Self {
+        #[cfg(test)]
+        {
+            Self::Fake(FakeRuntime::default())
+        }
+        #[cfg(not(test))]
+        {
+            Self::Codex(CodexRuntime::default())
+        }
+    }
+}
+
+impl Runtime for AppRuntime {
+    fn identity(&self) -> RuntimeIdentity {
+        match self {
+            Self::Codex(runtime) => runtime.identity(),
+            Self::Fake(runtime) => runtime.identity(),
+        }
+    }
+    fn capabilities(&self) -> RuntimeCapabilities {
+        match self {
+            Self::Codex(runtime) => runtime.capabilities(),
+            Self::Fake(runtime) => runtime.capabilities(),
+        }
+    }
+    fn start(
+        &self,
+        request: RuntimeRequest,
+        cancellation: CancellationToken,
+    ) -> RuntimeStartFuture {
+        match self {
+            Self::Codex(runtime) => runtime.start(request, cancellation),
+            Self::Fake(runtime) => runtime.start(request, cancellation),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct AppState {
     relay: Relay,
@@ -857,7 +925,8 @@ struct AppState {
     store: Option<SqliteStore>,
     durable_tasks: Vec<StoredTask>,
     selected_task: Option<TaskId>,
-    scheduler: Option<Arc<ExecutionScheduler<FakeRuntime>>>,
+    scheduler: Option<Arc<ExecutionScheduler<AppRuntime>>>,
+    runtime_health: CodexRuntimeHealth,
     scheduler_events: Option<broadcast::Receiver<CoreExecutionEvent>>,
     scheduler_snapshot: SchedulerSnapshot,
     scheduler_driver:
@@ -892,6 +961,15 @@ struct ExecutionViewState {
 const UI_OUTPUT_BYTE_LIMIT: usize = 16 * 1024;
 
 impl AppState {
+    fn runtime_label(&self) -> String {
+        let identity = AppRuntime::default().identity();
+        format!(
+            "{}\nProfile: {}\nStatus: {}",
+            identity.display_name,
+            identity.profile_id,
+            self.runtime_health.display_status()
+        )
+    }
     #[cfg(test)]
     fn new(relay: Relay, config_path: PathBuf, registry_writable: bool, feedback: String) -> Self {
         Self::new_with_store(
@@ -918,7 +996,7 @@ impl AppState {
             Arc::new(ExecutionScheduler::new(
                 relay.clone(),
                 store.clone(),
-                Arc::new(FakeRuntime::default()),
+                Arc::new(AppRuntime::default()),
                 ExecutionLimits::default(),
             ))
         });
@@ -932,6 +1010,9 @@ impl AppState {
             durable_tasks,
             selected_task: None,
             scheduler,
+            runtime_health: CodexRuntimeHealth::Available {
+                version: "test runtime".to_owned(),
+            },
             scheduler_events,
             scheduler_snapshot: SchedulerSnapshot { tasks: Vec::new() },
             scheduler_driver: None,
@@ -1019,7 +1100,10 @@ impl AppState {
             return "unavailable: task is not READY".to_owned();
         }
         if self.scheduler.is_none() {
-            return "unavailable: local Fake Runtime or store is unavailable".to_owned();
+            return "unavailable: local runtime or store is unavailable".to_owned();
+        }
+        if !self.runtime_health.is_ready() {
+            return format!("unavailable: {}", self.runtime_health.display_status());
         }
         if !task.handoff.extensions.is_empty() {
             return "unavailable: unsupported task extensions".to_owned();
@@ -1139,7 +1223,7 @@ impl AppState {
         let scheduler = Arc::new(ExecutionScheduler::new(
             self.relay.clone(),
             store.clone(),
-            Arc::new(FakeRuntime::default()),
+            Arc::new(AppRuntime::default()),
             ExecutionLimits::default(),
         ));
         self.scheduler_events = Some(scheduler.subscribe());
@@ -1168,16 +1252,13 @@ impl AppState {
         self.refresh_durable_tasks().await;
     }
 
-    async fn ensure_scheduler_driver(&mut self, scheduler: Arc<ExecutionScheduler<FakeRuntime>>) {
+    async fn ensure_scheduler_driver(&mut self, scheduler: Arc<ExecutionScheduler<AppRuntime>>) {
         self.reap_finished_scheduler_driver().await;
         self.scheduler_snapshot = scheduler.snapshot().await;
         self.start_scheduler_driver_if_queued(scheduler);
     }
 
-    fn start_scheduler_driver_if_queued(
-        &mut self,
-        scheduler: Arc<ExecutionScheduler<FakeRuntime>>,
-    ) {
+    fn start_scheduler_driver_if_queued(&mut self, scheduler: Arc<ExecutionScheduler<AppRuntime>>) {
         let has_queued_work = self.scheduler_snapshot.tasks.iter().any(|task| {
             matches!(
                 task.status,

@@ -39,6 +39,48 @@ use tokio::task::JoinHandle;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
+const CODEX_DEFAULT_MAX_DURATION_SECS: u64 = 30 * 60;
+const CODEX_MAX_DURATION_SECS: u64 = 4 * 60 * 60;
+
+fn parse_codex_duration(value: Option<&str>) -> Result<Duration, String> {
+    let seconds = match value {
+        None => CODEX_DEFAULT_MAX_DURATION_SECS,
+        Some(value) => value
+            .parse::<u64>()
+            .map_err(|_| "RELAY_CODEX_MAX_DURATION_SECS must be a positive integer".to_owned())?,
+    };
+    if seconds == 0 || seconds > CODEX_MAX_DURATION_SECS {
+        return Err(format!(
+            "RELAY_CODEX_MAX_DURATION_SECS must be between 1 and {CODEX_MAX_DURATION_SECS}"
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+#[cfg(not(test))]
+fn production_codex_execution_limits() -> ExecutionLimits {
+    ExecutionLimits {
+        max_duration: parse_codex_duration(
+            std::env::var("RELAY_CODEX_MAX_DURATION_SECS")
+                .ok()
+                .as_deref(),
+        )
+        .unwrap_or_else(|_| Duration::from_secs(CODEX_DEFAULT_MAX_DURATION_SECS)),
+        ..ExecutionLimits::default()
+    }
+}
+
+fn app_execution_limits() -> ExecutionLimits {
+    #[cfg(test)]
+    {
+        ExecutionLimits::default()
+    }
+    #[cfg(not(test))]
+    {
+        production_codex_execution_limits()
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config_path = default_config_path();
@@ -997,7 +1039,7 @@ impl AppState {
                 relay.clone(),
                 store.clone(),
                 Arc::new(AppRuntime::default()),
-                ExecutionLimits::default(),
+                app_execution_limits(),
             ))
         });
         let scheduler_events = scheduler.as_ref().map(|scheduler| scheduler.subscribe());
@@ -1224,7 +1266,7 @@ impl AppState {
             self.relay.clone(),
             store.clone(),
             Arc::new(AppRuntime::default()),
-            ExecutionLimits::default(),
+            app_execution_limits(),
         ));
         self.scheduler_events = Some(scheduler.subscribe());
         self.scheduler = Some(scheduler);
@@ -1729,6 +1771,21 @@ mod tests {
         );
 
         assert!(dashboard_status(&state).starts_with("No projects configured.\nNo durable tasks."));
+    }
+
+    #[test]
+    fn codex_duration_parser_is_bounded() {
+        assert_eq!(
+            parse_codex_duration(None).unwrap(),
+            Duration::from_secs(1_800)
+        );
+        assert_eq!(
+            parse_codex_duration(Some("3600")).unwrap(),
+            Duration::from_secs(3_600)
+        );
+        assert!(parse_codex_duration(Some("0")).is_err());
+        assert!(parse_codex_duration(Some("14401")).is_err());
+        assert!(parse_codex_duration(Some("invalid")).is_err());
     }
 
     #[test]

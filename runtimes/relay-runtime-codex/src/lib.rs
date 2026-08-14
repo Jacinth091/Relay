@@ -58,6 +58,10 @@ pub enum CodexRuntimeHealth {
         version: Option<String>,
         error: String,
     },
+    Incompatible {
+        version: String,
+        reason: String,
+    },
     DiscoveryFailed {
         error: String,
     },
@@ -73,6 +77,7 @@ impl CodexRuntimeHealth {
             Self::Available { .. } => "Codex available",
             Self::NotInstalled { .. } => "Codex not installed",
             Self::NotAuthenticated { .. } => "Codex not authenticated",
+            Self::Incompatible { .. } => "Codex CLI incompatible",
             Self::DiscoveryFailed { .. } => "Codex discovery failed",
         }
     }
@@ -111,17 +116,45 @@ impl CodexRuntime {
             }
         };
         match discover_command(&self.config.executable, &["login", "status"]).await {
-            Ok(output) if output.status.success() => CodexRuntimeHealth::Available { version },
-            Ok(output) => CodexRuntimeHealth::NotAuthenticated {
-                version: Some(version),
-                error: safe_process_error(
-                    &output.stderr,
-                    "codex login status reported no active login",
-                ),
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                return CodexRuntimeHealth::NotAuthenticated {
+                    version: Some(version),
+                    error: safe_process_error(
+                        &output.stderr,
+                        "codex login status reported no active login",
+                    ),
+                };
+            }
+            Err(DiscoveryError::Spawn(error)) => {
+                return CodexRuntimeHealth::DiscoveryFailed { error };
+            }
+            Err(DiscoveryError::Timeout) => {
+                return CodexRuntimeHealth::DiscoveryFailed {
+                    error: "codex login status timed out".to_owned(),
+                };
+            }
+        };
+        match discover_command(
+            &self.config.executable,
+            &["--ask-for-approval", "never", "exec", "--help"],
+        )
+        .await
+        {
+            Ok(output) if output.status.success() && required_exec_flags_present(&output) => {
+                CodexRuntimeHealth::Available { version }
+            }
+            Ok(output) if output.status.success() => CodexRuntimeHealth::Incompatible {
+                version,
+                reason: "installed Codex CLI is missing required M8 exec flags".to_owned(),
+            },
+            Ok(output) => CodexRuntimeHealth::Incompatible {
+                version,
+                reason: safe_process_error(&output.stderr, "Codex exec compatibility probe failed"),
             },
             Err(DiscoveryError::Spawn(error)) => CodexRuntimeHealth::DiscoveryFailed { error },
             Err(DiscoveryError::Timeout) => CodexRuntimeHealth::DiscoveryFailed {
-                error: "codex login status timed out".to_owned(),
+                error: "Codex exec compatibility probe timed out".to_owned(),
             },
         }
     }
@@ -133,12 +166,18 @@ impl CodexRuntime {
         result_path: &Path,
     ) -> CodexCommandSpec {
         let mut args = vec![
-            "exec".to_owned(),
-            "--json".to_owned(),
-            "--sandbox".to_owned(),
-            "workspace-write".to_owned(),
             "--ask-for-approval".to_owned(),
             "never".to_owned(),
+            "exec".to_owned(),
+            "--ignore-user-config".to_owned(),
+            "--strict-config".to_owned(),
+            "--json".to_owned(),
+            "--color".to_owned(),
+            "never".to_owned(),
+            "--sandbox".to_owned(),
+            "workspace-write".to_owned(),
+            "-c".to_owned(),
+            "sandbox_workspace_write.writable_roots=[]".to_owned(),
             "--cd".to_owned(),
             request.trusted_working_dir.display().to_string(),
             "--output-schema".to_owned(),
@@ -308,6 +347,73 @@ struct StreamState {
     turn_failed: bool,
 }
 
+const EVENT_OUTPUT_BYTE_LIMIT: usize = 2 * 1024;
+
+fn render_codex_json_event(event: &Value) -> Option<Vec<u8>> {
+    let kind = event.get("type")?.as_str()?;
+    let text = match kind {
+        "thread.started" => "› Codex session started".to_owned(),
+        "turn.started" => "› Codex started working".to_owned(),
+        "error" => format!(
+            "× Codex: {}",
+            bounded_event_text(
+                event
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("runtime error")
+            )
+        ),
+        "item.started" | "item.updated" | "item.completed" => render_item_event(event)?,
+        _ => return None,
+    };
+    Some(format!("{text}\n").into_bytes())
+}
+
+fn render_item_event(event: &Value) -> Option<String> {
+    let item = event.get("item")?;
+    match item.get("type")?.as_str()? {
+        "agent_message" => Some(format!(
+            "› {}",
+            bounded_event_text(item.get("text").and_then(Value::as_str)?)
+        )),
+        "command_execution" => {
+            let command = bounded_event_text(
+                item.get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("command"),
+            );
+            match event.get("type").and_then(Value::as_str) {
+                Some("item.started") => Some(format!("› Running {command}")),
+                Some("item.completed")
+                    if item.get("exit_code").and_then(Value::as_i64) == Some(0) =>
+                {
+                    Some(format!("✓ {command}"))
+                }
+                Some("item.completed") => Some(format!("× {command} failed")),
+                _ => None,
+            }
+        }
+        "file_change" => item
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|path| format!("› Modified {}", bounded_event_text(path))),
+        "reasoning" => Some("› Codex is analyzing the task".to_owned()),
+        _ => None,
+    }
+}
+
+fn bounded_event_text(input: &str) -> String {
+    let mut safe: String = input
+        .chars()
+        .filter(|character| *character == '\n' || *character == '\t' || !character.is_control())
+        .collect();
+    if safe.len() > EVENT_OUTPUT_BYTE_LIMIT {
+        safe.truncate(EVENT_OUTPUT_BYTE_LIMIT);
+        safe.push('…');
+    }
+    safe
+}
+
 async fn read_stdout(
     stdout: tokio::process::ChildStdout,
     tx: mpsc::Sender<RuntimeEvent>,
@@ -324,16 +430,15 @@ async fn read_stdout(
         match kind {
             "turn.completed" => state.turn_completed = true,
             "turn.failed" => state.turn_failed = true,
-            "thread.started" | "turn.started" | "item.started" | "item.updated"
-            | "item.completed" | "error" => {
-                let _ = tx
-                    .send(RuntimeEvent::Output {
-                        stream: RuntimeOutputStream::Stdout,
-                        bytes: format!("Codex event: {kind}\n").into_bytes(),
-                    })
-                    .await;
-            }
             _ => {}
+        }
+        if let Some(rendered) = render_codex_json_event(&event) {
+            let _ = tx
+                .send(RuntimeEvent::Output {
+                    stream: RuntimeOutputStream::Stdout,
+                    bytes: rendered,
+                })
+                .await;
         }
     }
     Ok(state)
@@ -484,6 +589,26 @@ fn safe_process_error(bytes: &[u8], fallback: &str) -> String {
     }
 }
 
+fn required_exec_flags_present(output: &std::process::Output) -> bool {
+    let help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    [
+        "--json",
+        "--ignore-user-config",
+        "--strict-config",
+        "--sandbox",
+        "--cd",
+        "--output-schema",
+        "--output-last-message",
+        "-c",
+    ]
+    .iter()
+    .all(|flag| help.contains(flag))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,13 +637,23 @@ mod tests {
         let runtime = CodexRuntime::default();
         let request = request("; git push\n--full-auto $(rm -rf .)");
         let spec = runtime.command_spec(&request, Path::new("schema"), Path::new("result"));
-        assert!(spec.args.contains(&"exec".to_owned()));
+        assert_eq!(spec.args[..3], ["--ask-for-approval", "never", "exec"]);
         assert!(spec.args.contains(&"--json".to_owned()));
         assert!(spec.args.contains(&"workspace-write".to_owned()));
+        assert!(spec.args.contains(&"--ignore-user-config".to_owned()));
+        assert!(spec.args.contains(&"--strict-config".to_owned()));
+        assert!(
+            spec.args
+                .windows(2)
+                .any(|args| args == ["-c", "sandbox_workspace_write.writable_roots=[]"])
+        );
         assert!(!spec.args.iter().any(|arg| arg.contains("git push")
             || arg.contains("full-auto")
             || arg.contains("skip-git-repo-check")
-            || arg == "--yolo"));
+            || arg.contains("--add-dir")
+            || arg.contains("danger-full-access")
+            || arg == "--yolo"
+            || arg.contains("dangerously-bypass")));
     }
     #[test]
     fn prompt_preserves_policy_and_repair_details() {
@@ -551,5 +686,20 @@ mod tests {
             .is_err()
         );
         assert!(serde_json::from_str::<RelayResult>(r#"{\"outcome\":\"success\",\"summary\":\"x\",\"verification_summary\":\"y\",\"extra\":true}"#).is_err());
+    }
+
+    #[test]
+    fn formatter_surfaces_safe_progress_and_hides_reasoning_text() {
+        let command = serde_json::json!({"type":"item.started","item":{"type":"command_execution","command":"cargo check --workspace"}});
+        assert_eq!(
+            String::from_utf8(render_codex_json_event(&command).unwrap()).unwrap(),
+            "› Running cargo check --workspace\n"
+        );
+        let reasoning = serde_json::json!({"type":"item.completed","item":{"type":"reasoning","text":"private chain of thought"}});
+        assert_eq!(
+            String::from_utf8(render_codex_json_event(&reasoning).unwrap()).unwrap(),
+            "› Codex is analyzing the task\n"
+        );
+        assert!(render_codex_json_event(&serde_json::json!({"type":"future.event"})).is_none());
     }
 }

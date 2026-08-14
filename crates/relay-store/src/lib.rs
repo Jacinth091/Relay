@@ -473,6 +473,90 @@ impl SqliteStore {
             })
     }
 
+    pub async fn transition_task_and_increment_repair_count(
+        &self,
+        task_id: &str,
+        expected_task_state: &str,
+        execution_id: &str,
+    ) -> Result<(TaskRecord, ExecutionRecord), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        let result = sqlx::query(
+            r#"
+            UPDATE tasks
+            SET state = 'repairing',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+              AND state = ?2
+            "#,
+        )
+        .bind(task_id)
+        .bind(expected_task_state)
+        .execute(&mut *transaction)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            let actual_state =
+                sqlx::query_scalar::<_, String>("SELECT state FROM tasks WHERE id = ?1")
+                    .bind(task_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+
+            return match actual_state {
+                Some(actual_state) => Err(StoreError::StateConflict {
+                    id: task_id.to_owned(),
+                    expected_state: expected_task_state.to_owned(),
+                    actual_state,
+                }),
+                None => Err(StoreError::TaskNotFound {
+                    id: task_id.to_owned(),
+                }),
+            };
+        }
+
+        let execution_result = sqlx::query(
+            r#"
+            UPDATE executions
+            SET phase = 'repairing',
+                repair_attempt_count = repair_attempt_count + 1
+            WHERE id = ?1
+              AND task_id = ?2
+            "#,
+        )
+        .bind(execution_id)
+        .bind(task_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        if execution_result.rows_affected() == 0 {
+            return Err(StoreError::ExecutionNotFound {
+                id: execution_id.to_owned(),
+            });
+        }
+
+        insert_event(
+            &mut transaction,
+            Some(task_id),
+            Some(execution_id),
+            "repair_started",
+            Some(r#"{"phase":"repairing"}"#),
+        )
+        .await?;
+
+        let task = fetch_task(&mut *transaction, task_id)
+            .await?
+            .ok_or_else(|| StoreError::TaskNotFound {
+                id: task_id.to_owned(),
+            })?;
+        let execution = fetch_execution(&mut *transaction, execution_id)
+            .await?
+            .ok_or_else(|| StoreError::ExecutionNotFound {
+                id: execution_id.to_owned(),
+            })?;
+        transaction.commit().await?;
+        Ok((task, execution))
+    }
+
     pub async fn finish_execution(
         &self,
         task_id: &str,
@@ -1108,6 +1192,35 @@ mod tests {
             Some("implementation_failure")
         );
         assert!(execution.ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn repair_start_transition_and_count_increment_are_atomic() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store
+            .insert_task(&task_record("task-repair-atomic", "Atomic repair"))
+            .await
+            .unwrap();
+        store
+            .claim_ready_task_for_execution(&execution_record(
+                "exec-repair-atomic",
+                "task-repair-atomic",
+            ))
+            .await
+            .unwrap();
+
+        let (task, execution) = store
+            .transition_task_and_increment_repair_count(
+                "task-repair-atomic",
+                "running",
+                "exec-repair-atomic",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(task.state, "repairing");
+        assert_eq!(execution.phase, "repairing");
+        assert_eq!(execution.repair_attempt_count, 1);
     }
 
     #[tokio::test]

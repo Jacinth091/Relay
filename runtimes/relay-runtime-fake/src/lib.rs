@@ -64,7 +64,7 @@ pub struct ObservedRuntimeRequest {
     pub task_id: String,
     pub trusted_working_dir: std::path::PathBuf,
     pub action: String,
-    pub ignored_extension_count: usize,
+    pub intent_title: String,
 }
 
 impl FakeRuntime {
@@ -144,7 +144,7 @@ impl Runtime for FakeRuntime {
                 task_id: request.task_id.clone(),
                 trusted_working_dir: request.trusted_working_dir.clone(),
                 action: format!("{:?}", request.action),
-                ignored_extension_count: request.handoff.extensions.len(),
+                intent_title: request.intent.title.clone(),
             });
 
         Box::pin(async move {

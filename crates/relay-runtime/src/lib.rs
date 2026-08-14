@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 
-use relay_protocol::HandoffTask;
+use relay_protocol::AmbiguityPolicy;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc};
@@ -77,10 +77,21 @@ pub enum RuntimeAction {
 pub struct RuntimeRequest {
     pub execution_id: ExecutionId,
     pub task_id: String,
-    pub handoff: HandoffTask,
+    pub intent: RuntimeTaskIntent,
     pub trusted_working_dir: PathBuf,
     pub action: RuntimeAction,
     pub profile_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeTaskIntent {
+    pub title: String,
+    pub goal: String,
+    pub requirements: Vec<String>,
+    pub constraints: Vec<String>,
+    pub verification: Vec<String>,
+    pub requested_stack: Option<String>,
+    pub ambiguity_policy: AmbiguityPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

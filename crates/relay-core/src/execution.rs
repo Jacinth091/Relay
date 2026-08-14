@@ -6,7 +6,7 @@ use std::{
 
 use relay_runtime::{
     CancellationToken, ExecutionId, Runtime, RuntimeAction, RuntimeEvent, RuntimeOutcome,
-    RuntimeOutcomeKind, RuntimeOutputStream, RuntimeRequest,
+    RuntimeOutcomeKind, RuntimeOutputStream, RuntimeRequest, RuntimeTaskIntent,
 };
 use relay_store::NewExecutionRecord;
 use serde_json::json;
@@ -101,6 +101,11 @@ pub enum CoreExecutionEvent {
         execution_id: ExecutionId,
         stream: RuntimeOutputStream,
         byte_len: usize,
+        bytes: Vec<u8>,
+    },
+    SchedulerStatusChanged {
+        task_id: TaskId,
+        status: SchedulerTaskStatus,
     },
     VerificationStarted {
         task_id: TaskId,
@@ -134,6 +139,12 @@ pub enum CoreExecutionEvent {
         execution_id: Option<ExecutionId>,
         final_state: TaskState,
         outcome: RuntimeOutcomeKind,
+        summary: String,
+    },
+    ExecutionPersistenceFailed {
+        task_id: TaskId,
+        execution_id: Option<ExecutionId>,
+        error: String,
     },
     TaskStateChanged {
         task_id: TaskId,
@@ -148,6 +159,7 @@ pub enum PreflightFailure {
     TaskNotReady { actual: TaskState },
     ProjectResolution { message: String },
     RepositoryNotEligible { message: String },
+    UnsupportedExtensions { namespaces: Vec<String> },
     Store { message: String },
 }
 
@@ -158,15 +170,44 @@ pub struct ExecutionReport {
     pub execution_id: Option<ExecutionId>,
     pub final_state: Option<TaskState>,
     pub outcome: Option<RuntimeOutcomeKind>,
+    pub outcome_summary: Option<String>,
+    pub persistence_error: Option<String>,
     pub output: BoundedOutputSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundedOutputSnapshot {
+    pub chunks: Vec<RetainedOutputChunk>,
     pub retained_bytes: usize,
     pub retained_chunks: usize,
     pub dropped_bytes: usize,
     pub dropped_chunks: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedOutputChunk {
+    pub stream: RuntimeOutputStream,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerSnapshot {
+    pub tasks: Vec<SchedulerTaskSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerTaskSnapshot {
+    pub task_id: TaskId,
+    pub project_key: ProjectKey,
+    pub status: SchedulerTaskStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchedulerTaskStatus {
+    Running,
+    QueuedReady,
+    QueuedGlobal,
+    QueuedProject,
 }
 
 #[derive(Debug)]
@@ -217,6 +258,13 @@ impl<R: Runtime> ExecutionScheduler<R> {
         self.event_tx.subscribe()
     }
 
+    pub async fn snapshot(&self) -> SchedulerSnapshot {
+        let inner = self.inner.lock().await;
+        SchedulerSnapshot {
+            tasks: inner.task_snapshots(&self.limits),
+        }
+    }
+
     pub async fn submit(&self, task_id: TaskId) -> Result<(), ExecutionSchedulerError> {
         let stored = get_stored_task(&self.store, task_id)
             .await?
@@ -242,6 +290,13 @@ impl<R: Runtime> ExecutionScheduler<R> {
             task_id,
             project_key: queued.project_key,
         });
+        let status = {
+            let inner = self.inner.lock().await;
+            inner.status_for_queued_task(task_id, &self.limits)
+        };
+        if let Some(status) = status {
+            self.send(CoreExecutionEvent::SchedulerStatusChanged { task_id, status });
+        }
         self.notify.notify_waiters();
         Ok(())
     }
@@ -283,6 +338,7 @@ impl<R: Runtime> ExecutionScheduler<R> {
                 execution_id: None,
                 final_state: TaskState::Cancelled,
                 outcome: RuntimeOutcomeKind::Cancelled,
+                summary: "queued execution cancelled".to_owned(),
             });
         }
 
@@ -350,6 +406,10 @@ impl<R: Runtime> ExecutionScheduler<R> {
 
                 (queued, cancellation)
             };
+            self.send(CoreExecutionEvent::SchedulerStatusChanged {
+                task_id: queued.0.task_id,
+                status: SchedulerTaskStatus::Running,
+            });
 
             let relay = self.relay.clone();
             let store = self.store.clone();
@@ -389,6 +449,58 @@ impl<R: Runtime> ExecutionScheduler<R> {
     }
 }
 
+impl SchedulerInner {
+    fn task_snapshots(&self, limits: &ExecutionLimits) -> Vec<SchedulerTaskSnapshot> {
+        let mut tasks = self
+            .active
+            .iter()
+            .map(|(task_id, active)| SchedulerTaskSnapshot {
+                task_id: *task_id,
+                project_key: active.project_key.clone(),
+                status: SchedulerTaskStatus::Running,
+            })
+            .collect::<Vec<_>>();
+        tasks.extend(self.queue.iter().map(|queued| SchedulerTaskSnapshot {
+            task_id: queued.task_id,
+            project_key: queued.project_key.clone(),
+            status: self.queued_status(queued, limits),
+        }));
+        tasks
+    }
+
+    fn status_for_queued_task(
+        &self,
+        task_id: TaskId,
+        limits: &ExecutionLimits,
+    ) -> Option<SchedulerTaskStatus> {
+        self.queue
+            .iter()
+            .find(|queued| queued.task_id == task_id)
+            .map(|queued| self.queued_status(queued, limits))
+    }
+
+    fn queued_status(
+        &self,
+        queued: &QueuedExecution,
+        limits: &ExecutionLimits,
+    ) -> SchedulerTaskStatus {
+        if self.active.len() >= limits.max_parallel {
+            SchedulerTaskStatus::QueuedGlobal
+        } else if self.active.contains_key(&queued.task_id)
+            || self
+                .active_by_project
+                .get(&queued.project_key)
+                .copied()
+                .unwrap_or(0)
+                >= limits.per_project_max_parallel
+        {
+            SchedulerTaskStatus::QueuedProject
+        } else {
+            SchedulerTaskStatus::QueuedReady
+        }
+    }
+}
+
 async fn run_task<R: Runtime>(
     relay: Relay,
     store: SqliteStore,
@@ -422,6 +534,8 @@ async fn run_task<R: Runtime>(
                 execution_id: None,
                 final_state: None,
                 outcome: None,
+                outcome_summary: None,
+                persistence_error: None,
                 output: output.snapshot(),
             };
         }
@@ -448,6 +562,8 @@ async fn run_task<R: Runtime>(
             execution_id: None,
             final_state: Some(TaskState::Cancelled),
             outcome: Some(RuntimeOutcomeKind::Cancelled),
+            outcome_summary: Some("execution cancelled before runtime start".to_owned()),
+            persistence_error: None,
             output: output.snapshot(),
         };
     }
@@ -481,6 +597,8 @@ async fn run_task<R: Runtime>(
             execution_id: None,
             final_state: None,
             outcome: None,
+            outcome_summary: None,
+            persistence_error: Some(error.to_string()),
             output: output.snapshot(),
         };
     }
@@ -512,6 +630,7 @@ async fn run_task<R: Runtime>(
                     TaskState::Cancelled,
                     RuntimeOutcomeKind::Cancelled,
                 ),
+                "execution cancelled".to_owned(),
                 output,
             )
             .await;
@@ -531,6 +650,7 @@ async fn run_task<R: Runtime>(
                     RuntimeOutcomeKind::Timeout,
                 )
                 .failure_category(RuntimeOutcomeKind::Timeout.as_str()),
+                "execution deadline exhausted".to_owned(),
                 output,
             )
             .await;
@@ -539,7 +659,15 @@ async fn run_task<R: Runtime>(
         let request = RuntimeRequest {
             execution_id,
             task_id: queued.task_id.to_string(),
-            handoff: preflight.stored.handoff.clone(),
+            intent: RuntimeTaskIntent {
+                title: preflight.stored.handoff.title.clone(),
+                goal: preflight.stored.handoff.task.goal.clone(),
+                requirements: preflight.stored.handoff.task.requirements.clone(),
+                constraints: preflight.stored.handoff.task.constraints.clone(),
+                verification: preflight.stored.handoff.task.verification.clone(),
+                requested_stack: preflight.stored.handoff.stack.clone(),
+                ambiguity_policy: preflight.stored.handoff.ambiguity_policy,
+            },
             trusted_working_dir: preflight.project.local_path().to_path_buf(),
             action: action.clone(),
             profile_id: identity.profile_id.clone(),
@@ -568,7 +696,7 @@ async fn run_task<R: Runtime>(
 
         match outcome.kind {
             RuntimeOutcomeKind::Success => {
-                task_state = transition(
+                task_state = match transition(
                     &store,
                     &event_tx,
                     queued.task_id,
@@ -578,7 +706,19 @@ async fn run_task<R: Runtime>(
                     "verifying",
                 )
                 .await
-                .unwrap_or(task_state);
+                {
+                    Ok(state) => state,
+                    Err(error) => {
+                        return persistence_failed_report(
+                            &event_tx,
+                            queued.task_id,
+                            preflight.stored.project_key.clone(),
+                            Some(execution_id),
+                            error.to_string(),
+                            output,
+                        );
+                    }
+                };
                 send(
                     &event_tx,
                     CoreExecutionEvent::VerificationStarted {
@@ -597,6 +737,7 @@ async fn run_task<R: Runtime>(
                         TaskState::Done,
                         RuntimeOutcomeKind::Success,
                     ),
+                    outcome.summary,
                     output,
                 )
                 .await;
@@ -605,7 +746,7 @@ async fn run_task<R: Runtime>(
                 if outcome.kind == RuntimeOutcomeKind::VerificationFailure
                     && task_state == TaskState::Running
                 {
-                    task_state = transition(
+                    task_state = match transition(
                         &store,
                         &event_tx,
                         queued.task_id,
@@ -615,7 +756,19 @@ async fn run_task<R: Runtime>(
                         "verifying",
                     )
                     .await
-                    .unwrap_or(task_state);
+                    {
+                        Ok(state) => state,
+                        Err(error) => {
+                            return persistence_failed_report(
+                                &event_tx,
+                                queued.task_id,
+                                preflight.stored.project_key.clone(),
+                                Some(execution_id),
+                                error.to_string(),
+                                output,
+                            );
+                        }
+                    };
                     send(
                         &event_tx,
                         CoreExecutionEvent::VerificationStarted {
@@ -638,26 +791,29 @@ async fn run_task<R: Runtime>(
                             outcome.kind,
                         )
                         .failure_category(outcome.kind.as_str()),
+                        outcome.summary,
                         output,
                     )
                     .await;
                 }
 
                 repair_attempts += 1;
-                task_state = transition(
-                    &store,
-                    &event_tx,
-                    queued.task_id,
-                    execution_id,
-                    task_state,
-                    TaskState::Repairing,
-                    "repairing",
-                )
-                .await
-                .unwrap_or(task_state);
-                let _ = store
-                    .increment_execution_repair_count(&execution_id.to_string())
-                    .await;
+                task_state =
+                    match begin_repair(&store, &event_tx, queued.task_id, execution_id, task_state)
+                        .await
+                    {
+                        Ok(state) => state,
+                        Err(error) => {
+                            return persistence_failed_report(
+                                &event_tx,
+                                queued.task_id,
+                                preflight.stored.project_key.clone(),
+                                Some(execution_id),
+                                error.to_string(),
+                                output,
+                            );
+                        }
+                    };
                 send(
                     &event_tx,
                     CoreExecutionEvent::RepairStarted {
@@ -671,7 +827,7 @@ async fn run_task<R: Runtime>(
                     attempt: repair_attempts,
                     previous_outcome: outcome.kind,
                 };
-                task_state = transition(
+                task_state = match transition(
                     &store,
                     &event_tx,
                     queued.task_id,
@@ -681,7 +837,19 @@ async fn run_task<R: Runtime>(
                     "running",
                 )
                 .await
-                .unwrap_or(task_state);
+                {
+                    Ok(state) => state,
+                    Err(error) => {
+                        return persistence_failed_report(
+                            &event_tx,
+                            queued.task_id,
+                            preflight.stored.project_key.clone(),
+                            Some(execution_id),
+                            error.to_string(),
+                            output,
+                        );
+                    }
+                };
                 send(
                     &event_tx,
                     CoreExecutionEvent::RepairAttempted {
@@ -711,6 +879,7 @@ async fn run_task<R: Runtime>(
                         RuntimeOutcomeKind::NeedsClarification,
                     )
                     .failure_category(RuntimeOutcomeKind::NeedsClarification.as_str()),
+                    outcome.summary,
                     output,
                 )
                 .await;
@@ -735,6 +904,7 @@ async fn run_task<R: Runtime>(
                         RuntimeOutcomeKind::NeedsDecision,
                     )
                     .failure_category(RuntimeOutcomeKind::NeedsDecision.as_str()),
+                    outcome.summary,
                     output,
                 )
                 .await;
@@ -751,6 +921,7 @@ async fn run_task<R: Runtime>(
                         TaskState::Cancelled,
                         RuntimeOutcomeKind::Cancelled,
                     ),
+                    outcome.summary,
                     output,
                 )
                 .await;
@@ -770,6 +941,7 @@ async fn run_task<R: Runtime>(
                         outcome.kind,
                     )
                     .failure_category(outcome.kind.as_str()),
+                    outcome.summary,
                     output,
                 )
                 .await;
@@ -804,12 +976,13 @@ async fn collect_runtime_events<R: Runtime>(
                 match event {
                     Some(RuntimeEvent::Output { stream, bytes }) => {
                         let byte_len = bytes.len();
-                        output.push(stream.clone(), bytes);
+                        let retained_bytes = output.push(stream.clone(), bytes);
                         send(event_tx, CoreExecutionEvent::RuntimeOutput {
                             task_id,
                             execution_id,
                             stream,
                             byte_len,
+                            bytes: retained_bytes,
                         });
                     }
                     Some(RuntimeEvent::Outcome(outcome)) => return outcome,
@@ -848,6 +1021,11 @@ async fn preflight(
     if stored.state != TaskState::Ready {
         return Err(PreflightFailure::TaskNotReady {
             actual: stored.state,
+        });
+    }
+    if !stored.handoff.extensions.is_empty() {
+        return Err(PreflightFailure::UnsupportedExtensions {
+            namespaces: stored.handoff.extensions.keys().cloned().collect(),
         });
     }
 
@@ -903,6 +1081,31 @@ async fn transition(
     Ok(to)
 }
 
+async fn begin_repair(
+    store: &SqliteStore,
+    event_tx: &broadcast::Sender<CoreExecutionEvent>,
+    task_id: TaskId,
+    execution_id: ExecutionId,
+    from: TaskState,
+) -> Result<TaskState, TaskPersistenceError> {
+    store
+        .transition_task_and_increment_repair_count(
+            &task_id.to_string(),
+            from.as_str(),
+            &execution_id.to_string(),
+        )
+        .await?;
+    send(
+        event_tx,
+        CoreExecutionEvent::TaskStateChanged {
+            task_id,
+            from,
+            to: TaskState::Repairing,
+        },
+    );
+    Ok(TaskState::Repairing)
+}
+
 struct FinishPlan<'a> {
     task_id: TaskId,
     project_key: ProjectKey,
@@ -943,9 +1146,10 @@ async fn finish(
     store: &SqliteStore,
     event_tx: &broadcast::Sender<CoreExecutionEvent>,
     plan: FinishPlan<'_>,
+    summary: String,
     output: BoundedOutputBuffer,
 ) -> ExecutionReport {
-    let _ = store
+    if let Err(error) = store
         .finish_execution(
             &plan.task_id.to_string(),
             plan.expected_state.as_str(),
@@ -954,7 +1158,18 @@ async fn finish(
             plan.outcome.as_str(),
             plan.failure_category,
         )
-        .await;
+        .await
+    {
+        return persistence_failed_report(
+            event_tx,
+            plan.task_id,
+            plan.project_key,
+            Some(plan.execution_id),
+            error.to_string(),
+            output,
+        );
+    }
+
     if plan.final_state == TaskState::Cancelled {
         send(
             event_tx,
@@ -971,6 +1186,7 @@ async fn finish(
             execution_id: Some(plan.execution_id),
             final_state: plan.final_state,
             outcome: plan.outcome,
+            summary: summary.clone(),
         },
     );
 
@@ -980,6 +1196,36 @@ async fn finish(
         execution_id: Some(plan.execution_id),
         final_state: Some(plan.final_state),
         outcome: Some(plan.outcome),
+        outcome_summary: Some(summary),
+        persistence_error: None,
+        output: output.snapshot(),
+    }
+}
+
+fn persistence_failed_report(
+    event_tx: &broadcast::Sender<CoreExecutionEvent>,
+    task_id: TaskId,
+    project_key: ProjectKey,
+    execution_id: Option<ExecutionId>,
+    error: String,
+    output: BoundedOutputBuffer,
+) -> ExecutionReport {
+    send(
+        event_tx,
+        CoreExecutionEvent::ExecutionPersistenceFailed {
+            task_id,
+            execution_id,
+            error: error.clone(),
+        },
+    );
+    ExecutionReport {
+        task_id,
+        project_key,
+        execution_id,
+        final_state: None,
+        outcome: None,
+        outcome_summary: None,
+        persistence_error: Some(error),
         output: output.snapshot(),
     }
 }
@@ -990,17 +1236,11 @@ fn send(event_tx: &broadcast::Sender<CoreExecutionEvent>, event: CoreExecutionEv
 
 #[derive(Debug)]
 struct BoundedOutputBuffer {
-    chunks: VecDeque<BufferedOutput>,
+    chunks: VecDeque<RetainedOutputChunk>,
     retained_bytes: usize,
     dropped_bytes: usize,
     dropped_chunks: usize,
     limit: usize,
-}
-
-#[derive(Debug)]
-struct BufferedOutput {
-    _stream: RuntimeOutputStream,
-    bytes: Vec<u8>,
 }
 
 impl BoundedOutputBuffer {
@@ -1014,19 +1254,17 @@ impl BoundedOutputBuffer {
         }
     }
 
-    fn push(&mut self, stream: RuntimeOutputStream, mut bytes: Vec<u8>) {
+    fn push(&mut self, stream: RuntimeOutputStream, mut bytes: Vec<u8>) -> Vec<u8> {
         if bytes.len() > self.limit {
             let drop_count = bytes.len() - self.limit;
             bytes.drain(..drop_count);
             self.dropped_bytes += drop_count;
             self.dropped_chunks += 1;
         }
+        let retained_for_event = bytes.clone();
 
         self.retained_bytes += bytes.len();
-        self.chunks.push_back(BufferedOutput {
-            _stream: stream,
-            bytes,
-        });
+        self.chunks.push_back(RetainedOutputChunk { stream, bytes });
 
         while self.retained_bytes > self.limit {
             if let Some(front) = self.chunks.pop_front() {
@@ -1038,10 +1276,12 @@ impl BoundedOutputBuffer {
                 break;
             }
         }
+        retained_for_event
     }
 
     fn snapshot(&self) -> BoundedOutputSnapshot {
         BoundedOutputSnapshot {
+            chunks: self.chunks.iter().cloned().collect(),
             retained_bytes: self.retained_bytes,
             retained_chunks: self.chunks.len(),
             dropped_bytes: self.dropped_bytes,
@@ -1065,6 +1305,7 @@ pub enum ExecutionSchedulerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use relay_runtime::{RuntimeCapabilities, RuntimeIdentity, RuntimeSession, RuntimeStartFuture};
     use relay_runtime_fake::{FakeRuntime, FakeRuntimeConfig, FakeScenario};
     use std::{
         fs,
@@ -1084,6 +1325,10 @@ mod tests {
         let reports = run_tasks(&scheduler, &[task]).await;
 
         assert_eq!(reports[0].final_state, Some(TaskState::Done));
+        assert_eq!(
+            String::from_utf8_lossy(&reports[0].output.chunks[0].bytes),
+            "fake implementation complete\n"
+        );
         assert_task_state(&fixture.store, task, TaskState::Done).await;
         let executions = fixture.executions(task).await;
         assert_eq!(executions.len(), 1);
@@ -1388,24 +1633,148 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_receives_only_core_resolved_trusted_working_directory() {
+    async fn unsupported_extensions_fail_preflight_before_runtime_dispatch() {
         let fixture = Fixture::new(&[("a", true)]).await;
         let task = fixture
             .import_task_with_extensions(
                 "a",
-                "extension ignored",
+                "extension rejected",
                 r#","extensions":{"fake":{"cwd":"C:/attacker","args":["bad"]}}"#,
             )
             .await;
         let runtime = Arc::new(FakeRuntime::default());
         let scheduler = fixture.scheduler(runtime.clone(), ExecutionLimits::default());
 
-        let _reports = run_tasks(&scheduler, &[task]).await;
+        let reports = run_tasks(&scheduler, &[task]).await;
 
-        let observed = runtime.observed_requests();
-        assert_eq!(observed.len(), 1);
-        assert_eq!(observed[0].trusted_working_dir, fixture.project_path("a"));
-        assert_eq!(observed[0].ignored_extension_count, 1);
+        assert_eq!(reports[0].execution_id, None);
+        assert_task_state(&fixture.store, task, TaskState::Ready).await;
+        assert!(runtime.observed_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn global_concurrency_limit_is_respected_across_projects() {
+        let fixture = Fixture::new(&[("a", true), ("b", true), ("c", true)]).await;
+        let a = fixture.import_task("a", "a").await;
+        let b = fixture.import_task("b", "b").await;
+        let c = fixture.import_task("c", "c").await;
+        let config = FakeRuntimeConfig {
+            stream_delay: Duration::from_millis(25),
+            slow_chunks: 5,
+            ..FakeRuntimeConfig::default()
+        };
+        let runtime = Arc::new(FakeRuntime::new(config));
+        for task_id in [a, b, c] {
+            runtime.set_task_scenario(task_id.to_string(), FakeScenario::SlowStreaming);
+        }
+        let scheduler = Arc::new(fixture.scheduler(
+            runtime,
+            ExecutionLimits::new(2, 1, 2, Duration::from_secs(5), 64 * 1024).unwrap(),
+        ));
+        let mut events = scheduler.subscribe();
+        for task_id in [a, b, c] {
+            scheduler.submit(task_id).await.unwrap();
+        }
+        let runner = {
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move { scheduler.run_until_idle().await.unwrap() })
+        };
+
+        let first_two = first_started_tasks(&mut events, 2).await;
+        assert_eq!(first_two.len(), 2);
+        assert!(!first_two.contains(&c) || !first_two.contains(&a) || !first_two.contains(&b));
+        let snapshot = scheduler.snapshot().await;
+        assert_eq!(
+            snapshot
+                .tasks
+                .iter()
+                .filter(|task| task.status == SchedulerTaskStatus::Running)
+                .count(),
+            2
+        );
+        assert!(
+            snapshot
+                .tasks
+                .iter()
+                .any(|task| task.status == SchedulerTaskStatus::QueuedGlobal)
+        );
+
+        let reports = runner.await.unwrap();
+        assert_eq!(reports.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn persistence_conflict_does_not_report_successful_intermediate_transition() {
+        let fixture = Fixture::new(&[("a", true)]).await;
+        let task = fixture
+            .import_task("a", "intermediate persistence failure")
+            .await;
+        let runtime = Arc::new(ControlledRuntime::new(RuntimeOutcomeKind::Success));
+        let scheduler = Arc::new(ExecutionScheduler::new(
+            fixture.relay.clone(),
+            fixture.store.clone(),
+            runtime.clone(),
+            ExecutionLimits::default(),
+        ));
+        scheduler.submit(task).await.unwrap();
+        let runner = {
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move { scheduler.run_until_idle().await.unwrap() })
+        };
+        wait_for_started(&scheduler, task).await;
+        crate::update_stored_task_state(
+            &fixture.store,
+            task,
+            TaskState::Running,
+            TaskState::Cancelled,
+        )
+        .await
+        .unwrap();
+        runtime.release();
+
+        let reports = runner.await.unwrap();
+
+        assert_eq!(reports[0].final_state, None);
+        assert_eq!(reports[0].outcome, None);
+        assert!(reports[0].persistence_error.is_some());
+        assert_task_state(&fixture.store, task, TaskState::Cancelled).await;
+    }
+
+    #[tokio::test]
+    async fn persistence_conflict_does_not_report_done_when_terminal_finish_fails() {
+        let fixture = Fixture::new(&[("a", true)]).await;
+        let task = fixture
+            .import_task("a", "terminal persistence failure")
+            .await;
+        let runtime = Arc::new(ControlledRuntime::new(RuntimeOutcomeKind::NeedsDecision));
+        let scheduler = Arc::new(ExecutionScheduler::new(
+            fixture.relay.clone(),
+            fixture.store.clone(),
+            runtime.clone(),
+            ExecutionLimits::default(),
+        ));
+        scheduler.submit(task).await.unwrap();
+        let runner = {
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move { scheduler.run_until_idle().await.unwrap() })
+        };
+        wait_for_started(&scheduler, task).await;
+        crate::update_stored_task_state(
+            &fixture.store,
+            task,
+            TaskState::Running,
+            TaskState::Cancelled,
+        )
+        .await
+        .unwrap();
+        runtime.release();
+
+        let reports = runner.await.unwrap();
+
+        assert_eq!(reports[0].final_state, None);
+        assert_eq!(reports[0].outcome, None);
+        assert!(reports[0].persistence_error.is_some());
+        assert_task_state(&fixture.store, task, TaskState::Cancelled).await;
     }
 
     async fn run_tasks<R: Runtime>(
@@ -1468,14 +1837,12 @@ mod tests {
     struct Fixture {
         relay: Relay,
         store: SqliteStore,
-        project_paths: HashMap<String, PathBuf>,
     }
 
     impl Fixture {
         async fn new(projects: &[(&str, bool)]) -> Self {
             let store = SqliteStore::in_memory().await.unwrap();
             let mut registry = crate::ProjectRegistry::empty();
-            let mut project_paths = HashMap::new();
             for (key, with_expected_remote) in projects {
                 let path = temp_git_repo(key);
                 if *with_expected_remote {
@@ -1491,12 +1858,10 @@ mod tests {
                         github: None,
                     })
                     .unwrap();
-                project_paths.insert((*key).to_owned(), path);
             }
             Self {
                 relay: Relay::with_project_registry(registry),
                 store,
-                project_paths,
             }
         }
 
@@ -1543,10 +1908,6 @@ mod tests {
                 .list_executions_for_task(&task_id.to_string())
                 .await
                 .unwrap()
-        }
-
-        fn project_path(&self, key: &str) -> PathBuf {
-            self.project_paths.get(key).unwrap().clone()
         }
     }
 
@@ -1596,5 +1957,78 @@ mod tests {
             .args(args)
             .output()
             .unwrap()
+    }
+
+    #[derive(Debug)]
+    struct ControlledRuntime {
+        outcome: RuntimeOutcomeKind,
+        release: Arc<Notify>,
+    }
+
+    impl ControlledRuntime {
+        fn new(outcome: RuntimeOutcomeKind) -> Self {
+            Self {
+                outcome,
+                release: Arc::new(Notify::new()),
+            }
+        }
+
+        fn release(&self) {
+            self.release.notify_waiters();
+        }
+    }
+
+    impl Runtime for ControlledRuntime {
+        fn identity(&self) -> RuntimeIdentity {
+            RuntimeIdentity {
+                runtime_id: "controlled".to_owned(),
+                profile_id: "controlled/default".to_owned(),
+                display_name: "Controlled Test Runtime".to_owned(),
+            }
+        }
+
+        fn capabilities(&self) -> RuntimeCapabilities {
+            RuntimeCapabilities {
+                streaming_output: true,
+                cancellation: true,
+                deterministic_outcome: true,
+            }
+        }
+
+        fn start(
+            &self,
+            _request: RuntimeRequest,
+            cancellation: CancellationToken,
+        ) -> RuntimeStartFuture {
+            let release = self.release.clone();
+            let outcome = self.outcome;
+            Box::pin(async move {
+                let (tx, rx) = mpsc::channel(4);
+                tokio::spawn(async move {
+                    tokio::select! {
+                        () = release.notified() => {
+                            let _ = tx
+                                .send(RuntimeEvent::Outcome(RuntimeOutcome::new(
+                                    outcome,
+                                    format!("controlled outcome: {}", outcome.as_str()),
+                                )))
+                                .await;
+                        }
+                        () = cancellation.cancelled() => {
+                            let _ = tx
+                                .send(RuntimeEvent::Outcome(RuntimeOutcome::new(
+                                    RuntimeOutcomeKind::Cancelled,
+                                    "controlled runtime cancelled",
+                                )))
+                                .await;
+                        }
+                    }
+                });
+                Ok(RuntimeSession {
+                    session_id: "controlled-session".to_owned(),
+                    events: rx,
+                })
+            })
+        }
     }
 }

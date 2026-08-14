@@ -1044,6 +1044,12 @@ impl AppState {
         if self.scheduler_rebind_pending {
             self.rebind_scheduler_if_idle();
         }
+        if self.scheduler_rebind_pending {
+            self.feedback =
+                "Scheduler refresh pending; new Run approvals resume after active work is idle."
+                    .to_owned();
+            return;
+        }
         let Some(task) = self.selected_stored_task().cloned() else {
             return;
         };
@@ -1077,12 +1083,7 @@ impl AppState {
                     .scheduler_status = Some(SchedulerTaskStatus::QueuedReady);
                 self.feedback = "Run approved. Queued for the scheduler.".to_owned();
                 self.screen = Screen::Execution;
-                if self.scheduler_driver.is_none() {
-                    self.scheduler_driver =
-                        Some(tokio::spawn(
-                            async move { scheduler.run_until_idle().await },
-                        ));
-                }
+                self.ensure_scheduler_driver(scheduler).await;
             }
             Err(error) => self.feedback = format!("Run was not queued: {error}"),
         }
@@ -1165,6 +1166,19 @@ impl AppState {
             Err(error) => self.feedback = format!("Scheduler driver stopped: {error}"),
         }
         self.refresh_durable_tasks().await;
+    }
+
+    async fn ensure_scheduler_driver(&mut self, scheduler: Arc<ExecutionScheduler<FakeRuntime>>) {
+        // Queue insertion is the synchronization point: an old driver may have become idle
+        // while submit awaited SQLite and scheduler mutex work.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        self.reap_finished_scheduler_driver().await;
+        if self.scheduler_driver.is_none() {
+            self.scheduler_driver = Some(tokio::spawn(
+                async move { scheduler.run_until_idle().await },
+            ));
+        }
     }
 
     async fn tick(&mut self) {
@@ -1605,6 +1619,7 @@ mod tests {
     use relay_core::ProjectRegistry;
     use std::{
         fs,
+        process::Command,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1974,6 +1989,61 @@ mod tests {
         assert!(state.scheduler_driver.is_none());
     }
 
+    #[tokio::test]
+    async fn active_registry_rebind_blocks_run_until_the_scheduler_is_rebound() {
+        let mut state = app_state_with_project_with_store().await;
+        state.start_paste_task();
+        state.paste_text = task_json();
+        state.submit_paste_task();
+        state.confirm_task_import().await;
+        let task_id = state.selected_task.unwrap();
+        state.scheduler_driver = Some(tokio::spawn(async {
+            std::future::pending::<Result<Vec<ExecutionReport>, relay_core::ExecutionSchedulerError>>().await
+        }));
+        state.add_project = AddProjectForm {
+            key: "other".to_owned(),
+            path: std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            expected_remote: String::new(),
+            default_stack: "fake".to_owned(),
+            github_owner: String::new(),
+            github_repo: String::new(),
+        };
+        state.submit_add_project().unwrap();
+
+        assert!(state.scheduler_rebind_pending);
+        state.submit_selected_task().await;
+        assert!(state.feedback.contains("Scheduler refresh pending"));
+        assert!(!state.execution_views.contains_key(&task_id));
+    }
+
+    #[tokio::test]
+    async fn submit_replaces_a_driver_that_finishes_during_queue_submission() {
+        let mut state = app_state_with_eligible_project_with_store().await;
+        state.start_paste_task();
+        state.paste_text = task_json();
+        state.submit_paste_task();
+        state.confirm_task_import().await;
+        let task_id = state.selected_task.unwrap();
+        state.scheduler_driver = Some(tokio::spawn(async {
+            tokio::task::yield_now().await;
+            Ok(Vec::new())
+        }));
+
+        state.submit_selected_task().await;
+        assert!(state.scheduler_driver.is_some());
+        for _ in 0..20 {
+            state.tick().await;
+            if state.last_reports.contains_key(&task_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(state.last_reports.contains_key(&task_id));
+    }
+
     #[test]
     fn add_project_does_not_overwrite_invalid_existing_config() {
         let config_path = unique_temp_path("invalid-existing-config").join("config.toml");
@@ -2032,6 +2102,58 @@ mod tests {
             state.relay,
             state.config_path,
             state.registry_writable,
+            unique_temp_path("state").join("relay.sqlite3"),
+            Some(SqliteStore::in_memory().await.unwrap()),
+            Vec::new(),
+            "ready".to_owned(),
+        )
+    }
+
+    async fn app_state_with_eligible_project_with_store() -> AppState {
+        let path = unique_temp_path("eligible-project");
+        fs::create_dir_all(&path).unwrap();
+        for args in [
+            vec!["init"],
+            vec![
+                "-c",
+                "user.name=Relay Test",
+                "-c",
+                "user.email=relay@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/relay.git",
+            ],
+        ] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&path)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let mut registry = ProjectRegistry::empty();
+        registry
+            .register(RegisterProject {
+                key: "relay".to_owned(),
+                name: Some("Relay".to_owned()),
+                local_path: path,
+                expected_remote: Some("https://github.com/example/relay.git".to_owned()),
+                default_stack: Some("fake".to_owned()),
+                github: None,
+            })
+            .unwrap();
+        AppState::new_with_store(
+            Relay::with_project_registry(registry),
+            unique_temp_path("config").join("relay.toml"),
+            true,
             unique_temp_path("state").join("relay.sqlite3"),
             Some(SqliteStore::in_memory().await.unwrap()),
             Vec::new(),

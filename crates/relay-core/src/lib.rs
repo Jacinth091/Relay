@@ -3,6 +3,7 @@
 //! Presentation-framework types do not belong in this crate.
 
 mod durable_state;
+mod execution;
 mod project_registry;
 mod repository_safety;
 mod task_ingress;
@@ -14,6 +15,11 @@ pub use relay_protocol::{AmbiguityPolicy, HandoffTask};
 pub use durable_state::{
     SqliteStore, StoredTask, TaskPersistenceError, TaskState, default_database_path,
     get_stored_task, list_stored_tasks, update_stored_task_state,
+};
+pub use execution::{
+    BoundedOutputSnapshot, CoreExecutionEvent, ExecutionLimits, ExecutionReport,
+    ExecutionScheduler, ExecutionSchedulerError, PreflightFailure, RetainedOutputChunk,
+    SchedulerSnapshot, SchedulerTaskSnapshot, SchedulerTaskStatus,
 };
 pub use project_registry::{
     ExpectedRemote, GitHubRepositoryMetadata, ProjectKey, ProjectRegistry, ProjectRegistryError,

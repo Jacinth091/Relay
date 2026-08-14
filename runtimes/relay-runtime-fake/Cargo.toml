@@ -1,0 +1,11 @@
+[package]
+name = "relay-runtime-fake"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+relay-runtime = { path = "../../crates/relay-runtime" }
+tokio = { version = "1.43.0", features = ["sync", "time", "rt"] }

@@ -3,7 +3,9 @@ members = [
     "apps/relay-tui",
     "crates/relay-core",
     "crates/relay-protocol",
+    "crates/relay-runtime",
     "crates/relay-store",
+    "runtimes/relay-runtime-fake",
 ]
 resolver = "3"
 

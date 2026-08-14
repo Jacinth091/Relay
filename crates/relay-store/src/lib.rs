@@ -43,6 +43,29 @@ pub struct TaskRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewExecutionRecord {
+    pub id: String,
+    pub task_id: String,
+    pub runtime_profile: String,
+    pub phase: String,
+    pub repository_snapshot_json: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionRecord {
+    pub id: String,
+    pub task_id: String,
+    pub runtime_profile: String,
+    pub phase: String,
+    pub repair_attempt_count: i64,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub exit_outcome: Option<String>,
+    pub failure_category: Option<String>,
+    pub repository_snapshot_json: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
@@ -189,6 +212,445 @@ impl SqliteStore {
             .ok_or_else(|| StoreError::TaskNotFound { id: id.to_owned() })
     }
 
+    pub async fn claim_ready_task_for_execution(
+        &self,
+        execution: &NewExecutionRecord,
+    ) -> Result<(TaskRecord, ExecutionRecord), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        let result = sqlx::query(
+            r#"
+            UPDATE tasks
+            SET state = 'running',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+              AND state = 'ready'
+            "#,
+        )
+        .bind(&execution.task_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            let actual_state =
+                sqlx::query_scalar::<_, String>("SELECT state FROM tasks WHERE id = ?1")
+                    .bind(&execution.task_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+
+            return match actual_state {
+                Some(actual_state) => Err(StoreError::StateConflict {
+                    id: execution.task_id.clone(),
+                    expected_state: "ready".to_owned(),
+                    actual_state,
+                }),
+                None => Err(StoreError::TaskNotFound {
+                    id: execution.task_id.clone(),
+                }),
+            };
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO executions (
+                id,
+                task_id,
+                runtime_profile,
+                phase,
+                repository_snapshot_json
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+        )
+        .bind(&execution.id)
+        .bind(&execution.task_id)
+        .bind(&execution.runtime_profile)
+        .bind(&execution.phase)
+        .bind(execution.repository_snapshot_json.as_deref())
+        .execute(&mut *transaction)
+        .await?;
+
+        insert_event(
+            &mut transaction,
+            Some(&execution.task_id),
+            Some(&execution.id),
+            "execution_started",
+            Some(r#"{"phase":"running"}"#),
+        )
+        .await?;
+
+        let task = fetch_task(&mut *transaction, &execution.task_id)
+            .await?
+            .ok_or_else(|| StoreError::TaskNotFound {
+                id: execution.task_id.clone(),
+            })?;
+        let execution = fetch_execution(&mut *transaction, &execution.id)
+            .await?
+            .ok_or_else(|| StoreError::ExecutionNotFound {
+                id: execution.id.clone(),
+            })?;
+        transaction.commit().await?;
+        Ok((task, execution))
+    }
+
+    pub async fn get_execution(&self, id: &str) -> Result<Option<ExecutionRecord>, StoreError> {
+        fetch_execution(&self.pool, id).await
+    }
+
+    pub async fn list_executions_for_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<ExecutionRecord>, StoreError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id,
+                task_id,
+                runtime_profile,
+                phase,
+                repair_attempt_count,
+                started_at,
+                ended_at,
+                exit_outcome,
+                failure_category,
+                repository_snapshot_json
+            FROM executions
+            WHERE task_id = ?1
+            ORDER BY started_at, id
+            "#,
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_execution_record).collect()
+    }
+
+    pub async fn update_execution_phase(
+        &self,
+        execution_id: &str,
+        phase: &str,
+    ) -> Result<ExecutionRecord, StoreError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE executions
+            SET phase = ?1
+            WHERE id = ?2
+            "#,
+        )
+        .bind(phase)
+        .bind(execution_id)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(StoreError::ExecutionNotFound {
+                id: execution_id.to_owned(),
+            });
+        }
+
+        self.get_execution(execution_id)
+            .await?
+            .ok_or_else(|| StoreError::ExecutionNotFound {
+                id: execution_id.to_owned(),
+            })
+    }
+
+    pub async fn transition_task_and_execution(
+        &self,
+        task_id: &str,
+        expected_task_state: &str,
+        new_task_state: &str,
+        execution_id: &str,
+        new_execution_phase: &str,
+    ) -> Result<(TaskRecord, ExecutionRecord), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        let result = sqlx::query(
+            r#"
+            UPDATE tasks
+            SET state = ?1,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?2
+              AND state = ?3
+            "#,
+        )
+        .bind(new_task_state)
+        .bind(task_id)
+        .bind(expected_task_state)
+        .execute(&mut *transaction)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            let actual_state =
+                sqlx::query_scalar::<_, String>("SELECT state FROM tasks WHERE id = ?1")
+                    .bind(task_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+
+            return match actual_state {
+                Some(actual_state) => Err(StoreError::StateConflict {
+                    id: task_id.to_owned(),
+                    expected_state: expected_task_state.to_owned(),
+                    actual_state,
+                }),
+                None => Err(StoreError::TaskNotFound {
+                    id: task_id.to_owned(),
+                }),
+            };
+        }
+
+        let execution_result = sqlx::query(
+            r#"
+            UPDATE executions
+            SET phase = ?1
+            WHERE id = ?2
+              AND task_id = ?3
+            "#,
+        )
+        .bind(new_execution_phase)
+        .bind(execution_id)
+        .bind(task_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        if execution_result.rows_affected() == 0 {
+            return Err(StoreError::ExecutionNotFound {
+                id: execution_id.to_owned(),
+            });
+        }
+
+        insert_event(
+            &mut transaction,
+            Some(task_id),
+            Some(execution_id),
+            "task_state_changed",
+            Some(&format!(
+                r#"{{"from":"{expected_task_state}","to":"{new_task_state}"}}"#
+            )),
+        )
+        .await?;
+
+        let task = fetch_task(&mut *transaction, task_id)
+            .await?
+            .ok_or_else(|| StoreError::TaskNotFound {
+                id: task_id.to_owned(),
+            })?;
+        let execution = fetch_execution(&mut *transaction, execution_id)
+            .await?
+            .ok_or_else(|| StoreError::ExecutionNotFound {
+                id: execution_id.to_owned(),
+            })?;
+        transaction.commit().await?;
+        Ok((task, execution))
+    }
+
+    pub async fn increment_execution_repair_count(
+        &self,
+        execution_id: &str,
+    ) -> Result<ExecutionRecord, StoreError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE executions
+            SET repair_attempt_count = repair_attempt_count + 1
+            WHERE id = ?1
+            "#,
+        )
+        .bind(execution_id)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(StoreError::ExecutionNotFound {
+                id: execution_id.to_owned(),
+            });
+        }
+
+        self.get_execution(execution_id)
+            .await?
+            .ok_or_else(|| StoreError::ExecutionNotFound {
+                id: execution_id.to_owned(),
+            })
+    }
+
+    pub async fn transition_task_and_increment_repair_count(
+        &self,
+        task_id: &str,
+        expected_task_state: &str,
+        execution_id: &str,
+    ) -> Result<(TaskRecord, ExecutionRecord), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        let result = sqlx::query(
+            r#"
+            UPDATE tasks
+            SET state = 'repairing',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+              AND state = ?2
+            "#,
+        )
+        .bind(task_id)
+        .bind(expected_task_state)
+        .execute(&mut *transaction)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            let actual_state =
+                sqlx::query_scalar::<_, String>("SELECT state FROM tasks WHERE id = ?1")
+                    .bind(task_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+
+            return match actual_state {
+                Some(actual_state) => Err(StoreError::StateConflict {
+                    id: task_id.to_owned(),
+                    expected_state: expected_task_state.to_owned(),
+                    actual_state,
+                }),
+                None => Err(StoreError::TaskNotFound {
+                    id: task_id.to_owned(),
+                }),
+            };
+        }
+
+        let execution_result = sqlx::query(
+            r#"
+            UPDATE executions
+            SET phase = 'repairing',
+                repair_attempt_count = repair_attempt_count + 1
+            WHERE id = ?1
+              AND task_id = ?2
+            "#,
+        )
+        .bind(execution_id)
+        .bind(task_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        if execution_result.rows_affected() == 0 {
+            return Err(StoreError::ExecutionNotFound {
+                id: execution_id.to_owned(),
+            });
+        }
+
+        insert_event(
+            &mut transaction,
+            Some(task_id),
+            Some(execution_id),
+            "repair_started",
+            Some(r#"{"phase":"repairing"}"#),
+        )
+        .await?;
+
+        let task = fetch_task(&mut *transaction, task_id)
+            .await?
+            .ok_or_else(|| StoreError::TaskNotFound {
+                id: task_id.to_owned(),
+            })?;
+        let execution = fetch_execution(&mut *transaction, execution_id)
+            .await?
+            .ok_or_else(|| StoreError::ExecutionNotFound {
+                id: execution_id.to_owned(),
+            })?;
+        transaction.commit().await?;
+        Ok((task, execution))
+    }
+
+    pub async fn finish_execution(
+        &self,
+        task_id: &str,
+        expected_task_state: &str,
+        terminal_task_state: &str,
+        execution_id: &str,
+        exit_outcome: &str,
+        failure_category: Option<&str>,
+    ) -> Result<(TaskRecord, ExecutionRecord), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        let result = sqlx::query(
+            r#"
+            UPDATE tasks
+            SET state = ?1,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?2
+              AND state = ?3
+            "#,
+        )
+        .bind(terminal_task_state)
+        .bind(task_id)
+        .bind(expected_task_state)
+        .execute(&mut *transaction)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            let actual_state =
+                sqlx::query_scalar::<_, String>("SELECT state FROM tasks WHERE id = ?1")
+                    .bind(task_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+
+            return match actual_state {
+                Some(actual_state) => Err(StoreError::StateConflict {
+                    id: task_id.to_owned(),
+                    expected_state: expected_task_state.to_owned(),
+                    actual_state,
+                }),
+                None => Err(StoreError::TaskNotFound {
+                    id: task_id.to_owned(),
+                }),
+            };
+        }
+
+        let execution_result = sqlx::query(
+            r#"
+            UPDATE executions
+            SET phase = 'finished',
+                ended_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                exit_outcome = ?1,
+                failure_category = ?2
+            WHERE id = ?3
+              AND task_id = ?4
+            "#,
+        )
+        .bind(exit_outcome)
+        .bind(failure_category)
+        .bind(execution_id)
+        .bind(task_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        if execution_result.rows_affected() == 0 {
+            return Err(StoreError::ExecutionNotFound {
+                id: execution_id.to_owned(),
+            });
+        }
+
+        insert_event(
+            &mut transaction,
+            Some(task_id),
+            Some(execution_id),
+            "execution_finished",
+            Some(&format!(
+                r#"{{"task_state":"{terminal_task_state}","exit_outcome":"{exit_outcome}"}}"#
+            )),
+        )
+        .await?;
+
+        let task = fetch_task(&mut *transaction, task_id)
+            .await?
+            .ok_or_else(|| StoreError::TaskNotFound {
+                id: task_id.to_owned(),
+            })?;
+        let execution = fetch_execution(&mut *transaction, execution_id)
+            .await?
+            .ok_or_else(|| StoreError::ExecutionNotFound {
+                id: execution_id.to_owned(),
+            })?;
+        transaction.commit().await?;
+        Ok((task, execution))
+    }
+
     pub async fn get_task(&self, id: &str) -> Result<Option<TaskRecord>, StoreError> {
         let row = sqlx::query(
             r#"
@@ -244,6 +706,28 @@ impl SqliteStore {
     }
 }
 
+async fn insert_event(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task_id: Option<&str>,
+    execution_id: Option<&str>,
+    event_kind: &str,
+    event_json: Option<&str>,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        r#"
+        INSERT INTO events (task_id, execution_id, event_kind, event_json)
+        VALUES (?1, ?2, ?3, ?4)
+        "#,
+    )
+    .bind(task_id)
+    .bind(execution_id)
+    .bind(event_kind)
+    .bind(event_json)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
 async fn fetch_task<'a>(
     executor: impl sqlx::Executor<'a, Database = sqlx::Sqlite>,
     id: &str,
@@ -268,6 +752,34 @@ async fn fetch_task<'a>(
     .await?;
 
     row.map(row_to_task_record).transpose()
+}
+
+async fn fetch_execution<'a>(
+    executor: impl sqlx::Executor<'a, Database = sqlx::Sqlite>,
+    id: &str,
+) -> Result<Option<ExecutionRecord>, StoreError> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            id,
+            task_id,
+            runtime_profile,
+            phase,
+            repair_attempt_count,
+            started_at,
+            ended_at,
+            exit_outcome,
+            failure_category,
+            repository_snapshot_json
+        FROM executions
+        WHERE id = ?1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(executor)
+    .await?;
+
+    row.map(row_to_execution_record).transpose()
 }
 
 /// Returns Relay's default local durable-state database path.
@@ -314,6 +826,21 @@ fn row_to_task_record(row: sqlx::sqlite::SqliteRow) -> Result<TaskRecord, StoreE
     })
 }
 
+fn row_to_execution_record(row: sqlx::sqlite::SqliteRow) -> Result<ExecutionRecord, StoreError> {
+    Ok(ExecutionRecord {
+        id: row.try_get("id")?,
+        task_id: row.try_get("task_id")?,
+        runtime_profile: row.try_get("runtime_profile")?,
+        phase: row.try_get("phase")?,
+        repair_attempt_count: row.try_get("repair_attempt_count")?,
+        started_at: row.try_get("started_at")?,
+        ended_at: row.try_get("ended_at")?,
+        exit_outcome: row.try_get("exit_outcome")?,
+        failure_category: row.try_get("failure_category")?,
+        repository_snapshot_json: row.try_get("repository_snapshot_json")?,
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("failed to create Relay database directory '{path}': {source}")]
@@ -329,6 +856,8 @@ pub enum StoreError {
     TaskMissingAfterInsert { id: String },
     #[error("task {id} was not found")]
     TaskNotFound { id: String },
+    #[error("execution {id} was not found")]
+    ExecutionNotFound { id: String },
     #[error("task {id} state conflict: expected '{expected_state}', found '{actual_state}'")]
     StateConflict {
         id: String,
@@ -534,6 +1063,279 @@ mod tests {
         assert_eq!(titles, ["task-1", "task-2"]);
     }
 
+    #[tokio::test]
+    async fn claims_ready_task_and_creates_execution_transactionally() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store
+            .insert_task(&task_record("task-exec", "Execute task"))
+            .await
+            .unwrap();
+
+        let (task, execution) = store
+            .claim_ready_task_for_execution(&execution_record("exec-1", "task-exec"))
+            .await
+            .unwrap();
+
+        assert_eq!(task.state, "running");
+        assert_eq!(execution.id, "exec-1");
+        assert_eq!(execution.task_id, "task-exec");
+        assert_eq!(execution.phase, "running");
+        assert_eq!(execution.repair_attempt_count, 0);
+        assert_eq!(
+            store.get_task("task-exec").await.unwrap().unwrap().state,
+            "running"
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_claim_rolls_back_when_execution_insert_fails() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store
+            .insert_task(&task_record("task-rollback-exec", "Rollback execution"))
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER fail_execution_insert
+            BEFORE INSERT ON executions
+            BEGIN
+                SELECT RAISE(ABORT, 'forced execution failure');
+            END
+            "#,
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        let error = store
+            .claim_ready_task_for_execution(&execution_record(
+                "exec-rollback",
+                "task-rollback-exec",
+            ))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("SQLite operation failed"));
+        assert_eq!(
+            store
+                .get_task("task-rollback-exec")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "ready"
+        );
+        assert!(
+            store
+                .get_execution("exec-rollback")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_phase_repair_count_and_terminal_outcomes_persist() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store
+            .insert_task(&task_record("task-life", "Lifecycle task"))
+            .await
+            .unwrap();
+        store
+            .claim_ready_task_for_execution(&execution_record("exec-life", "task-life"))
+            .await
+            .unwrap();
+
+        let execution = store
+            .update_execution_phase("exec-life", "verifying")
+            .await
+            .unwrap();
+        assert_eq!(execution.phase, "verifying");
+
+        let (_task, execution) = store
+            .transition_task_and_execution(
+                "task-life",
+                "running",
+                "repairing",
+                "exec-life",
+                "repairing",
+            )
+            .await
+            .unwrap();
+        assert_eq!(execution.phase, "repairing");
+
+        let execution = store
+            .increment_execution_repair_count("exec-life")
+            .await
+            .unwrap();
+        assert_eq!(execution.repair_attempt_count, 1);
+
+        store
+            .finish_execution(
+                "task-life",
+                "repairing",
+                "failed",
+                "exec-life",
+                "implementation_failure",
+                Some("implementation_failure"),
+            )
+            .await
+            .unwrap();
+        let execution = store.get_execution("exec-life").await.unwrap().unwrap();
+        assert_eq!(execution.phase, "finished");
+        assert_eq!(
+            execution.exit_outcome.as_deref(),
+            Some("implementation_failure")
+        );
+        assert_eq!(
+            execution.failure_category.as_deref(),
+            Some("implementation_failure")
+        );
+        assert!(execution.ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn repair_start_transition_and_count_increment_are_atomic() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store
+            .insert_task(&task_record("task-repair-atomic", "Atomic repair"))
+            .await
+            .unwrap();
+        store
+            .claim_ready_task_for_execution(&execution_record(
+                "exec-repair-atomic",
+                "task-repair-atomic",
+            ))
+            .await
+            .unwrap();
+
+        let (task, execution) = store
+            .transition_task_and_increment_repair_count(
+                "task-repair-atomic",
+                "running",
+                "exec-repair-atomic",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(task.state, "repairing");
+        assert_eq!(execution.phase, "repairing");
+        assert_eq!(execution.repair_attempt_count, 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_task_states_remain_consistent_with_execution_finish() {
+        for terminal in [
+            "done",
+            "failed",
+            "cancelled",
+            "needs_clarification",
+            "needs_decision",
+        ] {
+            let store = SqliteStore::in_memory().await.unwrap();
+            let task_id = format!("task-{terminal}");
+            let execution_id = format!("exec-{terminal}");
+            store
+                .insert_task(&task_record(&task_id, "Terminal task"))
+                .await
+                .unwrap();
+            store
+                .claim_ready_task_for_execution(&execution_record(&execution_id, &task_id))
+                .await
+                .unwrap();
+
+            let (task, execution) = store
+                .finish_execution(
+                    &task_id,
+                    "running",
+                    terminal,
+                    &execution_id,
+                    terminal,
+                    (terminal != "done").then_some(terminal),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(task.state, terminal);
+            assert_eq!(execution.phase, "finished");
+            assert_eq!(execution.exit_outcome.as_deref(), Some(terminal));
+            assert_eq!(
+                store.get_task(&task_id).await.unwrap().unwrap().state,
+                terminal
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_execution_lifecycle_updates_are_rejected() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store
+            .insert_task(&task_record("task-stale-exec", "Stale execution"))
+            .await
+            .unwrap();
+        store
+            .update_task_state("task-stale-exec", "ready", "cancelled")
+            .await
+            .unwrap();
+
+        let error = store
+            .claim_ready_task_for_execution(&execution_record("exec-stale", "task-stale-exec"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::StateConflict {
+                expected_state,
+                actual_state,
+                ..
+            } if expected_state == "ready" && actual_state == "cancelled"
+        ));
+        assert!(store.get_execution("exec-stale").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn completed_execution_metadata_survives_reopen() {
+        let database_path = temp_path("relay-execution-metadata.sqlite3");
+
+        {
+            let store = SqliteStore::open(&database_path).await.unwrap();
+            store
+                .insert_task(&task_record("task-reopen-exec", "Reopen execution"))
+                .await
+                .unwrap();
+            store
+                .claim_ready_task_for_execution(&execution_record(
+                    "exec-reopen",
+                    "task-reopen-exec",
+                ))
+                .await
+                .unwrap();
+            store
+                .finish_execution(
+                    "task-reopen-exec",
+                    "running",
+                    "done",
+                    "exec-reopen",
+                    "success",
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let reopened = SqliteStore::open(&database_path).await.unwrap();
+        let execution = reopened
+            .get_execution("exec-reopen")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(execution.task_id, "task-reopen-exec");
+        assert_eq!(execution.phase, "finished");
+        assert_eq!(execution.exit_outcome.as_deref(), Some("success"));
+    }
+
     fn task_record(id: &str, title: &str) -> NewTaskRecord {
         NewTaskRecord {
             id: id.to_owned(),
@@ -546,6 +1348,16 @@ mod tests {
             state: "ready".to_owned(),
             protocol_version: 1,
             handoff_json: TASK_JSON.to_owned(),
+        }
+    }
+
+    fn execution_record(id: &str, task_id: &str) -> NewExecutionRecord {
+        NewExecutionRecord {
+            id: id.to_owned(),
+            task_id: task_id.to_owned(),
+            runtime_profile: "fake/default".to_owned(),
+            phase: "running".to_owned(),
+            repository_snapshot_json: Some(r#"{"eligibility":"eligible"}"#.to_owned()),
         }
     }
 

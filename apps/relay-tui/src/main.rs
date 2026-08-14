@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     error::Error,
     io::{self, Stdout},
     path::PathBuf,
@@ -864,6 +864,8 @@ struct AppState {
         Option<JoinHandle<Result<Vec<ExecutionReport>, relay_core::ExecutionSchedulerError>>>,
     execution_views: HashMap<TaskId, ExecutionViewState>,
     last_reports: HashMap<TaskId, ExecutionReport>,
+    preflight_retry_pending: HashSet<TaskId>,
+    scheduler_rebind_pending: bool,
     cancel_confirmation: Option<TaskId>,
     screen: Screen,
     add_project: AddProjectForm,
@@ -935,6 +937,8 @@ impl AppState {
             scheduler_driver: None,
             execution_views: HashMap::new(),
             last_reports: HashMap::new(),
+            preflight_retry_pending: HashSet::new(),
+            scheduler_rebind_pending: false,
             cancel_confirmation: None,
             screen: Screen::Dashboard,
             add_project: AddProjectForm::default(),
@@ -1017,6 +1021,9 @@ impl AppState {
         if self.scheduler.is_none() {
             return "unavailable: local Fake Runtime or store is unavailable".to_owned();
         }
+        if !task.handoff.extensions.is_empty() {
+            return "unavailable: unsupported task extensions".to_owned();
+        }
         match self
             .relay
             .inspect_project_repository(task.project_key.as_str())
@@ -1033,6 +1040,10 @@ impl AppState {
     }
 
     async fn submit_selected_task(&mut self) {
+        self.reap_finished_scheduler_driver().await;
+        if self.scheduler_rebind_pending {
+            self.rebind_scheduler_if_idle();
+        }
         let Some(task) = self.selected_stored_task().cloned() else {
             return;
         };
@@ -1066,11 +1077,7 @@ impl AppState {
                     .scheduler_status = Some(SchedulerTaskStatus::QueuedReady);
                 self.feedback = "Run approved. Queued for the scheduler.".to_owned();
                 self.screen = Screen::Execution;
-                if self
-                    .scheduler_driver
-                    .as_ref()
-                    .is_none_or(JoinHandle::is_finished)
-                {
+                if self.scheduler_driver.is_none() {
                     self.scheduler_driver =
                         Some(tokio::spawn(
                             async move { scheduler.run_until_idle().await },
@@ -1111,22 +1118,57 @@ impl AppState {
         }
     }
 
-    async fn tick(&mut self) {
-        if let Some(driver) = self.scheduler_driver.as_ref()
-            && driver.is_finished()
-        {
-            let driver = self.scheduler_driver.take().expect("checked above");
-            match driver.await {
-                Ok(Ok(reports)) => {
-                    for report in reports {
-                        self.last_reports.insert(report.task_id, report);
-                    }
-                }
-                Ok(Err(error)) => self.feedback = format!("Scheduler driver failed: {error}"),
-                Err(error) => self.feedback = format!("Scheduler driver stopped: {error}"),
+    fn clear_preflight_retry_state(&mut self) {
+        for task_id in self.preflight_retry_pending.drain() {
+            if let Some(view) = self.execution_views.get_mut(&task_id) {
+                view.scheduler_status = None;
+                view.cancellation_requested = false;
             }
-            self.refresh_durable_tasks().await;
         }
+    }
+
+    fn rebind_scheduler_if_idle(&mut self) {
+        if self.scheduler_driver.is_some() || !self.scheduler_snapshot.tasks.is_empty() {
+            self.scheduler_rebind_pending = true;
+            return;
+        }
+        let Some(store) = &self.store else {
+            return;
+        };
+        let scheduler = Arc::new(ExecutionScheduler::new(
+            self.relay.clone(),
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            ExecutionLimits::default(),
+        ));
+        self.scheduler_events = Some(scheduler.subscribe());
+        self.scheduler = Some(scheduler);
+        self.scheduler_snapshot = SchedulerSnapshot { tasks: Vec::new() };
+        self.scheduler_rebind_pending = false;
+    }
+
+    async fn reap_finished_scheduler_driver(&mut self) {
+        let Some(driver) = self.scheduler_driver.as_ref() else {
+            return;
+        };
+        if !driver.is_finished() {
+            return;
+        }
+        let driver = self.scheduler_driver.take().expect("checked above");
+        match driver.await {
+            Ok(Ok(reports)) => {
+                for report in reports {
+                    self.last_reports.insert(report.task_id, report);
+                }
+            }
+            Ok(Err(error)) => self.feedback = format!("Scheduler driver failed: {error}"),
+            Err(error) => self.feedback = format!("Scheduler driver stopped: {error}"),
+        }
+        self.refresh_durable_tasks().await;
+    }
+
+    async fn tick(&mut self) {
+        self.reap_finished_scheduler_driver().await;
         let mut reload = false;
         let mut lagged = false;
         let mut drained = Vec::new();
@@ -1158,6 +1200,13 @@ impl AppState {
         }
         if reload {
             self.refresh_durable_tasks().await;
+            self.clear_preflight_retry_state();
+        }
+        if self.scheduler_rebind_pending
+            && self.scheduler_driver.is_none()
+            && self.scheduler_snapshot.tasks.is_empty()
+        {
+            self.rebind_scheduler_if_idle();
         }
     }
 
@@ -1220,6 +1269,7 @@ impl AppState {
             }
             CoreExecutionEvent::ExecutionPreflightFailed { task_id, failure } => {
                 self.feedback = format!("Execution preflight failed for {task_id}: {failure:?}");
+                self.preflight_retry_pending.insert(task_id);
                 return true;
             }
             CoreExecutionEvent::ExecutionFinished {
@@ -1435,6 +1485,7 @@ impl AppState {
         match result {
             Ok(()) => {
                 self.relay = Relay::with_project_registry(registry);
+                self.rebind_scheduler_if_idle();
                 self.feedback = format!(
                     "Registered project '{key}' in {}",
                     self.config_path.display()
@@ -1806,6 +1857,123 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn unsupported_extensions_are_not_presented_as_runnable() {
+        let mut state = app_state_with_project_with_store().await;
+        state.start_paste_task();
+        state.paste_text = task_json().replace(
+            "\"ambiguity_policy\": \"needs_clarification\"",
+            "\"ambiguity_policy\": \"needs_clarification\", \"extensions\": {\"fake\": {}}",
+        );
+        state.submit_paste_task();
+        state.confirm_task_import().await;
+
+        let task = state.selected_stored_task().unwrap();
+        assert!(
+            state
+                .ui_preflight(task)
+                .contains("unsupported task extensions")
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_failure_clears_transient_status_after_refresh() {
+        let mut state = app_state_with_project_with_store().await;
+        state.start_paste_task();
+        state.paste_text = task_json();
+        state.submit_paste_task();
+        state.confirm_task_import().await;
+        let task_id = state.selected_task.unwrap();
+        state
+            .execution_views
+            .entry(task_id)
+            .or_default()
+            .scheduler_status = Some(SchedulerTaskStatus::QueuedReady);
+
+        assert!(
+            state.apply_execution_event(CoreExecutionEvent::ExecutionPreflightFailed {
+                task_id,
+                failure: relay_core::PreflightFailure::ProjectResolution {
+                    message: "missing".to_owned()
+                },
+            })
+        );
+        state.refresh_durable_tasks().await;
+        state.clear_preflight_retry_state();
+
+        assert_eq!(
+            state.selected_stored_task().unwrap().state,
+            TaskState::Ready
+        );
+        assert!(state.execution_views[&task_id].scheduler_status.is_none());
+    }
+
+    #[tokio::test]
+    async fn adding_project_rebinds_idle_scheduler_to_current_registry() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let mut state = AppState::new_with_store(
+            Relay::new(),
+            unique_temp_path("config").join("relay.toml"),
+            true,
+            unique_temp_path("state").join("relay.sqlite3"),
+            Some(store),
+            Vec::new(),
+            "ready".to_owned(),
+        );
+        let before = state.scheduler.as_ref().unwrap().clone();
+        state.add_project = AddProjectForm {
+            key: "relay".to_owned(),
+            path: std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            expected_remote: String::new(),
+            default_stack: "fake".to_owned(),
+            github_owner: String::new(),
+            github_repo: String::new(),
+        };
+        state.submit_add_project().unwrap();
+
+        assert!(!Arc::ptr_eq(&before, state.scheduler.as_ref().unwrap()));
+        assert!(state.relay.resolve_project("relay").is_ok());
+    }
+
+    #[tokio::test]
+    async fn finished_driver_reports_are_reaped_before_new_work_can_replace_it() {
+        let mut state = app_state_with_project_with_store().await;
+        state.start_paste_task();
+        state.paste_text = task_json();
+        state.submit_paste_task();
+        state.confirm_task_import().await;
+        let task_id = state.selected_task.unwrap();
+        state.scheduler_driver = Some(tokio::spawn(async move {
+            Ok(vec![ExecutionReport {
+                task_id,
+                project_key: ProjectKey::parse("relay").unwrap(),
+                execution_id: None,
+                final_state: Some(TaskState::Done),
+                outcome: None,
+                outcome_summary: Some("preserved".to_owned()),
+                persistence_error: None,
+                output: relay_core::BoundedOutputSnapshot {
+                    chunks: Vec::new(),
+                    retained_bytes: 0,
+                    retained_chunks: 0,
+                    dropped_bytes: 0,
+                    dropped_chunks: 0,
+                },
+            }])
+        }));
+        tokio::task::yield_now().await;
+        state.reap_finished_scheduler_driver().await;
+
+        assert_eq!(
+            state.last_reports[&task_id].outcome_summary.as_deref(),
+            Some("preserved")
+        );
+        assert!(state.scheduler_driver.is_none());
+    }
+
     #[test]
     fn add_project_does_not_overwrite_invalid_existing_config() {
         let config_path = unique_temp_path("invalid-existing-config").join("config.toml");
@@ -1859,10 +2027,16 @@ mod tests {
     }
 
     async fn app_state_with_project_with_store() -> AppState {
-        let mut state = app_state_with_project();
-        state.database_path = unique_temp_path("state").join("relay.sqlite3");
-        state.store = Some(SqliteStore::in_memory().await.unwrap());
-        state
+        let state = app_state_with_project();
+        AppState::new_with_store(
+            state.relay,
+            state.config_path,
+            state.registry_writable,
+            unique_temp_path("state").join("relay.sqlite3"),
+            Some(SqliteStore::in_memory().await.unwrap()),
+            Vec::new(),
+            "ready".to_owned(),
+        )
     }
 
     fn task_json() -> String {

@@ -1053,6 +1053,8 @@ name = "relay-core"
 version = "0.1.0"
 dependencies = [
  "relay-protocol",
+ "relay-runtime",
+ "relay-runtime-fake",
  "relay-store",
  "serde",
  "serde_json",
@@ -1069,6 +1071,25 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "relay-runtime"
+version = "0.1.0"
+dependencies = [
+ "relay-protocol",
+ "serde",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "relay-runtime-fake"
+version = "0.1.0"
+dependencies = [
+ "relay-runtime",
+ "tokio",
 ]
 
 [[package]]

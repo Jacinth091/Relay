@@ -114,8 +114,8 @@ async fn probe_version(executable: &str, args: &[&str]) -> Result<String, String
 
 async fn collect_health() -> HealthSnapshot {
     let git_health = match probe_version("git", &["--version"]).await {
-        Ok(version) => format!("available ({version})"),
-        Err(error) => format!("unavailable ({error})"),
+        Ok(version) => ToolHealth::Available(version),
+        Err(error) => ToolHealth::Unavailable(error),
     };
     let runtime_health = CodexRuntime::default().discover().await;
     let github_cli_health = match probe_version("gh", &["--version"]).await {
@@ -328,12 +328,8 @@ fn render_settings(frame: &mut Frame, state: &AppState, area: Rect) {
 
 fn render_doctor(frame: &mut Frame, state: &AppState, area: Rect) {
     let body = format!(
-        "Relay Doctor\n\nCurrent execution requirements\n\n{} Git\n{} Relay config\n{} SQLite\n{}\n  {}\n\nFuture integrations\n{}\nGitHub Issue ingress: not implemented until M10\nRelay Direct / MCP: not implemented until M12\n\nNo secrets or environment data are displayed.",
-        if state.git_health.starts_with("unavailable") {
-            "×"
-        } else {
-            "✓"
-        },
+        "Relay Doctor\n\nCurrent execution requirements\n\n{}\n{} Relay config\n{} SQLite\n{}\n  {}\n\nFuture integrations\n{}\nGitHub Issue ingress: not implemented until M10\nRelay Direct / MCP: not implemented until M12\n\nNo secrets or environment data are displayed.",
+        git_health_marker(&state.git_health),
         if state.registry_writable { "✓" } else { "×" },
         if state.store.is_some() { "✓" } else { "×" },
         if state.runtime_health.is_ready() {
@@ -1286,7 +1282,7 @@ struct AppState {
     selected_task: Option<TaskId>,
     scheduler: Option<Arc<ExecutionScheduler<AppRuntime>>>,
     runtime_health: CodexRuntimeHealth,
-    git_health: String,
+    git_health: ToolHealth,
     github_cli_health: String,
     health_refresh: Option<JoinHandle<HealthSnapshot>>,
     command_input: String,
@@ -1325,12 +1321,27 @@ struct ExecutionViewState {
 
 #[derive(Debug)]
 struct HealthSnapshot {
-    git_health: String,
+    git_health: ToolHealth,
     runtime_health: CodexRuntimeHealth,
     github_cli_health: String,
 }
 
 const UI_OUTPUT_BYTE_LIMIT: usize = 16 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolHealth {
+    Checking,
+    Available(String),
+    Unavailable(String),
+}
+
+fn git_health_marker(health: &ToolHealth) -> &'static str {
+    match health {
+        ToolHealth::Checking => "… Git — checking",
+        ToolHealth::Available(_) => "✓ Git",
+        ToolHealth::Unavailable(_) => "× Git",
+    }
+}
 
 impl AppState {
     fn begin_health_refresh(&mut self) {
@@ -1470,7 +1481,7 @@ impl AppState {
             selected_task: None,
             scheduler,
             runtime_health: CodexRuntimeHealth::Checking,
-            git_health: "not checked".to_owned(),
+            git_health: ToolHealth::Checking,
             github_cli_health: "not checked (optional M10 prerequisite)".to_owned(),
             health_refresh: None,
             command_input: String::new(),
@@ -2690,6 +2701,19 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&config_path).unwrap(), invalid_config);
         assert!(state.feedback.contains("registration is disabled"));
+    }
+
+    #[test]
+    fn doctor_marks_git_pending_until_probe_finishes() {
+        assert_eq!(git_health_marker(&ToolHealth::Checking), "… Git — checking");
+        assert_eq!(
+            git_health_marker(&ToolHealth::Available("git version test".to_owned())),
+            "✓ Git"
+        );
+        assert_eq!(
+            git_health_marker(&ToolHealth::Unavailable("missing".to_owned())),
+            "× Git"
+        );
     }
 
     fn app_state_with_project() -> AppState {

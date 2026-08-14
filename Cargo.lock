@@ -1108,6 +1108,8 @@ dependencies = [
  "crossterm",
  "ratatui",
  "relay-core",
+ "relay-runtime",
+ "relay-runtime-fake",
  "tokio",
 ]
 

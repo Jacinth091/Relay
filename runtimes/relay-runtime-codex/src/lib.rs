@@ -706,9 +706,10 @@ async fn discover_command(
     executable: &Path,
     args: &[&str],
 ) -> Result<std::process::Output, DiscoveryError> {
+    let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     match timeout(
         DISCOVERY_TIMEOUT,
-        Command::new(executable).args(args).output(),
+        launcher_command(executable, &args).output(),
     )
     .await
     {

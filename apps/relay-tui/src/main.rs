@@ -195,7 +195,7 @@ async fn run(terminal: &mut Tui, state: &mut AppState) -> Result<(), Box<dyn Err
 fn render(frame: &mut Frame, state: &AppState) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .constraints([Constraint::Min(3), Constraint::Length(2)])
         .split(frame.area());
 
     match state.screen {
@@ -210,18 +210,61 @@ fn render(frame: &mut Frame, state: &AppState) {
         Screen::TaskReview => render_task_review(frame, state, areas[0]),
         Screen::Execution => render_execution(frame, state, areas[0]),
         Screen::Result => render_result(frame, state, areas[0]),
+        Screen::Runtime => render_runtime(frame, state, areas[0]),
+        Screen::Settings => render_settings(frame, state, areas[0]),
+        Screen::Doctor => render_doctor(frame, state, areas[0]),
     }
 
-    let help = Paragraph::new(help_text(state));
+    let prompt = if state.command_mode {
+        format!("> {}", state.command_input)
+    } else {
+        "Type /help for commands".to_owned()
+    };
+    let help = Paragraph::new(format!("{prompt}\n{}", help_text(state)));
     frame.render_widget(help, areas[1]);
 }
 
 fn render_dashboard(frame: &mut Frame, state: &AppState, area: Rect) {
-    let body = format!("{}\n\n{}", dashboard_status(state), state.feedback);
+    let body = activity_home(state);
     let dashboard = Paragraph::new(body)
         .wrap(Wrap { trim: true })
         .block(Block::default().title(" Relay ").borders(Borders::ALL));
     frame.render_widget(dashboard, area);
+}
+
+fn render_runtime(frame: &mut Frame, state: &AppState, area: Rect) {
+    let body = format!(
+        "Runtime\n\n{}\n\nExecution\nSandbox: workspace-write\nUser config: ignored for execution\nAdditional writable roots: none\nApproval: Relay Run + Codex never\nMaximum duration: {} minutes\n\nAuthentication: {}",
+        state.runtime_label(),
+        app_execution_limits().max_duration.as_secs() / 60,
+        state.runtime_health.display_status()
+    );
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: true }), area);
+}
+
+fn render_settings(frame: &mut Frame, state: &AppState, area: Rect) {
+    let limits = app_execution_limits();
+    let body = format!(
+        "Settings\n\nExecution\n  Global parallelism: {}\n  Per-project parallelism: {}\n  Repair attempts: {}\n  Maximum execution: {} minutes\n\nSafety\n  Explicit Run approval: On\n  Automatic commit: Off\n  Automatic push: Off\n\nStorage\n  Config: {}\n  SQLite: {}\n\nRuntime\n  {}",
+        limits.max_parallel,
+        limits.per_project_max_parallel,
+        limits.max_repair_attempts,
+        limits.max_duration.as_secs() / 60,
+        state.config_path.display(),
+        state.database_path.display(),
+        state.runtime_health.display_status()
+    );
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: true }), area);
+}
+
+fn render_doctor(frame: &mut Frame, state: &AppState, area: Rect) {
+    let body = format!(
+        "Doctor\n\n{} Relay config\n{} SQLite\n{} Codex runtime\n\nNo secrets or environment data are displayed.",
+        if state.registry_writable { "✓" } else { "×" },
+        if state.store.is_some() { "✓" } else { "×" },
+        state.runtime_health.display_status()
+    );
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: true }), area);
 }
 
 fn render_tasks(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -429,6 +472,34 @@ async fn handle_event(state: &mut AppState, event: Event) -> Result<bool, Box<dy
 }
 
 async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn Error>> {
+    if state.command_mode {
+        match key.code {
+            KeyCode::Enter => {
+                let command = std::mem::take(&mut state.command_input);
+                state.command_mode = false;
+                return execute_relay_command(state, &command).await;
+            }
+            KeyCode::Esc => {
+                state.command_mode = false;
+                state.command_input.clear();
+                return Ok(false);
+            }
+            KeyCode::Backspace => {
+                state.command_input.pop();
+                return Ok(false);
+            }
+            KeyCode::Char(character) if !character.is_control() => {
+                state.command_input.push(character);
+                return Ok(false);
+            }
+            _ => return Ok(false),
+        }
+    }
+    if key.code == KeyCode::Char('/') {
+        state.command_mode = true;
+        state.command_input = "/".to_owned();
+        return Ok(false);
+    }
     match state.screen {
         Screen::Dashboard => match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => Ok(true),
@@ -615,9 +686,49 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
             }
             _ => Ok(false),
         },
+        Screen::Runtime | Screen::Settings | Screen::Doctor => match key.code {
+            KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => {
+                state.screen = Screen::Dashboard;
+                Ok(false)
+            }
+            _ => Ok(false),
+        },
     }
 }
 
+async fn execute_relay_command(state: &mut AppState, input: &str) -> Result<bool, Box<dyn Error>> {
+    let command = input.trim();
+    match command {
+        "/home" => state.screen = Screen::Dashboard,
+        "/new" => state.start_new_task(),
+        "/tasks" => state.enter_tasks(),
+        "/projects" => state.enter_projects(),
+        "/project add" => state.start_detected_project(None),
+        "/runtime" => state.screen = Screen::Runtime,
+        "/settings" => state.screen = Screen::Settings,
+        "/doctor" => state.screen = Screen::Doctor,
+        "/help" => {
+            state.screen = Screen::Dashboard;
+            state.feedback = "Commands: /new /tasks /projects /project add /runtime /settings /doctor /help /quit".to_owned();
+        }
+        "/quit" => return Ok(true),
+        _ if command.starts_with("/project add ") => state.start_detected_project(Some(
+            PathBuf::from(command.trim_start_matches("/project add ").trim()),
+        )),
+        _ if command.starts_with("/run ") => {
+            state
+                .run_task_selector(command.trim_start_matches("/run ").trim())
+                .await
+        }
+        _ if command.starts_with("/cancel ") => {
+            state.cancel_task_selector(command.trim_start_matches("/cancel ").trim())
+        }
+        _ => state.feedback = "Unknown Relay command. Try /help.".to_owned(),
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
 fn dashboard_status(state: &AppState) -> String {
     let projects = match state.relay.configured_project_count() {
         0 => "No projects configured.".to_owned(),
@@ -661,6 +772,77 @@ fn dashboard_status(state: &AppState) -> String {
         ));
     }
     format!("{projects}\n{tasks}\n\n{}", execution.join("\n"))
+}
+
+fn activity_home(state: &AppState) -> String {
+    if state.relay.configured_project_count() == 0 {
+        return format!(
+            "Relay                                      {}\n\nWelcome to Relay.\n\nNo projects are configured yet.\nRelay needs a trusted local Git repository before it can run implementation tasks.\n\nTry:\n  /project add\n  /help\n\n{}",
+            state.runtime_health.display_status(),
+            state.feedback
+        );
+    }
+    let active = state
+        .scheduler_snapshot
+        .tasks
+        .iter()
+        .filter(|task| matches!(task.status, SchedulerTaskStatus::Running))
+        .count();
+    let waiting = state
+        .scheduler_snapshot
+        .tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.status,
+                SchedulerTaskStatus::QueuedGlobal | SchedulerTaskStatus::QueuedProject
+            )
+        })
+        .count();
+    let attention = state
+        .durable_tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.state,
+                TaskState::NeedsClarification | TaskState::NeedsDecision
+            )
+        })
+        .count();
+    let mut lines = vec![format!(
+        "Relay                                      {}",
+        state.runtime_health.display_status()
+    )];
+    if active + waiting + attention == 0 {
+        lines.push("\nNo active tasks.".to_owned());
+    } else {
+        lines.push(format!(
+            "\n{active} active · {waiting} waiting · {attention} needs attention"
+        ));
+    }
+    for task in state
+        .durable_tasks
+        .iter()
+        .filter(|task| !matches!(task.state, TaskState::Done | TaskState::Cancelled))
+        .take(6)
+    {
+        lines.push(format!(
+            "\n{} {}\n  {}",
+            if matches!(
+                task.state,
+                TaskState::NeedsClarification | TaskState::NeedsDecision
+            ) {
+                "!"
+            } else {
+                "●"
+            },
+            task.project_key,
+            task.handoff.title
+        ));
+        lines.push(format!("  {}", task.state.as_str().to_uppercase()));
+    }
+    lines.push(format!("\n{}", state.feedback));
+    lines.join("\n")
 }
 
 fn scheduler_status_text(status: &SchedulerTaskStatus) -> &'static str {
@@ -844,6 +1026,7 @@ fn help_text(state: &AppState) -> &'static str {
         Screen::TaskReview => "R: run when eligible  B / Esc: tasks  Q: quit",
         Screen::Execution => "C: cancel  B: background / tasks",
         Screen::Result => "T: tasks  D: dashboard  N: new task",
+        Screen::Runtime | Screen::Settings | Screen::Doctor => "Esc / D: dashboard",
     }
 }
 
@@ -969,6 +1152,8 @@ struct AppState {
     selected_task: Option<TaskId>,
     scheduler: Option<Arc<ExecutionScheduler<AppRuntime>>>,
     runtime_health: CodexRuntimeHealth,
+    command_input: String,
+    command_mode: bool,
     scheduler_events: Option<broadcast::Receiver<CoreExecutionEvent>>,
     scheduler_snapshot: SchedulerSnapshot,
     scheduler_driver:
@@ -1003,6 +1188,69 @@ struct ExecutionViewState {
 const UI_OUTPUT_BYTE_LIMIT: usize = 16 * 1024;
 
 impl AppState {
+    fn start_detected_project(&mut self, path: Option<PathBuf>) {
+        self.start_add_project();
+        let path = path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        self.add_project.path = path.display().to_string();
+        self.add_project.key = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("project")
+            .to_ascii_lowercase()
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_owned();
+        self.add_project.default_stack = "chatgpt-codex".to_owned();
+        self.feedback = "Detected local candidate. Review the suggested values, then confirm to trust this repository.".to_owned();
+    }
+
+    async fn run_task_selector(&mut self, selector: &str) {
+        let matches = self
+            .durable_tasks
+            .iter()
+            .filter(|task| task.id.to_string().starts_with(selector))
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [task_id] => {
+                self.selected_task = Some(*task_id);
+                self.submit_selected_task().await;
+            }
+            [] => self.feedback = "No Relay task matches that selector.".to_owned(),
+            _ => {
+                self.feedback = "Task selector is ambiguous; provide more of the TaskId.".to_owned()
+            }
+        }
+    }
+
+    fn cancel_task_selector(&mut self, selector: &str) {
+        let matches = self
+            .durable_tasks
+            .iter()
+            .filter(|task| task.id.to_string().starts_with(selector))
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [task_id] => {
+                self.selected_task = Some(*task_id);
+                self.cancel_confirmation = Some(*task_id);
+                self.screen = Screen::Execution;
+                self.feedback = "Cancel execution? Press Y to confirm.".to_owned();
+            }
+            [] => self.feedback = "No Relay task matches that selector.".to_owned(),
+            _ => {
+                self.feedback = "Task selector is ambiguous; provide more of the TaskId.".to_owned()
+            }
+        }
+    }
     fn runtime_label(&self) -> String {
         let identity = AppRuntime::default().identity();
         format!(
@@ -1055,6 +1303,8 @@ impl AppState {
             runtime_health: CodexRuntimeHealth::Available {
                 version: "test runtime".to_owned(),
             },
+            command_input: String::new(),
+            command_mode: false,
             scheduler_events,
             scheduler_snapshot: SchedulerSnapshot { tasks: Vec::new() },
             scheduler_driver: None,
@@ -1667,6 +1917,9 @@ enum Screen {
     TaskReview,
     Execution,
     Result,
+    Runtime,
+    Settings,
+    Doctor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

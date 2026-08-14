@@ -3,6 +3,8 @@
 //! All executable selection is trusted local configuration. Task content is
 //! supplied only on stdin and is never interpreted as shell syntax.
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::{
     env,
     path::{Path, PathBuf},
@@ -301,6 +303,16 @@ impl Runtime for CodexRuntime {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
+            #[cfg(unix)]
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setpgid(0, 0) == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
             sanitize_git_environment(&mut command);
             let mut child = command.spawn().map_err(|error| {
                 RuntimeError::StartFailed(format!(
@@ -348,7 +360,13 @@ async fn terminate_process_tree(child: &mut tokio::process::Child) {
     }
     #[cfg(not(windows))]
     {
-        let _ = child.kill().await;
+        if let Some(pid) = child.id() {
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+        } else {
+            let _ = child.kill().await;
+        }
     }
     let _ = child.wait().await;
 }

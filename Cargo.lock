@@ -1088,6 +1088,7 @@ dependencies = [
 name = "relay-runtime-codex"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "relay-protocol",
  "relay-runtime",
  "serde",

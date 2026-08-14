@@ -112,6 +112,39 @@ async fn probe_version(executable: &str, args: &[&str]) -> Result<String, String
     })
 }
 
+async fn collect_health() -> HealthSnapshot {
+    let git_health = match probe_version("git", &["--version"]).await {
+        Ok(version) => format!("available ({version})"),
+        Err(error) => format!("unavailable ({error})"),
+    };
+    let runtime_health = CodexRuntime::default().discover().await;
+    let github_cli_health = match probe_version("gh", &["--version"]).await {
+        Ok(version) => {
+            let auth = timeout(
+                Duration::from_secs(3),
+                TokioCommand::new("gh")
+                    .args(["auth", "status", "--active", "--hostname", "github.com"])
+                    .output(),
+            )
+            .await;
+            match auth {
+                Ok(Ok(output)) if output.status.success() => {
+                    format!("available and authenticated ({version})")
+                }
+                Ok(Ok(_)) => format!("available but not authenticated ({version})"),
+                Ok(Err(error)) => format!("available but auth check failed ({error})"),
+                Err(_) => format!("available but auth check timed out ({version})"),
+            }
+        }
+        Err(_) => "not installed (optional M10 prerequisite)".to_owned(),
+    };
+    HealthSnapshot {
+        git_health,
+        runtime_health,
+        github_cli_health,
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config_path = default_config_path();
@@ -137,7 +170,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         durable_tasks,
         format!("{feedback}\n{database_feedback}"),
     );
-    state.refresh_health().await;
+    state.begin_health_refresh();
     let mut terminal = initialize_terminal()?;
 
     let run_result = run(&mut terminal, &mut state).await;
@@ -813,7 +846,7 @@ async fn execute_relay_command(state: &mut AppState, input: &str) -> Result<bool
         RelayCommand::Settings => state.screen = Screen::Settings,
         RelayCommand::Doctor => {
             state.screen = Screen::Doctor;
-            state.refresh_health().await;
+            state.begin_health_refresh();
         }
         RelayCommand::Help => {
             state.screen = Screen::Dashboard;
@@ -1252,6 +1285,7 @@ struct AppState {
     runtime_health: CodexRuntimeHealth,
     git_health: String,
     github_cli_health: String,
+    health_refresh: Option<JoinHandle<HealthSnapshot>>,
     command_input: String,
     command_mode: bool,
     scheduler_events: Option<broadcast::Receiver<CoreExecutionEvent>>,
@@ -1286,28 +1320,36 @@ struct ExecutionViewState {
     started_at: Option<Instant>,
 }
 
+#[derive(Debug)]
+struct HealthSnapshot {
+    git_health: String,
+    runtime_health: CodexRuntimeHealth,
+    github_cli_health: String,
+}
+
 const UI_OUTPUT_BYTE_LIMIT: usize = 16 * 1024;
 
 impl AppState {
-    async fn refresh_health(&mut self) {
-        self.git_health = probe_version("git", &["--version"])
-            .await
-            .unwrap_or_else(|error| format!("unavailable: {error}"));
-        self.runtime_health = CodexRuntime::default().discover().await;
-        self.github_cli_health = match probe_version("gh", &["--version"]).await {
-            Ok(version) => {
-                let auth = TokioCommand::new("gh")
-                    .args(["auth", "status", "--active", "--hostname", "github.com"])
-                    .output()
-                    .await;
-                if auth.as_ref().is_ok_and(|output| output.status.success()) {
-                    format!("{version}; authenticated (M10 prerequisite)")
-                } else {
-                    format!("{version}; not authenticated (M10 prerequisite)")
-                }
-            }
-            Err(_) => "not installed (optional M10 prerequisite)".to_owned(),
+    fn begin_health_refresh(&mut self) {
+        if let Some(task) = self.health_refresh.take() {
+            task.abort();
+        }
+        self.health_refresh = Some(tokio::spawn(collect_health()));
+    }
+
+    async fn poll_health_refresh(&mut self) {
+        let Some(task) = self.health_refresh.as_ref() else {
+            return;
         };
+        if !task.is_finished() {
+            return;
+        }
+        let task = self.health_refresh.take().expect("health task exists");
+        if let Ok(snapshot) = task.await {
+            self.git_health = snapshot.git_health;
+            self.runtime_health = snapshot.runtime_health;
+            self.github_cli_health = snapshot.github_cli_health;
+        }
     }
 
     fn start_detected_project(&mut self, path: Option<PathBuf>) {
@@ -1429,6 +1471,7 @@ impl AppState {
             },
             git_health: "not checked".to_owned(),
             github_cli_health: "not checked (optional M10 prerequisite)".to_owned(),
+            health_refresh: None,
             command_input: String::new(),
             command_mode: false,
             scheduler_events,
@@ -1694,6 +1737,7 @@ impl AppState {
     }
 
     async fn tick(&mut self) {
+        self.poll_health_refresh().await;
         self.reap_finished_scheduler_driver().await;
         let mut reload = false;
         let mut lagged = false;

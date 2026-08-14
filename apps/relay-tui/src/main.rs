@@ -89,10 +89,10 @@ fn app_execution_limits() -> ExecutionLimits {
 }
 
 async fn probe_version(executable: &str, args: &[&str]) -> Result<String, String> {
-    let output = timeout(
-        Duration::from_secs(3),
-        TokioCommand::new(executable).args(args).output(),
-    )
+    let output = timeout(Duration::from_secs(3), {
+        let mut command = TokioCommand::new(executable);
+        command.args(args).kill_on_drop(true).output()
+    })
     .await
     .map_err(|_| format!("{executable} probe timed out"))?
     .map_err(|error| error.to_string())?;
@@ -120,12 +120,13 @@ async fn collect_health() -> HealthSnapshot {
     let runtime_health = CodexRuntime::default().discover().await;
     let github_cli_health = match probe_version("gh", &["--version"]).await {
         Ok(version) => {
-            let auth = timeout(
-                Duration::from_secs(3),
-                TokioCommand::new("gh")
+            let auth = timeout(Duration::from_secs(3), {
+                let mut command = TokioCommand::new("gh");
+                command
                     .args(["auth", "status", "--active", "--hostname", "github.com"])
-                    .output(),
-            )
+                    .kill_on_drop(true)
+                    .output()
+            })
             .await;
             match auth {
                 Ok(Ok(output)) if output.status.success() => {

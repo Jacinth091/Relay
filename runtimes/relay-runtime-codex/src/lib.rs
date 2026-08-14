@@ -344,23 +344,77 @@ async fn run_child(
     cancellation: CancellationToken,
     temp: RuntimeTempFiles,
 ) {
-    let stdout_reader = tokio::spawn(read_stdout(stdout, tx.clone()));
-    let stderr_reader = tokio::spawn(read_stderr(stderr, tx.clone()));
-    let exit = tokio::select! {
-        status = child.wait() => status.map_err(|error| error.to_string()),
-        _ = cancellation.cancelled() => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            let _ = tx.send(RuntimeEvent::Outcome(RuntimeOutcome::new(RuntimeOutcomeKind::Cancelled, "Codex execution cancelled"))).await;
-            return;
+    let mut stdout_reader = tokio::spawn(read_stdout(stdout, tx.clone()));
+    let mut stderr_reader = tokio::spawn(read_stderr(stderr, tx.clone()));
+    let mut stdout_result = None;
+    let mut stderr_result = None;
+    let exit = loop {
+        tokio::select! {
+            status = child.wait() => break status.map_err(|error| error.to_string()),
+            _ = cancellation.cancelled() => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                stdout_reader.abort();
+                stderr_reader.abort();
+                let _ = tx.send(RuntimeEvent::Outcome(RuntimeOutcome::new(RuntimeOutcomeKind::Cancelled, "Codex execution cancelled"))).await;
+                return;
+            }
+            result = &mut stdout_reader, if stdout_result.is_none() => {
+                match result {
+                    Ok(Ok(state)) => stdout_result = Some(Ok(state)),
+                    Ok(Err(error)) => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        stderr_reader.abort();
+                        let _ = tx.send(RuntimeEvent::InvalidOutput { reason: error }).await;
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        stderr_reader.abort();
+                        let _ = tx.send(RuntimeEvent::InvalidOutput { reason: format!("stdout reader failed: {error}") }).await;
+                        return;
+                    }
+                }
+            }
+            result = &mut stderr_reader, if stderr_result.is_none() => {
+                match result {
+                    Ok(Ok(())) => stderr_result = Some(Ok(())),
+                    Ok(Err(error)) => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        stdout_reader.abort();
+                        let _ = tx.send(RuntimeEvent::InvalidOutput { reason: error }).await;
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        stdout_reader.abort();
+                        let _ = tx.send(RuntimeEvent::InvalidOutput { reason: format!("stderr reader failed: {error}") }).await;
+                        return;
+                    }
+                }
+            }
         }
     };
-    let stdout_result = stdout_reader
-        .await
-        .unwrap_or_else(|error| Err(format!("stdout reader failed: {error}")));
-    let stderr_result = stderr_reader
-        .await
-        .unwrap_or_else(|error| Err(format!("stderr reader failed: {error}")));
+    let stdout_result = if let Some(result) = stdout_result {
+        result
+    } else {
+        match stdout_reader.await {
+            Ok(result) => result,
+            Err(error) => Err(format!("stdout reader failed: {error}")),
+        }
+    };
+    let stderr_result = if let Some(result) = stderr_result {
+        result
+    } else {
+        match stderr_reader.await {
+            Ok(result) => result,
+            Err(error) => Err(format!("stderr reader failed: {error}")),
+        }
+    };
     let outcome = match (exit, stdout_result, stderr_result) {
         (_, Err(error), _) | (_, _, Err(error)) => RuntimeEvent::InvalidOutput { reason: error },
         (Err(error), _, _) => RuntimeEvent::Outcome(RuntimeOutcome::new(
@@ -539,12 +593,13 @@ async fn read_stdout(
             break;
         }
         pending.extend_from_slice(&chunk[..read]);
-        if pending.len() > MAX_CODEX_JSONL_FRAME_BYTES {
-            return Err("Codex JSONL frame exceeded the 256 KiB limit".to_owned());
-        }
         while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
             let line = pending.drain(..=newline).collect::<Vec<_>>();
-            let line = String::from_utf8_lossy(&line[..line.len() - 1]);
+            if line.len() - 1 > MAX_CODEX_JSONL_FRAME_BYTES {
+                return Err("Codex JSONL frame exceeded the 256 KiB limit".to_owned());
+            }
+            let line = String::from_utf8(line[..line.len() - 1].to_vec())
+                .map_err(|_| "Codex JSONL frame was not valid UTF-8".to_owned())?;
             let event: Value = serde_json::from_str(&line)
                 .map_err(|error| format!("malformed Codex JSONL: {error}"))?;
             let kind = event
@@ -564,6 +619,9 @@ async fn read_stdout(
                     })
                     .await;
             }
+        }
+        if pending.len() > MAX_CODEX_JSONL_FRAME_BYTES {
+            return Err("Codex JSONL frame exceeded the 256 KiB limit".to_owned());
         }
     }
     Ok(state)
@@ -799,9 +857,8 @@ fn sanitize_git_environment(command: &mut Command) {
         command.env_remove(key);
     }
     for (key, _) in env::vars_os() {
-        if key.to_string_lossy().starts_with("GIT_CONFIG_KEY_")
-            || key.to_string_lossy().starts_with("GIT_CONFIG_VALUE_")
-        {
+        let upper = key.to_string_lossy().to_ascii_uppercase();
+        if upper.starts_with("GIT_CONFIG_KEY_") || upper.starts_with("GIT_CONFIG_VALUE_") {
             command.env_remove(key);
         }
     }
@@ -848,6 +905,7 @@ fn required_exec_flags_present(output: &std::process::Output) -> bool {
         "--ignore-rules",
         "--ephemeral",
         "--strict-config",
+        "--color",
         "--sandbox",
         "--cd",
         "--output-schema",

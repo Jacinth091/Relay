@@ -511,11 +511,18 @@ fn render_task_review(frame: &mut Frame, state: &AppState, area: Rect) {
             } else {
                 "\n\n[B] Back"
             };
+            let requested_stack = task.handoff.stack.as_deref().unwrap_or("not requested");
+            let effective_stack = state
+                .effective_stack(task)
+                .unwrap_or("missing or unsupported");
             format!(
-                "Task: {}\nProject: {}\nRuntime: {}\nState: {}\nRepository: {}\n\n{}{}",
+                "Task: {}\nProject: {}\nRequested stack: {}\nEffective stack: {}\nRuntime profile: {}\nRuntime availability: {}\nState: {}\nRepository: {}\n\n{}{}",
                 task.id,
                 task.project_key,
-                state.runtime_label(),
+                requested_stack,
+                effective_stack,
+                AppRuntime::default().identity().profile_id,
+                state.runtime_health.display_status(),
                 task.state.as_str(),
                 preflight,
                 handoff_summary_text(
@@ -1350,6 +1357,7 @@ impl AppState {
         }
         self.runtime_health = CodexRuntimeHealth::Checking;
         self.git_health = ToolHealth::Checking;
+        self.github_cli_health = "checking (optional M10 prerequisite)".to_owned();
         self.health_refresh = Some(tokio::spawn(collect_health()));
     }
 
@@ -1581,20 +1589,12 @@ impl AppState {
         if !self.runtime_health.is_ready() {
             return format!("unavailable: {}", self.runtime_health.display_status());
         }
-        let Ok(project) = self.relay.resolve_project(task.project_key.as_str()) else {
-            return "unavailable: project is not registered".to_owned();
-        };
-        let effective_stack = task
-            .handoff
-            .stack
-            .as_deref()
-            .or_else(|| project.default_stack());
-        match effective_stack {
-            Some("chatgpt-codex") => {}
-            Some(stack) => {
+        match self.effective_stack(task) {
+            Ok("chatgpt-codex") => {}
+            Ok(stack) => {
                 return format!("unavailable: unsupported runtime stack '{stack}'");
             }
-            None => return "unavailable: no runtime stack is configured".to_owned(),
+            Err(error) => return format!("unavailable: {error}"),
         }
         if !task.handoff.extensions.is_empty() {
             return "unavailable: unsupported task extensions".to_owned();
@@ -1612,6 +1612,18 @@ impl AppState {
             ),
             Err(error) => format!("unavailable: project missing ({error})"),
         }
+    }
+
+    fn effective_stack<'a>(&'a self, task: &'a StoredTask) -> Result<&'a str, String> {
+        let project = self
+            .relay
+            .resolve_project(task.project_key.as_str())
+            .map_err(|_| "project is not registered".to_owned())?;
+        task.handoff
+            .stack
+            .as_deref()
+            .or_else(|| project.default_stack())
+            .ok_or_else(|| "no runtime stack is configured".to_owned())
     }
 
     async fn submit_selected_task(&mut self) {

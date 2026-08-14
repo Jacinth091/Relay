@@ -36,8 +36,10 @@ pub struct CodexRuntimeConfig {
 
 impl Default for CodexRuntimeConfig {
     fn default() -> Self {
+        let configured = env::var_os("RELAY_CODEX_EXECUTABLE");
         Self {
-            executable: env::var_os("RELAY_CODEX_EXECUTABLE")
+            executable: configured
+                .clone()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("codex")),
             profile_id: "codex/default".to_owned(),
@@ -97,9 +99,19 @@ impl CodexRuntime {
         &self.config
     }
 
+    pub fn resolve_executable(&self) -> Result<PathBuf, String> {
+        let explicit = env::var_os("RELAY_CODEX_EXECUTABLE").is_some()
+            || self.config.executable != Path::new("codex");
+        resolve_executable(&self.config.executable, explicit)
+    }
+
     /// Checks CLI availability and existing CLI authentication without starting an agent turn.
     pub async fn discover(&self) -> CodexRuntimeHealth {
-        let version = match discover_command(&self.config.executable, &["--version"]).await {
+        let executable = match self.resolve_executable() {
+            Ok(executable) => executable,
+            Err(error) => return CodexRuntimeHealth::NotInstalled { error },
+        };
+        let version = match discover_command(&executable, &["--version"]).await {
             Ok(output) if output.status.success() => {
                 String::from_utf8_lossy(&output.stdout).trim().to_owned()
             }
@@ -115,7 +127,7 @@ impl CodexRuntime {
                 };
             }
         };
-        match discover_command(&self.config.executable, &["login", "status"]).await {
+        match discover_command(&executable, &["login", "status"]).await {
             Ok(output) if output.status.success() => {}
             Ok(output) => {
                 return CodexRuntimeHealth::NotAuthenticated {
@@ -136,7 +148,7 @@ impl CodexRuntime {
             }
         };
         match discover_command(
-            &self.config.executable,
+            &executable,
             &["--ask-for-approval", "never", "exec", "--help"],
         )
         .await
@@ -161,6 +173,21 @@ impl CodexRuntime {
 
     pub fn command_spec(
         &self,
+        request: &RuntimeRequest,
+        schema_path: &Path,
+        result_path: &Path,
+    ) -> CodexCommandSpec {
+        self.command_spec_with_executable(
+            self.config.executable.clone(),
+            request,
+            schema_path,
+            result_path,
+        )
+    }
+
+    fn command_spec_with_executable(
+        &self,
+        executable: PathBuf,
         request: &RuntimeRequest,
         schema_path: &Path,
         result_path: &Path,
@@ -190,7 +217,7 @@ impl CodexRuntime {
         }
         args.push("-".to_owned());
         CodexCommandSpec {
-            executable: self.config.executable.clone(),
+            executable,
             args,
             current_dir: request.trusted_working_dir.clone(),
         }
@@ -240,10 +267,17 @@ impl Runtime for CodexRuntime {
                 ));
             }
             let temp = RuntimeTempFiles::create()?;
-            let spec = runtime.command_spec(&request, &temp.schema_path, &temp.result_path);
-            let mut command = Command::new(&spec.executable);
+            let executable = runtime
+                .resolve_executable()
+                .map_err(RuntimeError::StartFailed)?;
+            let spec = runtime.command_spec_with_executable(
+                executable,
+                &request,
+                &temp.schema_path,
+                &temp.result_path,
+            );
+            let mut command = launcher_command(&spec.executable, &spec.args);
             command
-                .args(&spec.args)
                 .current_dir(&spec.current_dir)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -597,6 +631,77 @@ enum DiscoveryError {
     Spawn(String),
     Timeout,
 }
+
+fn resolve_executable(configured: &Path, explicit: bool) -> Result<PathBuf, String> {
+    if explicit {
+        return resolve_candidate(configured).ok_or_else(|| format!("configured Codex executable '{}' could not be started; check RELAY_CODEX_EXECUTABLE", configured.display()));
+    }
+    let path_directories = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let candidates = path_directories.into_iter().flat_map(|directory| {
+        let names = if cfg!(windows) {
+            vec!["codex.exe", "codex.cmd", "codex"]
+        } else {
+            vec!["codex"]
+        };
+        names
+            .into_iter()
+            .map(move |name| directory.join(name))
+            .collect::<Vec<_>>()
+    });
+    candidates
+        .into_iter()
+        .find(|candidate| resolve_candidate(candidate).is_some())
+        .ok_or_else(|| {
+            "Codex executable not found on PATH; install Codex or set RELAY_CODEX_EXECUTABLE"
+                .to_owned()
+        })
+}
+
+fn resolve_candidate(candidate: &Path) -> Option<PathBuf> {
+    if candidate.components().count() > 1 || candidate.is_absolute() {
+        return candidate.is_file().then(|| candidate.to_owned());
+    }
+    let path_directories = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    path_directories.into_iter().find_map(|directory| {
+        let direct = directory.join(candidate);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        if cfg!(windows) && candidate.extension().is_none() {
+            for extension in ["exe", "cmd"] {
+                let with_extension =
+                    directory.join(format!("{}.{}", candidate.display(), extension));
+                if with_extension.is_file() {
+                    return Some(with_extension);
+                }
+            }
+        }
+        None
+    })
+}
+
+fn launcher_command(executable: &Path, args: &[String]) -> Command {
+    #[cfg(windows)]
+    if executable
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"))
+    {
+        let mut command = Command::new("cmd.exe");
+        command.arg("/C").arg(executable).args(args);
+        return command;
+    }
+    let mut command = Command::new(executable);
+    command.args(args);
+    command
+}
+
 async fn discover_command(
     executable: &Path,
     args: &[&str],
@@ -766,5 +871,17 @@ mod tests {
         assert_eq!(bounded_event_text("abc"), "abc");
         let exact = "a".repeat(EVENT_OUTPUT_BYTE_LIMIT);
         assert_eq!(bounded_event_text(&exact), exact);
+    }
+
+    #[test]
+    fn explicit_codex_path_resolution_is_fail_closed() {
+        let missing = PathBuf::from("C:/definitely-missing-relay-codex");
+        let error = resolve_executable(&missing, true).unwrap_err();
+        assert!(error.contains("RELAY_CODEX_EXECUTABLE"));
+        let file =
+            std::env::temp_dir().join(format!("relay-codex-candidate-{}", std::process::id()));
+        std::fs::write(&file, b"fixture").unwrap();
+        assert_eq!(resolve_executable(&file, true).unwrap(), file);
+        let _ = std::fs::remove_file(file);
     }
 }

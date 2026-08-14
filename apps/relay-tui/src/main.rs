@@ -39,8 +39,10 @@ use relay_runtime::{
 };
 use relay_runtime_codex::{CodexRuntime, CodexRuntimeHealth};
 use relay_runtime_fake::FakeRuntime;
+use tokio::process::Command as TokioCommand;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -86,6 +88,30 @@ fn app_execution_limits() -> ExecutionLimits {
     }
 }
 
+async fn probe_version(executable: &str, args: &[&str]) -> Result<String, String> {
+    let output = timeout(
+        Duration::from_secs(3),
+        TokioCommand::new(executable).args(args).output(),
+    )
+    .await
+    .map_err(|_| format!("{executable} probe timed out"))?
+    .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(format!("{executable} exited with {}", output.status));
+    }
+    let text = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    Ok(if text.is_empty() {
+        "available".to_owned()
+    } else {
+        text.chars().take(160).collect()
+    })
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config_path = default_config_path();
@@ -111,7 +137,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         durable_tasks,
         format!("{feedback}\n{database_feedback}"),
     );
-    state.runtime_health = CodexRuntime::default().discover().await;
+    state.refresh_health().await;
     let mut terminal = initialize_terminal()?;
 
     let run_result = run(&mut terminal, &mut state).await;
@@ -269,12 +295,44 @@ fn render_settings(frame: &mut Frame, state: &AppState, area: Rect) {
 
 fn render_doctor(frame: &mut Frame, state: &AppState, area: Rect) {
     let body = format!(
-        "Doctor\n\n{} Relay config\n{} SQLite\n{} Codex runtime\n\nNo secrets or environment data are displayed.",
+        "Relay Doctor\n\nCurrent execution requirements\n\n{} Git\n{} Relay config\n{} SQLite\n{}\n  {}\n\nFuture integrations\n{}\nGitHub Issue ingress: not implemented until M10\nRelay Direct / MCP: not implemented until M12\n\nNo secrets or environment data are displayed.",
+        if state.git_health.starts_with("unavailable") {
+            "×"
+        } else {
+            "✓"
+        },
         if state.registry_writable { "✓" } else { "×" },
         if state.store.is_some() { "✓" } else { "×" },
-        state.runtime_health.display_status()
+        if state.runtime_health.is_ready() {
+            "✓ Codex CLI"
+        } else {
+            "× Codex CLI"
+        },
+        codex_health_detail(&state.runtime_health, &CodexRuntime::default()),
+        state.github_cli_health
     );
     frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: true }), area);
+}
+
+fn codex_health_detail(health: &CodexRuntimeHealth, runtime: &CodexRuntime) -> String {
+    let executable = runtime
+        .resolve_executable()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "no supported executable resolved".to_owned());
+    match health {
+        CodexRuntimeHealth::Available { version } => {
+            format!("  {executable}\n  {version}\n✓ Codex authentication and exec compatibility")
+        }
+        CodexRuntimeHealth::NotAuthenticated { version, error } => format!(
+            "  {executable}\n  {}\n  authentication unavailable: {error}",
+            version.as_deref().unwrap_or("version unavailable")
+        ),
+        CodexRuntimeHealth::Incompatible { reason, .. } => {
+            format!("  {executable}\n  compatibility unavailable: {reason}")
+        }
+        CodexRuntimeHealth::NotInstalled { error }
+        | CodexRuntimeHealth::DiscoveryFailed { error } => format!("  {executable}\n  {error}"),
+    }
 }
 
 fn render_tasks(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -753,7 +811,10 @@ async fn execute_relay_command(state: &mut AppState, input: &str) -> Result<bool
         RelayCommand::ProjectAdd { path } => state.start_detected_project(path),
         RelayCommand::Runtime => state.screen = Screen::Runtime,
         RelayCommand::Settings => state.screen = Screen::Settings,
-        RelayCommand::Doctor => state.screen = Screen::Doctor,
+        RelayCommand::Doctor => {
+            state.screen = Screen::Doctor;
+            state.refresh_health().await;
+        }
         RelayCommand::Help => {
             state.screen = Screen::Dashboard;
             state.feedback = command::COMMANDS.join("\n");
@@ -1189,6 +1250,8 @@ struct AppState {
     selected_task: Option<TaskId>,
     scheduler: Option<Arc<ExecutionScheduler<AppRuntime>>>,
     runtime_health: CodexRuntimeHealth,
+    git_health: String,
+    github_cli_health: String,
     command_input: String,
     command_mode: bool,
     scheduler_events: Option<broadcast::Receiver<CoreExecutionEvent>>,
@@ -1226,6 +1289,27 @@ struct ExecutionViewState {
 const UI_OUTPUT_BYTE_LIMIT: usize = 16 * 1024;
 
 impl AppState {
+    async fn refresh_health(&mut self) {
+        self.git_health = probe_version("git", &["--version"])
+            .await
+            .unwrap_or_else(|error| format!("unavailable: {error}"));
+        self.runtime_health = CodexRuntime::default().discover().await;
+        self.github_cli_health = match probe_version("gh", &["--version"]).await {
+            Ok(version) => {
+                let auth = TokioCommand::new("gh")
+                    .args(["auth", "status", "--active", "--hostname", "github.com"])
+                    .output()
+                    .await;
+                if auth.as_ref().is_ok_and(|output| output.status.success()) {
+                    format!("{version}; authenticated (M10 prerequisite)")
+                } else {
+                    format!("{version}; not authenticated (M10 prerequisite)")
+                }
+            }
+            Err(_) => "not installed (optional M10 prerequisite)".to_owned(),
+        };
+    }
+
     fn start_detected_project(&mut self, path: Option<PathBuf>) {
         let path = path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         match discover_project(&path) {
@@ -1343,6 +1427,8 @@ impl AppState {
             runtime_health: CodexRuntimeHealth::Available {
                 version: "test runtime".to_owned(),
             },
+            git_health: "not checked".to_owned(),
+            github_cli_health: "not checked (optional M10 prerequisite)".to_owned(),
             command_input: String::new(),
             command_mode: false,
             scheduler_events,

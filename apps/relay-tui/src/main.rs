@@ -1,9 +1,10 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, VecDeque},
     error::Error,
     io::{self, Stdout},
     path::PathBuf,
-    time::Duration,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -21,11 +22,16 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use relay_core::{
-    AmbiguityPolicy, BranchState, GitHubRepositoryMetadata, HandoffTask, ProjectKey,
-    RegisterProject, Relay, RepositoryEligibility, RepositoryInspection, RepositorySafetyFailure,
-    SqliteStore, StoredTask, TaskImportCandidate, default_config_path, default_database_path,
-    list_stored_tasks,
+    AmbiguityPolicy, BranchState, CoreExecutionEvent, ExecutionLimits, ExecutionReport,
+    ExecutionScheduler, GitHubRepositoryMetadata, HandoffTask, ProjectKey, RegisterProject, Relay,
+    RepositoryEligibility, RepositoryInspection, RepositorySafetyFailure, SchedulerSnapshot,
+    SchedulerTaskStatus, SqliteStore, StoredTask, TaskId, TaskImportCandidate, TaskState,
+    default_config_path, default_database_path, list_stored_tasks,
 };
+use relay_runtime::RuntimeOutputStream;
+use relay_runtime_fake::FakeRuntime;
+use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -129,11 +135,13 @@ fn restore_terminal(terminal: &mut Tui) -> Result<(), Box<dyn Error>> {
 
 async fn run(terminal: &mut Tui, state: &mut AppState) -> Result<(), Box<dyn Error>> {
     loop {
+        state.tick().await;
         terminal.draw(|frame| render(frame, state))?;
 
-        if event::poll(Duration::from_millis(250))? && handle_event(state, event::read()?).await? {
+        if event::poll(Duration::from_millis(30))? && handle_event(state, event::read()?).await? {
             return Ok(());
         }
+        tokio::time::sleep(Duration::from_millis(15)).await;
     }
 }
 
@@ -153,6 +161,8 @@ fn render(frame: &mut Frame, state: &AppState) {
         Screen::PasteTask => render_paste_task(frame, state, areas[0]),
         Screen::TaskPreview => render_task_preview(frame, state, areas[0]),
         Screen::TaskReview => render_task_review(frame, state, areas[0]),
+        Screen::Execution => render_execution(frame, state, areas[0]),
+        Screen::Result => render_result(frame, state, areas[0]),
     }
 
     let help = Paragraph::new(help_text(state));
@@ -168,7 +178,7 @@ fn render_dashboard(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn render_tasks(frame: &mut Frame, state: &AppState, area: Rect) {
-    let body = durable_task_listing(&state.durable_tasks, &state.feedback);
+    let body = task_selection_listing(state);
     let tasks = Paragraph::new(body)
         .wrap(Wrap { trim: false })
         .block(Block::default().title(" Tasks ").borders(Borders::ALL));
@@ -277,26 +287,70 @@ fn render_task_preview(frame: &mut Frame, state: &AppState, area: Rect) {
 
 fn render_task_review(frame: &mut Frame, state: &AppState, area: Rect) {
     let body = state
-        .relay
-        .reviewed_task()
+        .selected_stored_task()
         .map(|task| {
+            let preflight = state.ui_preflight(task);
+            let action = if task.state == TaskState::Ready && preflight == "eligible" {
+                "\n\n[R] Run  [B] Back"
+            } else if matches!(task.state, TaskState::Done | TaskState::Failed | TaskState::Cancelled) {
+                "\n\n[Enter] View result  [B] Back"
+            } else if matches!(task.state, TaskState::NeedsClarification | TaskState::NeedsDecision) {
+                "\n\nATTENTION REQUIRED: external resolution is required.\n[B] Back"
+            } else { "\n\n[B] Back" };
             format!(
-                "Task ID: {}\n{}\n\nValidation: IMPORTED\n\nNo Run action is available in M4.",
-                task.id(),
+                "Task: {}\nProject: {}\nRuntime: Relay Fake Runtime\nProfile: fake/default\nState: {}\nRepository: {}\n\n{}{}",
+                task.id,
+                task.project_key,
+                task.state.as_str(),
+                preflight,
                 handoff_summary_text(
-                    task.handoff(),
-                    task.project_key().as_str(),
-                    task.project_name()
-                )
+                    &task.handoff, task.project_key.as_str(), state.relay.resolve_project(task.project_key.as_str()).ok().and_then(|p| p.name())
+                ), action
             )
         })
-        .unwrap_or_else(|| "No imported task.".to_owned());
+        .unwrap_or_else(|| "No durable task selected.".to_owned());
     let review = Paragraph::new(body).wrap(Wrap { trim: false }).block(
         Block::default()
             .title(" Task Review ")
             .borders(Borders::ALL),
     );
     frame.render_widget(review, area);
+}
+
+fn render_execution(frame: &mut Frame, state: &AppState, area: Rect) {
+    let body = state.selected_task.and_then(|id| state.execution_views.get(&id).map(|view| (id, view))).map(|(id, view)| {
+        let task = state.durable_tasks.iter().find(|task| task.id == id);
+        let output = view.output.iter().cloned().collect::<Vec<_>>().join("");
+        format!("Task: {id}\nProject: {}\nRuntime: Relay Fake Runtime\nScheduler: {}\nPhase: {}\nRepair: {}\nElapsed: {}s\n{}\n\nOutput:\n{}\n\n[C] Cancel  [B] Background / Tasks",
+            task.map(|task| task.project_key.as_str()).unwrap_or("unknown"),
+            view.scheduler_status.as_ref().map(scheduler_status_text).unwrap_or("not scheduled"),
+            view.durable_state.map(|state| state.as_str()).unwrap_or("state pending"), view.repair_attempt,
+            view.started_at.map(|started| started.elapsed().as_secs()).unwrap_or(0),
+            view.persistence_error.as_ref().map(|error| format!("STATE UNCERTAIN / DURABILITY FAILURE\n{error}")).unwrap_or_else(|| if view.cancellation_requested { "Cancellation requested...".to_owned() } else { String::new() }), output)
+    }).unwrap_or_else(|| "No execution selected.".to_owned());
+    frame.render_widget(
+        Paragraph::new(body)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().title(" Execution ").borders(Borders::ALL)),
+        area,
+    );
+}
+
+fn render_result(frame: &mut Frame, state: &AppState, area: Rect) {
+    let body = state.selected_stored_task().map(|task| {
+        let report = state.last_reports.get(&task.id);
+        let repository = state.relay.inspect_project_repository(task.project_key.as_str()).ok().map(|i| repository_inspection_line(&i.eligibility, &i.status)).unwrap_or_else(|| "unavailable".to_owned());
+        format!("Task: {}\nProject: {}\nRuntime: Relay Fake Runtime\nState: {}\nOutcome: {}\nVerification: {}\nRepairs: {}\nRepository: {}\n\nSummary:\n{}\n\n[T] Tasks  [D] Dashboard  [N] New Task",
+            task.id, task.project_key, task.state.as_str(), report.and_then(|r| r.outcome).map(|o| o.as_str()).unwrap_or("not confirmed"),
+            if task.state == TaskState::Done { "PASS" } else { "not available" }, state.execution_views.get(&task.id).map(|v| v.repair_attempt).unwrap_or(0), repository,
+            report.and_then(|r| r.outcome_summary.as_deref()).unwrap_or("No confirmed execution report."))
+    }).unwrap_or_else(|| "No durable task selected.".to_owned());
+    frame.render_widget(
+        Paragraph::new(body)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().title(" Result ").borders(Borders::ALL)),
+        area,
+    );
 }
 
 async fn handle_event(state: &mut AppState, event: Event) -> Result<bool, Box<dyn Error>> {
@@ -336,6 +390,18 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
             KeyCode::Char('q') | KeyCode::Char('Q') => Ok(true),
             KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => {
                 state.screen = Screen::Dashboard;
+                Ok(false)
+            }
+            KeyCode::Up => {
+                state.select_previous_task();
+                Ok(false)
+            }
+            KeyCode::Down => {
+                state.select_next_task();
+                Ok(false)
+            }
+            KeyCode::Enter => {
+                state.open_selected_task();
                 Ok(false)
             }
             _ => Ok(false),
@@ -428,8 +494,16 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
             _ => Ok(false),
         },
         Screen::TaskReview => match key.code {
-            KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => {
-                state.screen = Screen::Dashboard;
+            KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('B') => {
+                state.screen = Screen::Tasks;
+                Ok(false)
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                state.submit_selected_task().await;
+                Ok(false)
+            }
+            KeyCode::Enter => {
+                state.open_selected_task();
                 Ok(false)
             }
             KeyCode::Char('n') | KeyCode::Char('N') => {
@@ -437,6 +511,44 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
                 Ok(false)
             }
             KeyCode::Char('q') | KeyCode::Char('Q') => Ok(true),
+            _ => Ok(false),
+        },
+        Screen::Execution => match key.code {
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                state.cancel_confirmation = state.selected_task;
+                state.feedback = "Cancel execution? Y: confirm  N / Esc: keep running".to_owned();
+                Ok(false)
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') if state.cancel_confirmation.is_some() => {
+                state.confirm_cancel().await;
+                Ok(false)
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc
+                if state.cancel_confirmation.is_some() =>
+            {
+                state.cancel_confirmation = None;
+                state.feedback = "Cancellation not requested.".to_owned();
+                Ok(false)
+            }
+            KeyCode::Char('b') | KeyCode::Char('B') | KeyCode::Esc => {
+                state.screen = Screen::Tasks;
+                Ok(false)
+            }
+            _ => Ok(false),
+        },
+        Screen::Result => match key.code {
+            KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Esc => {
+                state.screen = Screen::Tasks;
+                Ok(false)
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                state.screen = Screen::Dashboard;
+                Ok(false)
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                state.start_new_task();
+                Ok(false)
+            }
             _ => Ok(false),
         },
     }
@@ -452,7 +564,84 @@ fn dashboard_status(state: &AppState) -> String {
         1 => "1 durable task.".to_owned(),
         count => format!("{count} durable tasks."),
     };
-    format!("{projects}\n{tasks}")
+    let mut execution = vec!["Execution".to_owned()];
+    for status in [
+        SchedulerTaskStatus::Running,
+        SchedulerTaskStatus::QueuedReady,
+        SchedulerTaskStatus::QueuedGlobal,
+        SchedulerTaskStatus::QueuedProject,
+    ] {
+        let count = state
+            .scheduler_snapshot
+            .tasks
+            .iter()
+            .filter(|task| task.status == status)
+            .count();
+        execution.push(format!("{}: {count}", scheduler_status_text(&status)));
+    }
+    for durable in [
+        TaskState::NeedsClarification,
+        TaskState::NeedsDecision,
+        TaskState::Done,
+        TaskState::Failed,
+        TaskState::Cancelled,
+    ] {
+        execution.push(format!(
+            "{}: {}",
+            durable.as_str(),
+            state
+                .durable_tasks
+                .iter()
+                .filter(|task| task.state == durable)
+                .count()
+        ));
+    }
+    format!("{projects}\n{tasks}\n\n{}", execution.join("\n"))
+}
+
+fn scheduler_status_text(status: &SchedulerTaskStatus) -> &'static str {
+    match status {
+        SchedulerTaskStatus::Running => "RUNNING",
+        SchedulerTaskStatus::QueuedReady => "QUEUED / ready for scheduler",
+        SchedulerTaskStatus::QueuedGlobal => "WAITING — global execution slot",
+        SchedulerTaskStatus::QueuedProject => "WAITING — project execution slot",
+    }
+}
+
+fn task_selection_listing(state: &AppState) -> String {
+    if state.durable_tasks.is_empty() {
+        return format!("No durable tasks.\n\n{}", state.feedback);
+    }
+    let lines = state
+        .durable_tasks
+        .iter()
+        .map(|task| {
+            let marker = if state.selected_task == Some(task.id) {
+                ">"
+            } else {
+                " "
+            };
+            let status = state
+                .scheduler_snapshot
+                .tasks
+                .iter()
+                .find(|snapshot| snapshot.task_id == task.id)
+                .map(|snapshot| match snapshot.status {
+                    SchedulerTaskStatus::Running => "RUNNING".to_owned(),
+                    SchedulerTaskStatus::QueuedReady => "QUEUED".to_owned(),
+                    SchedulerTaskStatus::QueuedGlobal => "WAIT:GLOBAL".to_owned(),
+                    SchedulerTaskStatus::QueuedProject => "WAIT:PROJ".to_owned(),
+                })
+                .unwrap_or_else(|| task.state.as_str().to_ascii_uppercase());
+            format!(
+                "{marker} {status:<12} {:<12} {}",
+                task.project_key.as_str(),
+                task.handoff.title
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{lines}\n\n{}", state.feedback)
 }
 
 fn project_listing(
@@ -492,6 +681,7 @@ fn project_listing(
     format!("{}\n\n{feedback}", lines.join("\n\n"))
 }
 
+#[cfg(test)]
 fn durable_task_listing(tasks: &[StoredTask], feedback: &str) -> String {
     if tasks.is_empty() {
         return format!("No durable tasks.\n\n{feedback}");
@@ -577,7 +767,7 @@ fn help_text(state: &AppState) -> &'static str {
             "N: new task  T: tasks  P: projects  A: add project  Q / Esc: quit"
         }
         Screen::Dashboard => "N: new task  T: tasks  P: projects  Q / Esc: quit",
-        Screen::Tasks => "D / Esc: dashboard  Q: quit",
+        Screen::Tasks => "Up / Down: select  Enter: open  D / Esc: dashboard  Q: quit",
         Screen::Projects if state.registry_writable => {
             "R: refresh  A: add project  D / Esc: dashboard  Q: quit"
         }
@@ -587,7 +777,9 @@ fn help_text(state: &AppState) -> &'static str {
         Screen::ImportFile => "Enter: validate  Esc: new task",
         Screen::PasteTask => "Paste text, Enter: validate  Ctrl+Enter: newline  Esc: new task",
         Screen::TaskPreview => "I / Enter: import  C / Esc: cancel  Q: quit",
-        Screen::TaskReview => "N: new task  D / Esc: dashboard  Q: quit",
+        Screen::TaskReview => "R: run when eligible  B / Esc: tasks  Q: quit",
+        Screen::Execution => "C: cancel  B: background / tasks",
+        Screen::Result => "T: tasks  D: dashboard  N: new task",
     }
 }
 
@@ -636,6 +828,7 @@ fn bullet_lines(items: &[String]) -> String {
     }
 }
 
+#[cfg(test)]
 fn indented_bullet_lines(items: &[String]) -> String {
     bullet_lines(items)
         .lines()
@@ -655,7 +848,7 @@ fn add_field_line(state: &AppState, field: AddProjectField, label: &str, value: 
     format!("{marker} {label}: {value}")
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct AppState {
     relay: Relay,
     config_path: PathBuf,
@@ -663,6 +856,15 @@ struct AppState {
     database_path: PathBuf,
     store: Option<SqliteStore>,
     durable_tasks: Vec<StoredTask>,
+    selected_task: Option<TaskId>,
+    scheduler: Option<Arc<ExecutionScheduler<FakeRuntime>>>,
+    scheduler_events: Option<broadcast::Receiver<CoreExecutionEvent>>,
+    scheduler_snapshot: SchedulerSnapshot,
+    scheduler_driver:
+        Option<JoinHandle<Result<Vec<ExecutionReport>, relay_core::ExecutionSchedulerError>>>,
+    execution_views: HashMap<TaskId, ExecutionViewState>,
+    last_reports: HashMap<TaskId, ExecutionReport>,
+    cancel_confirmation: Option<TaskId>,
     screen: Screen,
     add_project: AddProjectForm,
     add_field: AddProjectField,
@@ -672,6 +874,20 @@ struct AppState {
     repository_inspections: BTreeMap<ProjectKey, RepositoryInspection>,
     feedback: String,
 }
+
+#[derive(Debug, Default)]
+struct ExecutionViewState {
+    scheduler_status: Option<SchedulerTaskStatus>,
+    durable_state: Option<TaskState>,
+    repair_attempt: u32,
+    output: VecDeque<String>,
+    output_bytes: usize,
+    persistence_error: Option<String>,
+    cancellation_requested: bool,
+    started_at: Option<Instant>,
+}
+
+const UI_OUTPUT_BYTE_LIMIT: usize = 16 * 1024;
 
 impl AppState {
     #[cfg(test)]
@@ -696,6 +912,15 @@ impl AppState {
         durable_tasks: Vec<StoredTask>,
         feedback: String,
     ) -> Self {
+        let scheduler = store.as_ref().map(|store| {
+            Arc::new(ExecutionScheduler::new(
+                relay.clone(),
+                store.clone(),
+                Arc::new(FakeRuntime::default()),
+                ExecutionLimits::default(),
+            ))
+        });
+        let scheduler_events = scheduler.as_ref().map(|scheduler| scheduler.subscribe());
         Self {
             relay,
             config_path,
@@ -703,6 +928,14 @@ impl AppState {
             database_path,
             store,
             durable_tasks,
+            selected_task: None,
+            scheduler,
+            scheduler_events,
+            scheduler_snapshot: SchedulerSnapshot { tasks: Vec::new() },
+            scheduler_driver: None,
+            execution_views: HashMap::new(),
+            last_reports: HashMap::new(),
+            cancel_confirmation: None,
             screen: Screen::Dashboard,
             add_project: AddProjectForm::default(),
             add_field: AddProjectField::Key,
@@ -720,7 +953,328 @@ impl AppState {
     }
 
     fn enter_tasks(&mut self) {
+        if self.selected_task.is_none() {
+            self.selected_task = self.durable_tasks.first().map(|task| task.id);
+        }
         self.screen = Screen::Tasks;
+    }
+
+    fn selected_stored_task(&self) -> Option<&StoredTask> {
+        self.selected_task
+            .and_then(|id| self.durable_tasks.iter().find(|task| task.id == id))
+    }
+
+    fn select_next_task(&mut self) {
+        if self.durable_tasks.is_empty() {
+            return;
+        }
+        let current = self
+            .selected_task
+            .and_then(|id| self.durable_tasks.iter().position(|task| task.id == id))
+            .unwrap_or(0);
+        self.selected_task = Some(self.durable_tasks[(current + 1) % self.durable_tasks.len()].id);
+    }
+
+    fn select_previous_task(&mut self) {
+        if self.durable_tasks.is_empty() {
+            return;
+        }
+        let current = self
+            .selected_task
+            .and_then(|id| self.durable_tasks.iter().position(|task| task.id == id))
+            .unwrap_or(0);
+        self.selected_task = Some(
+            self.durable_tasks[(current + self.durable_tasks.len() - 1) % self.durable_tasks.len()]
+                .id,
+        );
+    }
+
+    fn open_selected_task(&mut self) {
+        let Some(task) = self.selected_stored_task() else {
+            return;
+        };
+        let active = self
+            .scheduler_snapshot
+            .tasks
+            .iter()
+            .any(|snapshot| snapshot.task_id == task.id);
+        self.screen = if active {
+            Screen::Execution
+        } else if matches!(
+            task.state,
+            TaskState::Done | TaskState::Failed | TaskState::Cancelled
+        ) {
+            Screen::Result
+        } else {
+            Screen::TaskReview
+        };
+    }
+
+    fn ui_preflight(&self, task: &StoredTask) -> String {
+        if task.state != TaskState::Ready {
+            return "unavailable: task is not READY".to_owned();
+        }
+        if self.scheduler.is_none() {
+            return "unavailable: local Fake Runtime or store is unavailable".to_owned();
+        }
+        match self
+            .relay
+            .inspect_project_repository(task.project_key.as_str())
+        {
+            Ok(inspection) if inspection.eligibility == RepositoryEligibility::Eligible => {
+                "eligible".to_owned()
+            }
+            Ok(inspection) => format!(
+                "unavailable: {}",
+                repository_inspection_line(&inspection.eligibility, &inspection.status)
+            ),
+            Err(error) => format!("unavailable: project missing ({error})"),
+        }
+    }
+
+    async fn submit_selected_task(&mut self) {
+        let Some(task) = self.selected_stored_task().cloned() else {
+            return;
+        };
+        if task.state != TaskState::Ready
+            || self
+                .scheduler_snapshot
+                .tasks
+                .iter()
+                .any(|snapshot| snapshot.task_id == task.id)
+            || self
+                .execution_views
+                .get(&task.id)
+                .and_then(|view| view.scheduler_status.as_ref())
+                .is_some()
+        {
+            self.feedback = "Run is available only once for a durable READY task.".to_owned();
+            return;
+        }
+        if self.ui_preflight(&task) != "eligible" {
+            self.feedback = format!("Run unavailable: {}", self.ui_preflight(&task));
+            return;
+        }
+        let Some(scheduler) = self.scheduler.clone() else {
+            return;
+        };
+        match scheduler.submit(task.id).await {
+            Ok(()) => {
+                self.execution_views
+                    .entry(task.id)
+                    .or_default()
+                    .scheduler_status = Some(SchedulerTaskStatus::QueuedReady);
+                self.feedback = "Run approved. Queued for the scheduler.".to_owned();
+                self.screen = Screen::Execution;
+                if self
+                    .scheduler_driver
+                    .as_ref()
+                    .is_none_or(JoinHandle::is_finished)
+                {
+                    self.scheduler_driver =
+                        Some(tokio::spawn(
+                            async move { scheduler.run_until_idle().await },
+                        ));
+                }
+            }
+            Err(error) => self.feedback = format!("Run was not queued: {error}"),
+        }
+    }
+
+    async fn confirm_cancel(&mut self) {
+        let Some(task_id) = self.cancel_confirmation.take() else {
+            return;
+        };
+        let Some(scheduler) = self.scheduler.clone() else {
+            return;
+        };
+        match scheduler.cancel(task_id).await {
+            Ok(()) => {
+                self.execution_views
+                    .entry(task_id)
+                    .or_default()
+                    .cancellation_requested = true;
+                self.feedback = "Cancellation requested...".to_owned();
+            }
+            Err(error) => self.feedback = format!("Cancellation request failed: {error}"),
+        }
+    }
+
+    async fn refresh_durable_tasks(&mut self) {
+        if let Some(store) = &self.store {
+            match list_stored_tasks(store).await {
+                Ok(tasks) => self.durable_tasks = tasks,
+                Err(error) => {
+                    self.feedback = format!("Could not refresh durable task state: {error}")
+                }
+            }
+        }
+    }
+
+    async fn tick(&mut self) {
+        if let Some(driver) = self.scheduler_driver.as_ref()
+            && driver.is_finished()
+        {
+            let driver = self.scheduler_driver.take().expect("checked above");
+            match driver.await {
+                Ok(Ok(reports)) => {
+                    for report in reports {
+                        self.last_reports.insert(report.task_id, report);
+                    }
+                }
+                Ok(Err(error)) => self.feedback = format!("Scheduler driver failed: {error}"),
+                Err(error) => self.feedback = format!("Scheduler driver stopped: {error}"),
+            }
+            self.refresh_durable_tasks().await;
+        }
+        let mut reload = false;
+        let mut lagged = false;
+        let mut drained = Vec::new();
+        if let Some(events) = &mut self.scheduler_events {
+            loop {
+                match events.try_recv() {
+                    Ok(event) => drained.push(event),
+                    Err(broadcast::error::TryRecvError::Empty) => break,
+                    Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                        lagged = true;
+                        break;
+                    }
+                    Err(broadcast::error::TryRecvError::Closed) => {
+                        self.feedback = "Execution event stream closed.".to_owned();
+                        break;
+                    }
+                }
+            }
+        }
+        for event in drained {
+            reload |= self.apply_execution_event(event);
+        }
+        if let Some(scheduler) = &self.scheduler {
+            self.scheduler_snapshot = scheduler.snapshot().await;
+        }
+        if lagged {
+            self.feedback = "Execution event stream lagged; refreshing canonical state.".to_owned();
+            reload = true;
+        }
+        if reload {
+            self.refresh_durable_tasks().await;
+        }
+    }
+
+    fn apply_execution_event(&mut self, event: CoreExecutionEvent) -> bool {
+        match event {
+            CoreExecutionEvent::ExecutionQueued { task_id, .. } => {
+                self.execution_views
+                    .entry(task_id)
+                    .or_default()
+                    .scheduler_status = Some(SchedulerTaskStatus::QueuedReady);
+            }
+            CoreExecutionEvent::SchedulerStatusChanged { task_id, status } => {
+                self.execution_views
+                    .entry(task_id)
+                    .or_default()
+                    .scheduler_status = Some(status);
+            }
+            CoreExecutionEvent::ExecutionStarted { task_id, .. } => {
+                let view = self.execution_views.entry(task_id).or_default();
+                view.started_at = Some(Instant::now());
+                view.durable_state = Some(TaskState::Running);
+            }
+            CoreExecutionEvent::RuntimeOutput {
+                task_id,
+                stream,
+                bytes,
+                ..
+            } => self.append_output(task_id, stream, &bytes),
+            CoreExecutionEvent::VerificationStarted { task_id, .. } => {
+                self.execution_views
+                    .entry(task_id)
+                    .or_default()
+                    .durable_state = Some(TaskState::Verifying)
+            }
+            CoreExecutionEvent::RepairStarted {
+                task_id, attempt, ..
+            } => {
+                let view = self.execution_views.entry(task_id).or_default();
+                view.durable_state = Some(TaskState::Repairing);
+                view.repair_attempt = attempt;
+            }
+            CoreExecutionEvent::ClarificationNeeded { task_id, .. } => {
+                self.execution_views
+                    .entry(task_id)
+                    .or_default()
+                    .durable_state = Some(TaskState::NeedsClarification)
+            }
+            CoreExecutionEvent::DecisionNeeded { task_id, .. } => {
+                self.execution_views
+                    .entry(task_id)
+                    .or_default()
+                    .durable_state = Some(TaskState::NeedsDecision)
+            }
+            CoreExecutionEvent::ExecutionPersistenceFailed { task_id, error, .. } => {
+                self.execution_views
+                    .entry(task_id)
+                    .or_default()
+                    .persistence_error = Some(error);
+                return true;
+            }
+            CoreExecutionEvent::ExecutionPreflightFailed { task_id, failure } => {
+                self.feedback = format!("Execution preflight failed for {task_id}: {failure:?}");
+                return true;
+            }
+            CoreExecutionEvent::ExecutionFinished {
+                task_id,
+                final_state,
+                ..
+            } => {
+                let view = self.execution_views.entry(task_id).or_default();
+                view.cancellation_requested = false;
+                view.durable_state = Some(final_state);
+                return true;
+            }
+            CoreExecutionEvent::ExecutionCancelled { task_id, .. }
+            | CoreExecutionEvent::TaskStateChanged { task_id, .. } => {
+                self.execution_views
+                    .entry(task_id)
+                    .or_default()
+                    .cancellation_requested = false;
+                return true;
+            }
+            CoreExecutionEvent::ExecutionPreflightStarted { .. }
+            | CoreExecutionEvent::RepairAttempted { .. } => {}
+        }
+        false
+    }
+
+    fn append_output(&mut self, task_id: TaskId, stream: RuntimeOutputStream, bytes: &[u8]) {
+        let view = self.execution_views.entry(task_id).or_default();
+        let safe: String = String::from_utf8_lossy(bytes)
+            .chars()
+            .map(|character| {
+                if character == '\n' || character == '\t' || !character.is_control() {
+                    character
+                } else {
+                    '�'
+                }
+            })
+            .collect();
+        let line = format!(
+            "[{}] {}",
+            match stream {
+                RuntimeOutputStream::Stdout => "stdout",
+                RuntimeOutputStream::Stderr => "stderr",
+            },
+            safe
+        );
+        view.output_bytes += line.len();
+        view.output.push_back(line);
+        while view.output_bytes > UI_OUTPUT_BYTE_LIMIT {
+            if let Some(dropped) = view.output.pop_front() {
+                view.output_bytes = view.output_bytes.saturating_sub(dropped.len());
+            } else {
+                break;
+            }
+        }
     }
 
     fn refresh_repository_inspections(&mut self) {
@@ -824,6 +1378,7 @@ impl AppState {
         {
             Ok(stored) => {
                 let task_id = stored.id.to_string();
+                self.selected_task = Some(stored.id);
                 self.durable_tasks.push(stored);
                 self.feedback =
                     format!("Imported Relay task {task_id}. Execution has not started.");
@@ -907,6 +1462,8 @@ enum Screen {
     PasteTask,
     TaskPreview,
     TaskReview,
+    Execution,
+    Result,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1009,10 +1566,7 @@ mod tests {
             "ready".to_owned(),
         );
 
-        assert_eq!(
-            dashboard_status(&state),
-            "No projects configured.\nNo durable tasks."
-        );
+        assert!(dashboard_status(&state).starts_with("No projects configured.\nNo durable tasks."));
     }
 
     #[test]
@@ -1235,17 +1789,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_run_action_exists_in_task_review_help_or_text() {
+    async fn task_review_exposes_explicit_run_action() {
         let mut state = app_state_with_project_with_store().await;
         state.start_paste_task();
         state.paste_text = task_json();
         state.submit_paste_task();
         state.confirm_task_import().await;
 
-        assert_eq!(
-            help_text(&state),
-            "N: new task  D / Esc: dashboard  Q: quit"
-        );
+        assert!(help_text(&state).contains("run"));
         assert!(
             state
                 .relay

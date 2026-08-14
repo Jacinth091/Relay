@@ -297,13 +297,14 @@ fn render_add_project(frame: &mut Frame, state: &AppState, area: Rect) {
     let form = &state.add_project;
     if let Some(discovered) = &state.discovered_project {
         let body = format!(
-            "Add Project\n\nDetected repository\n\nName       {}\nKey        {}\nPath       {}\nRemote     {}\nGitHub     {}/{}\nStack      {}\n\n✓ Git worktree detected\n{}\n\nPress Enter to add this repository. Tab/arrow keys edit details. Esc cancels.",
-            discovered.suggested_name,
-            form.key,
+            "Add Project\n\nDetected repository\n\nGit root   {}\nOrigin     {}\n\nWill register\nKey        {}\nPath       {}\nRemote     {}\nGitHub     {}/{}\nStack      {}\n\n✓ Git worktree detected\n{}\n\nPress Enter to add this repository. Tab/arrow keys edit details. Esc cancels.",
             discovered.repository_root.display(),
             discovered.remote.as_deref().unwrap_or("not configured"),
-            discovered.github_owner.as_deref().unwrap_or("-"),
-            discovered.github_repo.as_deref().unwrap_or("-"),
+            form.key,
+            form.path,
+            form.expected_remote,
+            form.github_owner,
+            form.github_repo,
             form.default_stack,
             state.feedback
         );
@@ -520,7 +521,7 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
             _ => return Ok(false),
         }
     }
-    if key.code == KeyCode::Char('/') {
+    if key.code == KeyCode::Char('/') && command_mode_available(state.screen) {
         state.command_mode = true;
         state.command_input = "/".to_owned();
         return Ok(false);
@@ -719,6 +720,21 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
             _ => Ok(false),
         },
     }
+}
+
+fn command_mode_available(screen: Screen) -> bool {
+    matches!(
+        screen,
+        Screen::Dashboard
+            | Screen::Tasks
+            | Screen::Projects
+            | Screen::TaskReview
+            | Screen::Execution
+            | Screen::Result
+            | Screen::Runtime
+            | Screen::Settings
+            | Screen::Doctor
+    )
 }
 
 async fn execute_relay_command(state: &mut AppState, input: &str) -> Result<bool, Box<dyn Error>> {
@@ -2065,6 +2081,15 @@ mod tests {
         assert!(parse_codex_duration(Some("0")).is_err());
         assert!(parse_codex_duration(Some("14401")).is_err());
         assert!(parse_codex_duration(Some("invalid")).is_err());
+    }
+
+    #[test]
+    fn slash_is_reserved_only_for_navigation_views() {
+        assert!(command_mode_available(Screen::Dashboard));
+        assert!(command_mode_available(Screen::Tasks));
+        assert!(!command_mode_available(Screen::AddProject));
+        assert!(!command_mode_available(Screen::ImportFile));
+        assert!(!command_mode_available(Screen::PasteTask));
     }
 
     #[test]

@@ -98,9 +98,20 @@ mod tests {
     }
     #[test]
     fn parses_github_forms() {
+        for remote in [
+            "https://github.com/example/relay.git",
+            "http://github.com/example/relay.git",
+            "git@github.com:example/relay.git",
+            "ssh://git@github.com/example/relay.git",
+        ] {
+            assert_eq!(
+                parse_github_remote(remote),
+                Some((Some("example".to_owned()), Some("relay".to_owned())))
+            );
+        }
         assert_eq!(
-            parse_github_remote("git@github.com:Jacinth091/Relay.git"),
-            Some((Some("Jacinth091".to_owned()), Some("Relay".to_owned())))
+            parse_github_remote("ssh://git@example.internal/team/project.git"),
+            None
         );
     }
 
@@ -126,7 +137,7 @@ mod tests {
                     "remote",
                     "add",
                     "origin",
-                    "git@github.com:Jacinth091/Relay.git"
+                    "git@github.com:example/relay.git"
                 ])
                 .status()
                 .unwrap()
@@ -138,8 +149,8 @@ mod tests {
             discovered.suggested_key,
             path.file_name().unwrap().to_string_lossy()
         );
-        assert_eq!(discovered.github_owner.as_deref(), Some("Jacinth091"));
-        assert_eq!(discovered.github_repo.as_deref(), Some("Relay"));
+        assert_eq!(discovered.github_owner.as_deref(), Some("example"));
+        assert_eq!(discovered.github_repo.as_deref(), Some("relay"));
         let _ = std::fs::remove_dir_all(&path);
     }
 }

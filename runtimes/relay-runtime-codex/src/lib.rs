@@ -384,19 +384,42 @@ fn render_item_event(event: &Value) -> Option<String> {
             );
             match event.get("type").and_then(Value::as_str) {
                 Some("item.started") => Some(format!("› Running {command}")),
-                Some("item.completed")
-                    if item.get("exit_code").and_then(Value::as_i64) == Some(0) =>
-                {
-                    Some(format!("✓ {command}"))
+                Some("item.completed") => {
+                    let output = item
+                        .get("aggregated_output")
+                        .or_else(|| item.get("output"))
+                        .and_then(Value::as_str)
+                        .map(bounded_event_text);
+                    let status = if item.get("exit_code").and_then(Value::as_i64) == Some(0) {
+                        format!("✓ {command}")
+                    } else {
+                        format!("× {command} failed")
+                    };
+                    Some(output.map_or(status.clone(), |output| format!("{status}\n  {output}")))
                 }
-                Some("item.completed") => Some(format!("× {command} failed")),
                 _ => None,
             }
         }
-        "file_change" => item
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|path| format!("› Modified {}", bounded_event_text(path))),
+        "file_change" => {
+            let changes = item.get("changes").and_then(Value::as_array)?;
+            let rendered = changes
+                .iter()
+                .filter_map(|change| {
+                    let path = change.get("path").and_then(Value::as_str)?;
+                    let label = match change
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("modified")
+                    {
+                        "add" | "added" | "create" | "created" => "Added",
+                        "delete" | "deleted" | "remove" | "removed" => "Deleted",
+                        _ => "Modified",
+                    };
+                    Some(format!("› {label} {}", bounded_event_text(path)))
+                })
+                .collect::<Vec<_>>();
+            (!rendered.is_empty()).then(|| rendered.join("\n"))
+        }
         "reasoning" => Some("› Codex is analyzing the task".to_owned()),
         _ => None,
     }
@@ -407,11 +430,22 @@ fn bounded_event_text(input: &str) -> String {
         .chars()
         .filter(|character| *character == '\n' || *character == '\t' || !character.is_control())
         .collect();
-    if safe.len() > EVENT_OUTPUT_BYTE_LIMIT {
-        safe.truncate(EVENT_OUTPUT_BYTE_LIMIT);
-        safe.push('…');
-    }
+    truncate_utf8_to_bytes(&mut safe, EVENT_OUTPUT_BYTE_LIMIT);
     safe
+}
+
+fn truncate_utf8_to_bytes(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let boundary = value
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= max_bytes)
+        .last()
+        .unwrap_or(0);
+    value.truncate(boundary);
+    value.push('…');
 }
 
 async fn read_stdout(
@@ -701,5 +735,36 @@ mod tests {
             "› Codex is analyzing the task\n"
         );
         assert!(render_codex_json_event(&serde_json::json!({"type":"future.event"})).is_none());
+    }
+
+    #[test]
+    fn formatter_maps_file_changes_and_command_output() {
+        let files = serde_json::json!({"type":"item.completed","item":{"type":"file_change","changes":[{"kind":"add","path":"src/new.rs"},{"kind":"modify","path":"src/lib.rs"},{"kind":"delete","path":"old.rs"}]}});
+        let rendered = String::from_utf8(render_codex_json_event(&files).unwrap()).unwrap();
+        assert!(rendered.contains("Added src/new.rs"));
+        assert!(rendered.contains("Modified src/lib.rs"));
+        assert!(rendered.contains("Deleted old.rs"));
+        let command = serde_json::json!({"type":"item.completed","item":{"type":"command_execution","command":"cargo test","exit_code":0,"aggregated_output":"running 3 tests"}});
+        let rendered = String::from_utf8(render_codex_json_event(&command).unwrap()).unwrap();
+        assert!(rendered.contains("✓ cargo test"));
+        assert!(rendered.contains("running 3 tests"));
+    }
+
+    #[test]
+    fn event_text_truncation_is_utf8_safe() {
+        for text in [
+            "a".repeat(3000),
+            "é".repeat(3000),
+            "€".repeat(3000),
+            "😀".repeat(3000),
+        ] {
+            let result = bounded_event_text(&text);
+            assert!(result.is_char_boundary(result.len()));
+            assert!(result.len() <= EVENT_OUTPUT_BYTE_LIMIT + "…".len());
+            assert!(result.ends_with('…'));
+        }
+        assert_eq!(bounded_event_text("abc"), "abc");
+        let exact = "a".repeat(EVENT_OUTPUT_BYTE_LIMIT);
+        assert_eq!(bounded_event_text(&exact), exact);
     }
 }

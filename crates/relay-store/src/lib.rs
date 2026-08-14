@@ -34,6 +34,7 @@ pub struct NewTaskRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRecord {
     pub id: String,
+    pub title: String,
     pub handoff_json: String,
     pub project_key: String,
     pub submission_transport: String,
@@ -89,6 +90,8 @@ impl SqliteStore {
     }
 
     pub async fn insert_task(&self, task: &NewTaskRecord) -> Result<TaskRecord, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
         sqlx::query(
             r#"
             INSERT INTO tasks (
@@ -116,7 +119,7 @@ impl SqliteStore {
         .bind(&task.state)
         .bind(task.protocol_version)
         .bind(&task.handoff_json)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
 
         sqlx::query(
@@ -126,19 +129,64 @@ impl SqliteStore {
             "#,
         )
         .bind(&task.id)
-        .bind("TaskReady")
+        .bind("task_ready")
         .bind(format!(
             r#"{{"submission_transport":"{}"}}"#,
             task.submission_transport
         ))
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
 
-        self.get_task(&task.id)
+        let task = fetch_task(&mut *transaction, &task.id)
             .await?
             .ok_or_else(|| StoreError::TaskMissingAfterInsert {
                 id: task.id.clone(),
-            })
+            })?;
+        transaction.commit().await?;
+        Ok(task)
+    }
+
+    pub async fn update_task_state(
+        &self,
+        id: &str,
+        expected_state: &str,
+        new_state: &str,
+    ) -> Result<TaskRecord, StoreError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE tasks
+            SET state = ?1,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?2
+              AND state = ?3
+            "#,
+        )
+        .bind(new_state)
+        .bind(id)
+        .bind(expected_state)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            let actual_state =
+                sqlx::query_scalar::<_, String>("SELECT state FROM tasks WHERE id = ?1")
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+
+            return match actual_state {
+                Some(actual_state) => Err(StoreError::StateConflict {
+                    id: id.to_owned(),
+                    expected_state: expected_state.to_owned(),
+                    actual_state,
+                }),
+                None => Err(StoreError::TaskNotFound { id: id.to_owned() }),
+            };
+        }
+
+        self.get_task(id)
+            .await?
+            .ok_or_else(|| StoreError::TaskNotFound { id: id.to_owned() })
     }
 
     pub async fn get_task(&self, id: &str) -> Result<Option<TaskRecord>, StoreError> {
@@ -146,6 +194,7 @@ impl SqliteStore {
             r#"
             SELECT
                 id,
+                title,
                 handoff_json,
                 project_key,
                 submission_transport,
@@ -168,6 +217,7 @@ impl SqliteStore {
             r#"
             SELECT
                 id,
+                title,
                 handoff_json,
                 project_key,
                 submission_transport,
@@ -192,6 +242,32 @@ impl SqliteStore {
             .await?;
         Ok(count)
     }
+}
+
+async fn fetch_task<'a>(
+    executor: impl sqlx::Executor<'a, Database = sqlx::Sqlite>,
+    id: &str,
+) -> Result<Option<TaskRecord>, StoreError> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            id,
+            title,
+            handoff_json,
+            project_key,
+            submission_transport,
+            state,
+            created_at,
+            updated_at
+        FROM tasks
+        WHERE id = ?1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(executor)
+    .await?;
+
+    row.map(row_to_task_record).transpose()
 }
 
 /// Returns Relay's default local durable-state database path.
@@ -228,6 +304,7 @@ pub fn default_database_path() -> PathBuf {
 fn row_to_task_record(row: sqlx::sqlite::SqliteRow) -> Result<TaskRecord, StoreError> {
     Ok(TaskRecord {
         id: row.try_get("id")?,
+        title: row.try_get("title")?,
         handoff_json: row.try_get("handoff_json")?,
         project_key: row.try_get("project_key")?,
         submission_transport: row.try_get("submission_transport")?,
@@ -250,6 +327,14 @@ pub enum StoreError {
     Migration(#[from] sqlx::migrate::MigrateError),
     #[error("task {id} was not found after insert")]
     TaskMissingAfterInsert { id: String },
+    #[error("task {id} was not found")]
+    TaskNotFound { id: String },
+    #[error("task {id} state conflict: expected '{expected_state}', found '{actual_state}'")]
+    StateConflict {
+        id: String,
+        expected_state: String,
+        actual_state: String,
+    },
 }
 
 #[cfg(test)]
@@ -281,11 +366,39 @@ mod tests {
         let stored = store.insert_task(&task).await.unwrap();
 
         assert_eq!(stored.id, "task-1");
+        assert_eq!(stored.title, "Persist imported task");
         assert_eq!(stored.state, "ready");
         assert_eq!(stored.project_key, "relay");
         assert_eq!(stored.handoff_json, TASK_JSON);
         assert_eq!(stored.submission_transport, "local-paste");
         assert_eq!(store.task_event_count("task-1").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn task_creation_rolls_back_when_initial_event_fails() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER fail_task_ready_event
+            BEFORE INSERT ON events
+            WHEN NEW.event_kind = 'task_ready'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced TaskReady failure');
+            END
+            "#,
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        let error = store
+            .insert_task(&task_record("task-rollback", "Rollback task"))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("SQLite operation failed"));
+        assert!(store.get_task("task-rollback").await.unwrap().is_none());
+        assert_eq!(store.task_event_count("task-rollback").await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -302,6 +415,103 @@ mod tests {
         let loaded = reopened.get_task("task-1").await.unwrap().unwrap();
 
         assert_eq!(loaded.id, "task-1");
+        assert_eq!(loaded.state, "ready");
+    }
+
+    #[tokio::test]
+    async fn updates_task_state_and_timestamp() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let stored = store
+            .insert_task(&task_record("task-update", "Update task"))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let updated = store
+            .update_task_state("task-update", "ready", "needs_clarification")
+            .await
+            .unwrap();
+
+        assert_eq!(updated.id, stored.id);
+        assert_eq!(updated.state, "needs_clarification");
+        assert_ne!(updated.updated_at, stored.updated_at);
+    }
+
+    #[tokio::test]
+    async fn updated_task_state_survives_reopen() {
+        let database_path = temp_path("relay-update-state.sqlite3");
+
+        {
+            let store = SqliteStore::open(&database_path).await.unwrap();
+            store
+                .insert_task(&task_record("task-update", "Update task"))
+                .await
+                .unwrap();
+            store
+                .update_task_state("task-update", "ready", "done")
+                .await
+                .unwrap();
+        }
+
+        let reopened = SqliteStore::open(&database_path).await.unwrap();
+        let loaded = reopened.get_task("task-update").await.unwrap().unwrap();
+
+        assert_eq!(loaded.state, "done");
+    }
+
+    #[tokio::test]
+    async fn invalid_task_state_update_is_rejected() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store
+            .insert_task(&task_record("task-invalid-state", "Invalid update"))
+            .await
+            .unwrap();
+
+        let error = store
+            .update_task_state("task-invalid-state", "ready", "bogus")
+            .await
+            .unwrap_err();
+        let loaded = store.get_task("task-invalid-state").await.unwrap().unwrap();
+
+        assert!(error.to_string().contains("SQLite operation failed"));
+        assert_eq!(loaded.state, "ready");
+    }
+
+    #[tokio::test]
+    async fn missing_task_state_update_is_reported() {
+        let store = SqliteStore::in_memory().await.unwrap();
+
+        let error = store
+            .update_task_state("missing", "ready", "done")
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "task missing was not found");
+    }
+
+    #[tokio::test]
+    async fn stale_task_state_update_is_rejected() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store
+            .insert_task(&task_record("task-conflict", "Conflict task"))
+            .await
+            .unwrap();
+
+        let error = store
+            .update_task_state("task-conflict", "running", "done")
+            .await
+            .unwrap_err();
+        let loaded = store.get_task("task-conflict").await.unwrap().unwrap();
+
+        assert!(matches!(
+            error,
+            StoreError::StateConflict {
+                expected_state,
+                actual_state,
+                ..
+            } if expected_state == "running" && actual_state == "ready"
+        ));
         assert_eq!(loaded.state, "ready");
     }
 

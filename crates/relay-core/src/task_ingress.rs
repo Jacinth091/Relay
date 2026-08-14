@@ -92,11 +92,33 @@ impl TaskImportCandidate {
 /// Reviewable in-memory task created after explicit import confirmation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportedTask {
-    pub id: TaskId,
-    pub handoff: HandoffTask,
-    pub project_key: ProjectKey,
-    pub project_name: Option<String>,
-    pub submission_transport: SubmissionTransport,
+    id: TaskId,
+    handoff: HandoffTask,
+    project_key: ProjectKey,
+    project_name: Option<String>,
+    submission_transport: SubmissionTransport,
+}
+
+impl ImportedTask {
+    pub fn id(&self) -> TaskId {
+        self.id
+    }
+
+    pub fn handoff(&self) -> &HandoffTask {
+        &self.handoff
+    }
+
+    pub fn project_key(&self) -> &ProjectKey {
+        &self.project_key
+    }
+
+    pub fn project_name(&self) -> Option<&str> {
+        self.project_name.as_deref()
+    }
+
+    pub fn submission_transport(&self) -> SubmissionTransport {
+        self.submission_transport
+    }
 }
 
 #[derive(Debug, Error)]
@@ -141,7 +163,7 @@ impl Relay {
         self.accept_imported_task(candidate.into_imported_task())
     }
 
-    pub fn accept_imported_task(&mut self, imported: ImportedTask) -> &ImportedTask {
+    pub(crate) fn accept_imported_task(&mut self, imported: ImportedTask) -> &ImportedTask {
         self.reviewed_task = Some(imported);
 
         self.reviewed_task
@@ -295,8 +317,8 @@ mod tests {
 
         let imported = relay.confirm_task_import(candidate).clone();
 
-        assert_eq!(imported.project_key.as_str(), "relay");
-        assert!(!imported.id.to_string().is_empty());
+        assert_eq!(imported.project_key().as_str(), "relay");
+        assert!(!imported.id().to_string().is_empty());
         assert!(relay.reviewed_task().is_some());
     }
 
@@ -323,11 +345,11 @@ mod tests {
 
         let imported = relay.confirm_task_import(file_candidate).clone();
         assert_eq!(
-            imported.submission_transport,
+            imported.submission_transport(),
             SubmissionTransport::LocalFile
         );
         assert_eq!(
-            imported.handoff.source.as_ref().unwrap().provider,
+            imported.handoff().source.as_ref().unwrap().provider,
             "openai".to_owned()
         );
     }

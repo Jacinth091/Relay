@@ -130,6 +130,16 @@ load. The validated `HandoffTask v1` payload is stored with Relay-owned task
 identity, submission transport, project key, task state, source metadata, and
 timestamps.
 
+Task creation and its initial `task_ready` durable event are written in one
+transaction. Task state updates use compare-and-set storage semantics surfaced
+through a typed Core adapter, preserving stale-state conflicts for later
+orchestration policy. Reload validates stored canonical JSON through the
+protocol parser and rejects project/title metadata drift.
+
+On restart, the TUI lists durable tasks with task ID, title, project, state,
+submission transport, and loaded task content. The M5 task view is read-only
+and exposes no run action.
+
 The initial schema also creates tables for optional external bindings,
 executions, clarification/decision requests, resolutions, and durable events so
 later milestones can add lifecycle behavior without replacing the canonical

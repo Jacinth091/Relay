@@ -145,6 +145,7 @@ fn render(frame: &mut Frame, state: &AppState) {
 
     match state.screen {
         Screen::Dashboard => render_dashboard(frame, state, areas[0]),
+        Screen::Tasks => render_tasks(frame, state, areas[0]),
         Screen::Projects => render_projects(frame, state, areas[0]),
         Screen::AddProject => render_add_project(frame, state, areas[0]),
         Screen::NewTask => render_new_task(frame, state, areas[0]),
@@ -164,6 +165,14 @@ fn render_dashboard(frame: &mut Frame, state: &AppState, area: Rect) {
         .wrap(Wrap { trim: true })
         .block(Block::default().title(" Relay ").borders(Borders::ALL));
     frame.render_widget(dashboard, area);
+}
+
+fn render_tasks(frame: &mut Frame, state: &AppState, area: Rect) {
+    let body = durable_task_listing(&state.durable_tasks, &state.feedback);
+    let tasks = Paragraph::new(body)
+        .wrap(Wrap { trim: false })
+        .block(Block::default().title(" Tasks ").borders(Borders::ALL));
+    frame.render_widget(tasks, area);
 }
 
 fn render_projects(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -273,11 +282,11 @@ fn render_task_review(frame: &mut Frame, state: &AppState, area: Rect) {
         .map(|task| {
             format!(
                 "Task ID: {}\n{}\n\nValidation: IMPORTED\n\nNo Run action is available in M4.",
-                task.id,
+                task.id(),
                 handoff_summary_text(
-                    &task.handoff,
-                    task.project_key.as_str(),
-                    task.project_name.as_deref()
+                    task.handoff(),
+                    task.project_key().as_str(),
+                    task.project_name()
                 )
             )
         })
@@ -313,8 +322,20 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
                 state.enter_projects();
                 Ok(false)
             }
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                state.enter_tasks();
+                Ok(false)
+            }
             KeyCode::Char('a') | KeyCode::Char('A') => {
                 state.try_start_add_project();
+                Ok(false)
+            }
+            _ => Ok(false),
+        },
+        Screen::Tasks => match key.code {
+            KeyCode::Char('q') | KeyCode::Char('Q') => Ok(true),
+            KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => {
+                state.screen = Screen::Dashboard;
                 Ok(false)
             }
             _ => Ok(false),
@@ -471,6 +492,33 @@ fn project_listing(
     format!("{}\n\n{feedback}", lines.join("\n\n"))
 }
 
+fn durable_task_listing(tasks: &[StoredTask], feedback: &str) -> String {
+    if tasks.is_empty() {
+        return format!("No durable tasks.\n\n{feedback}");
+    }
+
+    let lines = tasks
+        .iter()
+        .map(|task| {
+            format!(
+                "{}\n  Title: {}\n  Project: {}\n  State: {}\n  Submission transport: {}\n\n  Goal: {}\n\n  Requirements:\n{}\n\n  Constraints:\n{}\n\n  Verification:\n{}",
+                task.id,
+                task.handoff.title,
+                task.project_key.as_str(),
+                task.state.as_str(),
+                task.submission_transport.as_str(),
+                task.handoff.task.goal,
+                indented_bullet_lines(&task.handoff.task.requirements),
+                indented_bullet_lines(&task.handoff.task.constraints),
+                indented_bullet_lines(&task.handoff.task.verification)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    format!("{lines}\n\n{feedback}")
+}
+
 fn repository_inspection_line(
     eligibility: &RepositoryEligibility,
     status: &Option<relay_core::RepositoryStatus>,
@@ -526,9 +574,10 @@ fn safety_failure_text(reason: &RepositorySafetyFailure) -> String {
 fn help_text(state: &AppState) -> &'static str {
     match state.screen {
         Screen::Dashboard if state.registry_writable => {
-            "N: new task  P: projects  A: add project  Q / Esc: quit"
+            "N: new task  T: tasks  P: projects  A: add project  Q / Esc: quit"
         }
-        Screen::Dashboard => "N: new task  P: projects  Q / Esc: quit",
+        Screen::Dashboard => "N: new task  T: tasks  P: projects  Q / Esc: quit",
+        Screen::Tasks => "D / Esc: dashboard  Q: quit",
         Screen::Projects if state.registry_writable => {
             "R: refresh  A: add project  D / Esc: dashboard  Q: quit"
         }
@@ -585,6 +634,14 @@ fn bullet_lines(items: &[String]) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+fn indented_bullet_lines(items: &[String]) -> String {
+    bullet_lines(items)
+        .lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn ambiguity_policy_text(policy: AmbiguityPolicy) -> &'static str {
@@ -660,6 +717,10 @@ impl AppState {
     fn enter_projects(&mut self) {
         self.refresh_repository_inspections();
         self.screen = Screen::Projects;
+    }
+
+    fn enter_tasks(&mut self) {
+        self.screen = Screen::Tasks;
     }
 
     fn refresh_repository_inspections(&mut self) {
@@ -838,6 +899,7 @@ impl AppState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Dashboard,
+    Tasks,
     Projects,
     AddProject,
     NewTask,
@@ -1060,6 +1122,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_tasks_are_visible_after_reopen_without_reviewed_task() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let mut state = app_state_with_project();
+        state.store = Some(store.clone());
+
+        state.start_paste_task();
+        state.paste_text = task_json();
+        state.submit_paste_task();
+        state.confirm_task_import().await;
+
+        let durable_tasks = list_stored_tasks(&store).await.unwrap();
+        let mut reopened = AppState::new_with_store(
+            Relay::with_project_registry(state.relay.project_registry().clone()),
+            unique_temp_path("config").join("relay.toml"),
+            true,
+            unique_temp_path("state").join("relay.sqlite3"),
+            Some(store),
+            durable_tasks,
+            "ready".to_owned(),
+        );
+
+        assert!(reopened.relay.reviewed_task().is_none());
+        reopened.enter_tasks();
+        assert_eq!(reopened.screen, Screen::Tasks);
+
+        let listing = durable_task_listing(&reopened.durable_tasks, "ready");
+        let task_id = reopened.durable_tasks[0].id.to_string();
+        assert!(listing.contains(&task_id));
+        assert!(listing.contains("Implement local ingress"));
+        assert!(listing.contains("Project: relay"));
+        assert!(listing.contains("State: ready"));
+        assert!(listing.contains("Submission transport: local-paste"));
+        assert!(listing.contains("Goal: Import a local handoff task."));
+        assert!(listing.contains("* Show a preview."));
+        assert!(listing.contains("* Do not execute."));
+        assert!(listing.contains("* Review in memory."));
+        assert!(!listing.to_ascii_lowercase().contains("run"));
+        assert!(!help_text(&reopened).to_ascii_lowercase().contains("run"));
+    }
+
+    #[tokio::test]
     async fn multiline_json_paste_event_waits_for_explicit_validation() {
         let mut state = app_state_with_project();
 
@@ -1147,7 +1250,7 @@ mod tests {
             state
                 .relay
                 .reviewed_task()
-                .map(|task| task.handoff.title.as_str())
+                .map(|task| task.handoff().title.as_str())
                 .is_some()
         );
     }

@@ -13,7 +13,7 @@ pub use relay_protocol::{AmbiguityPolicy, HandoffTask};
 
 pub use durable_state::{
     SqliteStore, StoredTask, TaskPersistenceError, TaskState, default_database_path,
-    get_stored_task, list_stored_tasks, persist_imported_task,
+    get_stored_task, list_stored_tasks, update_stored_task_state,
 };
 pub use project_registry::{
     ExpectedRemote, GitHubRepositoryMetadata, ProjectKey, ProjectRegistry, ProjectRegistryError,

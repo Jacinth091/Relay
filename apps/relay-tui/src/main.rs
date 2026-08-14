@@ -1,3 +1,6 @@
+mod command;
+mod project_discovery;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     error::Error,
@@ -7,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use command::{RelayCommand, command_suggestions, parse_relay_command};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -15,6 +19,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use project_discovery::{DiscoveredProject, discover_project};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -220,7 +225,12 @@ fn render(frame: &mut Frame, state: &AppState) {
     } else {
         "Type /help for commands".to_owned()
     };
-    let help = Paragraph::new(format!("{prompt}\n{}", help_text(state)));
+    let suggestions = if state.command_mode {
+        command_suggestions(&state.command_input).join("  ")
+    } else {
+        String::new()
+    };
+    let help = Paragraph::new(format!("{prompt}\n{} {}", help_text(state), suggestions));
     frame.render_widget(help, areas[1]);
 }
 
@@ -285,6 +295,21 @@ fn render_projects(frame: &mut Frame, state: &AppState, area: Rect) {
 
 fn render_add_project(frame: &mut Frame, state: &AppState, area: Rect) {
     let form = &state.add_project;
+    if let Some(discovered) = &state.discovered_project {
+        let body = format!(
+            "Add Project\n\nDetected repository\n\nName       {}\nKey        {}\nPath       {}\nRemote     {}\nGitHub     {}/{}\nStack      {}\n\n✓ Git worktree detected\n{}\n\nPress Enter to add this repository. Tab/arrow keys edit details. Esc cancels.",
+            discovered.suggested_name,
+            form.key,
+            discovered.repository_root.display(),
+            discovered.remote.as_deref().unwrap_or("not configured"),
+            discovered.github_owner.as_deref().unwrap_or("-"),
+            discovered.github_repo.as_deref().unwrap_or("-"),
+            form.default_stack,
+            state.feedback
+        );
+        frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), area);
+        return;
+    }
     let body = [
         add_field_line(state, AddProjectField::Key, "Key", &form.key),
         add_field_line(state, AddProjectField::Path, "Path", &form.path),
@@ -697,33 +722,29 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
 }
 
 async fn execute_relay_command(state: &mut AppState, input: &str) -> Result<bool, Box<dyn Error>> {
-    let command = input.trim();
+    let command = match parse_relay_command(input) {
+        Ok(command) => command,
+        Err(error) => {
+            state.feedback = error;
+            return Ok(false);
+        }
+    };
     match command {
-        "/home" => state.screen = Screen::Dashboard,
-        "/new" => state.start_new_task(),
-        "/tasks" => state.enter_tasks(),
-        "/projects" => state.enter_projects(),
-        "/project add" => state.start_detected_project(None),
-        "/runtime" => state.screen = Screen::Runtime,
-        "/settings" => state.screen = Screen::Settings,
-        "/doctor" => state.screen = Screen::Doctor,
-        "/help" => {
+        RelayCommand::Home => state.screen = Screen::Dashboard,
+        RelayCommand::New => state.start_new_task(),
+        RelayCommand::Tasks => state.enter_tasks(),
+        RelayCommand::Projects => state.enter_projects(),
+        RelayCommand::ProjectAdd { path } => state.start_detected_project(path),
+        RelayCommand::Runtime => state.screen = Screen::Runtime,
+        RelayCommand::Settings => state.screen = Screen::Settings,
+        RelayCommand::Doctor => state.screen = Screen::Doctor,
+        RelayCommand::Help => {
             state.screen = Screen::Dashboard;
-            state.feedback = "Commands: /new /tasks /projects /project add /runtime /settings /doctor /help /quit".to_owned();
+            state.feedback = command::COMMANDS.join("\n");
         }
-        "/quit" => return Ok(true),
-        _ if command.starts_with("/project add ") => state.start_detected_project(Some(
-            PathBuf::from(command.trim_start_matches("/project add ").trim()),
-        )),
-        _ if command.starts_with("/run ") => {
-            state
-                .run_task_selector(command.trim_start_matches("/run ").trim())
-                .await
-        }
-        _ if command.starts_with("/cancel ") => {
-            state.cancel_task_selector(command.trim_start_matches("/cancel ").trim())
-        }
-        _ => state.feedback = "Unknown Relay command. Try /help.".to_owned(),
+        RelayCommand::Quit => return Ok(true),
+        RelayCommand::Run { task } => state.run_task_selector(&task).await,
+        RelayCommand::Cancel { task } => state.cancel_task_selector(&task),
     }
     Ok(false)
 }
@@ -1165,6 +1186,7 @@ struct AppState {
     cancel_confirmation: Option<TaskId>,
     screen: Screen,
     add_project: AddProjectForm,
+    discovered_project: Option<DiscoveredProject>,
     add_field: AddProjectField,
     import_file_path: String,
     paste_text: String,
@@ -1189,27 +1211,29 @@ const UI_OUTPUT_BYTE_LIMIT: usize = 16 * 1024;
 
 impl AppState {
     fn start_detected_project(&mut self, path: Option<PathBuf>) {
-        self.start_add_project();
         let path = path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        self.add_project.path = path.display().to_string();
-        self.add_project.key = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("project")
-            .to_ascii_lowercase()
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() {
-                    character
-                } else {
-                    '-'
-                }
-            })
-            .collect::<String>()
-            .trim_matches('-')
-            .to_owned();
-        self.add_project.default_stack = "chatgpt-codex".to_owned();
-        self.feedback = "Detected local candidate. Review the suggested values, then confirm to trust this repository.".to_owned();
+        match discover_project(&path) {
+            Ok(discovered) => {
+                self.start_add_project();
+                self.add_project.path = discovered.repository_root.display().to_string();
+                self.add_project.key = discovered.suggested_key.clone();
+                self.add_project.expected_remote = discovered.remote.clone().unwrap_or_default();
+                self.add_project.default_stack = discovered
+                    .suggested_stack
+                    .clone()
+                    .unwrap_or_else(|| "chatgpt-codex".to_owned());
+                self.add_project.github_owner = discovered.github_owner.clone().unwrap_or_default();
+                self.add_project.github_repo = discovered.github_repo.clone().unwrap_or_default();
+                self.discovered_project = Some(discovered);
+                self.feedback = "Detected repository. Review the suggested values and press Enter to add it, or edit details first.".to_owned();
+            }
+            Err(error) => {
+                self.start_add_project();
+                self.feedback = format!(
+                    "Repository detection failed: {error}\nAdvanced setup is available for manual registration."
+                );
+            }
+        }
     }
 
     async fn run_task_selector(&mut self, selector: &str) {
@@ -1315,6 +1339,7 @@ impl AppState {
             cancel_confirmation: None,
             screen: Screen::Dashboard,
             add_project: AddProjectForm::default(),
+            discovered_project: None,
             add_field: AddProjectField::Key,
             import_file_path: String::new(),
             paste_text: String::new(),
@@ -1754,6 +1779,7 @@ impl AppState {
     fn start_add_project(&mut self) {
         self.screen = Screen::AddProject;
         self.add_project = AddProjectForm::default();
+        self.discovered_project = None;
         self.add_field = AddProjectField::Key;
         self.feedback = "Enter trusted local project metadata.".to_owned();
     }

@@ -17,6 +17,10 @@ impl TaskId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    pub fn parse(input: impl AsRef<str>) -> Result<Self, uuid::Error> {
+        Uuid::parse_str(input.as_ref()).map(Self)
+    }
 }
 
 impl Default for TaskId {
@@ -36,6 +40,15 @@ impl fmt::Display for TaskId {
 pub enum SubmissionTransport {
     LocalFile,
     LocalPaste,
+}
+
+impl SubmissionTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalFile => "local-file",
+            Self::LocalPaste => "local-paste",
+        }
+    }
 }
 
 /// Validated task ready for user confirmation.
@@ -63,16 +76,49 @@ impl TaskImportCandidate {
     pub fn submission_transport(&self) -> SubmissionTransport {
         self.submission_transport
     }
+
+    /// Consumes a validated candidate and assigns Relay-owned task identity.
+    pub fn into_imported_task(self) -> ImportedTask {
+        ImportedTask {
+            id: TaskId::new(),
+            handoff: self.handoff,
+            project_key: self.project_key,
+            project_name: self.project_name,
+            submission_transport: self.submission_transport,
+        }
+    }
 }
 
 /// Reviewable in-memory task created after explicit import confirmation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportedTask {
-    pub id: TaskId,
-    pub handoff: HandoffTask,
-    pub project_key: ProjectKey,
-    pub project_name: Option<String>,
-    pub submission_transport: SubmissionTransport,
+    id: TaskId,
+    handoff: HandoffTask,
+    project_key: ProjectKey,
+    project_name: Option<String>,
+    submission_transport: SubmissionTransport,
+}
+
+impl ImportedTask {
+    pub fn id(&self) -> TaskId {
+        self.id
+    }
+
+    pub fn handoff(&self) -> &HandoffTask {
+        &self.handoff
+    }
+
+    pub fn project_key(&self) -> &ProjectKey {
+        &self.project_key
+    }
+
+    pub fn project_name(&self) -> Option<&str> {
+        self.project_name.as_deref()
+    }
+
+    pub fn submission_transport(&self) -> SubmissionTransport {
+        self.submission_transport
+    }
 }
 
 #[derive(Debug, Error)]
@@ -114,13 +160,11 @@ impl Relay {
     }
 
     pub fn confirm_task_import(&mut self, candidate: TaskImportCandidate) -> &ImportedTask {
-        self.reviewed_task = Some(ImportedTask {
-            id: TaskId::new(),
-            handoff: candidate.handoff,
-            project_key: candidate.project_key,
-            project_name: candidate.project_name,
-            submission_transport: candidate.submission_transport,
-        });
+        self.accept_imported_task(candidate.into_imported_task())
+    }
+
+    pub(crate) fn accept_imported_task(&mut self, imported: ImportedTask) -> &ImportedTask {
+        self.reviewed_task = Some(imported);
 
         self.reviewed_task
             .as_ref()
@@ -273,8 +317,8 @@ mod tests {
 
         let imported = relay.confirm_task_import(candidate).clone();
 
-        assert_eq!(imported.project_key.as_str(), "relay");
-        assert!(!imported.id.to_string().is_empty());
+        assert_eq!(imported.project_key().as_str(), "relay");
+        assert!(!imported.id().to_string().is_empty());
         assert!(relay.reviewed_task().is_some());
     }
 
@@ -301,11 +345,11 @@ mod tests {
 
         let imported = relay.confirm_task_import(file_candidate).clone();
         assert_eq!(
-            imported.submission_transport,
+            imported.submission_transport(),
             SubmissionTransport::LocalFile
         );
         assert_eq!(
-            imported.handoff.source.as_ref().unwrap().provider,
+            imported.handoff().source.as_ref().unwrap().provider,
             "openai".to_owned()
         );
     }

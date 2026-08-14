@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{
-    Deserialize, Deserializer,
+    Deserialize, Deserializer, Serialize,
     de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor},
 };
 use serde_json::Value;
@@ -17,7 +17,7 @@ const MARKER_START: &str = "<!-- relay:task:start -->";
 const MARKER_END: &str = "<!-- relay:task:end -->";
 const DUPLICATE_KEY_PREFIX: &str = "duplicate JSON object key: ";
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HandoffTask {
     pub protocol_version: u8,
@@ -59,7 +59,7 @@ impl HandoffTask {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceMetadata {
     pub kind: String,
@@ -73,7 +73,7 @@ impl SourceMetadata {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskSpec {
     pub goal: String,
@@ -91,7 +91,7 @@ impl TaskSpec {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AmbiguityPolicy {
     NeedsClarification,

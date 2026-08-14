@@ -1123,4 +1123,24 @@ mod tests {
         assert!(stdout.contains("value with spaces & symbols"));
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_cmd_tree_termination_reaps_wrapper() {
+        let root = std::env::temp_dir().join(format!("relay-codex tree {}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("tree.cmd");
+        std::fs::write(
+            &script,
+            "@echo off\r\nstart \"\" /b ping 127.0.0.1 -n 30 > nul\r\nping 127.0.0.1 -n 30 > nul\r\n",
+        )
+        .unwrap();
+        let mut command = launcher_command(&script, &[]);
+        command.kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        terminate_process_tree(&mut child).await;
+        assert!(child.try_wait().unwrap().is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

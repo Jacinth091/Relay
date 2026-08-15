@@ -321,10 +321,17 @@ fn render(frame: &mut Frame, state: &AppState) {
 
 fn render_dashboard(frame: &mut Frame, state: &AppState, area: Rect) {
     let body = activity_home(state);
-    let dashboard = Paragraph::new(body)
-        .wrap(Wrap { trim: true })
-        .block(Block::default().title(" Relay ").borders(Borders::ALL));
-    frame.render_widget(dashboard, area);
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), area);
+}
+
+fn render_tasks(frame: &mut Frame, state: &AppState, area: Rect) {
+    let body = task_selection_listing(state);
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), area);
+}
+
+fn render_projects(frame: &mut Frame, state: &AppState, area: Rect) {
+    let body = project_listing(&state.relay, &state.repository_inspections, &state.feedback);
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), area);
 }
 
 fn render_runtimes(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -414,12 +421,15 @@ fn render_runtime_detail(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn render_diff(frame: &mut Frame, state: &AppState, area: Rect) {
-    let body = state
-        .diff_output
-        .as_deref()
-        .unwrap_or("No diff available.\n\nRun a task first, then use /diff to view changes.");
+    let theme = Theme::default();
+    let lines = match state.diff_output.as_deref() {
+        Some(diff_text) if !diff_text.is_empty() => format_diff_lines(diff_text, &theme),
+        _ => vec![ratatui::text::Line::from(
+            "No diff available.\n\nRun a task first, then use /diff to view changes.",
+        )],
+    };
     frame.render_widget(
-        Paragraph::new(body.to_owned())
+        Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((state.diff_scroll, 0)),
         area,
@@ -514,22 +524,6 @@ fn codex_health_detail(health: &CodexRuntimeHealth, runtime: &CodexRuntime) -> S
         CodexRuntimeHealth::NotInstalled { error }
         | CodexRuntimeHealth::DiscoveryFailed { error } => format!("  {executable}\n  {error}"),
     }
-}
-
-fn render_tasks(frame: &mut Frame, state: &AppState, area: Rect) {
-    let body = task_selection_listing(state);
-    let tasks = Paragraph::new(body)
-        .wrap(Wrap { trim: false })
-        .block(Block::default().title(" Tasks ").borders(Borders::ALL));
-    frame.render_widget(tasks, area);
-}
-
-fn render_projects(frame: &mut Frame, state: &AppState, area: Rect) {
-    let body = project_listing(&state.relay, &state.repository_inspections, &state.feedback);
-    let projects = Paragraph::new(body)
-        .wrap(Wrap { trim: false })
-        .block(Block::default().title(" Projects ").borders(Borders::ALL));
-    frame.render_widget(projects, area);
 }
 
 fn render_add_project(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -694,19 +688,14 @@ fn render_task_review(frame: &mut Frame, state: &AppState, area: Rect) {
             )
         })
         .unwrap_or_else(|| "No durable task selected.".to_owned());
-    let review = Paragraph::new(body).wrap(Wrap { trim: false }).block(
-        Block::default()
-            .title(" Task Review ")
-            .borders(Borders::ALL),
-    );
-    frame.render_widget(review, area);
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), area);
 }
 
 fn render_execution(frame: &mut Frame, state: &AppState, area: Rect) {
     let body = state.selected_task.and_then(|id| state.execution_views.get(&id).map(|view| (id, view))).map(|(id, view)| {
         let task = state.durable_tasks.iter().find(|task| task.id == id);
         let output = view.output.iter().cloned().collect::<Vec<_>>().join("");
-        format!("Task: {id}\nProject: {}\nRuntime: {}\nScheduler: {}\nPhase: {}\nRepair: {}\nElapsed: {}s\n{}\n\nOutput:\n{}\n\n[C] Cancel  [B] Background / Tasks",
+        format!("Task: {id}\nProject: {}\nRuntime: {}\nScheduler: {}\nPhase: {}\nRepair: {}\nElapsed: {}s\n{}\n\nOutput:\n{}\n\nTry:\n  /cancel\n  /diff\n  /logs\n  /tasks",
             task.map(|task| task.project_key.as_str()).unwrap_or("unknown"),
             state.runtime_label(),
             view.scheduler_status.as_ref().map(scheduler_status_text).unwrap_or("not scheduled"),
@@ -714,29 +703,19 @@ fn render_execution(frame: &mut Frame, state: &AppState, area: Rect) {
             view.started_at.map(|started| started.elapsed().as_secs()).unwrap_or(0),
             view.persistence_error.as_ref().map(|error| format!("STATE UNCERTAIN / DURABILITY FAILURE\n{error}")).unwrap_or_else(|| if view.cancellation_requested { "Cancellation requested...".to_owned() } else { String::new() }), output)
     }).unwrap_or_else(|| "No execution selected.".to_owned());
-    frame.render_widget(
-        Paragraph::new(body)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().title(" Execution ").borders(Borders::ALL)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), area);
 }
 
 fn render_result(frame: &mut Frame, state: &AppState, area: Rect) {
     let body = state.selected_stored_task().map(|task| {
         let report = state.last_reports.get(&task.id);
         let repository = state.relay.inspect_project_repository(task.project_key.as_str()).ok().map(|i| repository_inspection_line(&i.eligibility, &i.status)).unwrap_or_else(|| "unavailable".to_owned());
-        format!("Task: {}\nProject: {}\nRuntime: {}\nState: {}\nOutcome: {}\nVerification: {}\nRepairs: {}\nRepository: {}\n\nSummary:\n{}\n\n[T] Tasks  [D] Dashboard  [N] New Task",
+        format!("Task: {}\nProject: {}\nRuntime: {}\nState: {}\nOutcome: {}\nVerification: {}\nRepairs: {}\nRepository: {}\n\nSummary:\n{}\n\nTry:\n  /diff\n  /logs\n  /tasks\n  /new",
             task.id, task.project_key, state.runtime_label(), task.state.as_str(), report.and_then(|r| r.outcome).map(|o| o.as_str()).unwrap_or("not confirmed"),
             if task.state == TaskState::Done { "PASS" } else { "not available" }, state.execution_views.get(&task.id).map(|v| v.repair_attempt).unwrap_or(0), repository,
             report.and_then(|r| r.outcome_summary.as_deref()).unwrap_or("No confirmed execution report."))
     }).unwrap_or_else(|| "No durable task selected.".to_owned());
-    frame.render_widget(
-        Paragraph::new(body)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().title(" Result ").borders(Borders::ALL)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), area);
 }
 
 async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn Error>> {
@@ -1791,6 +1770,37 @@ impl AppState {
 
     fn has_active_execution(&self) -> bool {
         self.scheduler_driver.is_some() || matches!(self.screen, Screen::Execution)
+    }
+
+    pub fn input_context(&self) -> events::InputContext {
+        if self.command_mode {
+            events::InputContext::CommandPrompt
+        } else {
+            match self.screen {
+                Screen::PasteTask | Screen::ImportFile => events::InputContext::TextEditor,
+                Screen::AddProject => {
+                    if self.discovered_project.is_some() {
+                        events::InputContext::Selection
+                    } else {
+                        events::InputContext::TextEditor
+                    }
+                }
+                Screen::Tasks
+                | Screen::Projects
+                | Screen::NewTask
+                | Screen::Runtimes
+                | Screen::RuntimeDetail => events::InputContext::Selection,
+                Screen::TaskReview => events::InputContext::Confirmation,
+                Screen::Dashboard
+                | Screen::TaskPreview
+                | Screen::Execution
+                | Screen::Result
+                | Screen::Diff
+                | Screen::Logs
+                | Screen::Settings
+                | Screen::Doctor => events::InputContext::PassiveView,
+            }
+        }
     }
 
     fn enter_projects(&mut self) {

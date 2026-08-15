@@ -1058,7 +1058,7 @@ async fn execute_relay_command(state: &mut AppState, input: &str) -> Result<bool
         RelayCommand::RuntimeTest { .. } => state.begin_health_refresh(true),
         RelayCommand::Diff { task } => {
             if let Some(t) = task {
-                state.run_task_selector(&t).await;
+                state.select_task_by_selector(&t);
             }
             let diff = match state.selected_stored_task() {
                 Some(task) => match state.relay.resolve_project(task.project_key.as_str()) {
@@ -1092,7 +1092,7 @@ async fn execute_relay_command(state: &mut AppState, input: &str) -> Result<bool
         }
         RelayCommand::Logs { task } => {
             if let Some(t) = task {
-                state.run_task_selector(&t).await;
+                state.select_task_by_selector(&t);
             }
             state.screen = Screen::Logs;
         }
@@ -1638,7 +1638,7 @@ impl AppState {
         }
     }
 
-    async fn run_task_selector(&mut self, selector: &str) {
+    fn select_task_by_selector(&mut self, selector: &str) -> bool {
         let matches = self
             .durable_tasks
             .iter()
@@ -1648,12 +1648,23 @@ impl AppState {
         match matches.as_slice() {
             [task_id] => {
                 self.selected_task = Some(*task_id);
-                self.submit_selected_task().await;
+                true
             }
-            [] => self.feedback = "No Relay task matches that selector.".to_owned(),
+            [] => {
+                self.feedback = "No Relay task matches that selector.".to_owned();
+                false
+            }
             _ => {
-                self.feedback = "Task selector is ambiguous; provide more of the TaskId.".to_owned()
+                self.feedback =
+                    "Task selector is ambiguous; provide more of the TaskId.".to_owned();
+                false
             }
+        }
+    }
+
+    async fn run_task_selector(&mut self, selector: &str) {
+        if self.select_task_by_selector(selector) {
+            self.submit_selected_task().await;
         }
     }
 
@@ -1949,7 +1960,17 @@ impl AppState {
         let Some(scheduler) = self.scheduler.clone() else {
             return;
         };
-        match scheduler.submit(task.id).await {
+        let max_duration = std::cmp::min(
+            std::time::Duration::from_secs(1800),
+            scheduler.limits().max_duration,
+        );
+        let max_repair_attempts = std::cmp::min(2, scheduler.limits().max_repair_attempts);
+        let policy = relay_core::ExecutionRunPolicy {
+            runtime_profile_id: self.active_profile_id.clone(),
+            max_duration,
+            max_repair_attempts,
+        };
+        match scheduler.submit_with_policy(task.id, policy).await {
             Ok(()) => {
                 self.execution_views
                     .entry(task.id)
@@ -2985,6 +3006,31 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(state.last_reports.contains_key(&task_id));
+    }
+
+    #[tokio::test]
+    async fn diff_and_logs_commands_do_not_queue_ready_task() {
+        let mut state = app_state_with_eligible_project_with_store().await;
+        state.start_paste_task();
+        state.paste_text = task_json();
+        state.submit_paste_task();
+        state.confirm_task_import().await;
+        let task_id = state.selected_task.unwrap();
+
+        let prefix = task_id.to_string();
+        let short_id = &prefix[..8];
+
+        execute_relay_command(&mut state, &format!("/diff {short_id}"))
+            .await
+            .unwrap();
+        assert_eq!(state.screen, Screen::Diff);
+        assert!(state.scheduler_snapshot.tasks.is_empty());
+
+        execute_relay_command(&mut state, &format!("/logs {short_id}"))
+            .await
+            .unwrap();
+        assert_eq!(state.screen, Screen::Logs);
+        assert!(state.scheduler_snapshot.tasks.is_empty());
     }
 
     #[test]

@@ -207,6 +207,12 @@ impl CodexRuntime {
         schema_path: &Path,
         result_path: &Path,
     ) -> CodexCommandSpec {
+        let sandbox_mode = if request.profile_id.ends_with("/review") {
+            "read-only"
+        } else {
+            "workspace-write"
+        };
+
         let mut args = vec![
             "--ask-for-approval".to_owned(),
             "never".to_owned(),
@@ -219,7 +225,7 @@ impl CodexRuntime {
             "--color".to_owned(),
             "never".to_owned(),
             "--sandbox".to_owned(),
-            "workspace-write".to_owned(),
+            sandbox_mode.to_owned(),
             "-c".to_owned(),
             "sandbox_workspace_write.writable_roots=[]".to_owned(),
             "-c".to_owned(),

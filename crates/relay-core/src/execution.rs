@@ -19,6 +19,13 @@ use crate::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionRunPolicy {
+    pub runtime_profile_id: String,
+    pub max_duration: Duration,
+    pub max_repair_attempts: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionLimits {
     pub max_parallel: usize,
     pub per_project_max_parallel: usize,
@@ -232,6 +239,7 @@ struct SchedulerInner {
 struct QueuedExecution {
     task_id: TaskId,
     project_key: ProjectKey,
+    run_policy: ExecutionRunPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +262,10 @@ impl<R: Runtime> ExecutionScheduler<R> {
         }
     }
 
+    pub fn limits(&self) -> &ExecutionLimits {
+        &self.limits
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<CoreExecutionEvent> {
         self.event_tx.subscribe()
     }
@@ -265,7 +277,22 @@ impl<R: Runtime> ExecutionScheduler<R> {
         }
     }
 
-    pub async fn submit(&self, task_id: TaskId) -> Result<(), ExecutionSchedulerError> {
+    pub async fn submit_with_policy(
+        &self,
+        task_id: TaskId,
+        policy: ExecutionRunPolicy,
+    ) -> Result<(), ExecutionSchedulerError> {
+        if policy.max_duration > self.limits.max_duration {
+            return Err(ExecutionSchedulerError::InvalidLimit {
+                name: "max_duration exceeds scheduler ceiling",
+            });
+        }
+        if policy.max_repair_attempts > self.limits.max_repair_attempts {
+            return Err(ExecutionSchedulerError::InvalidLimit {
+                name: "max_repair_attempts exceeds scheduler ceiling",
+            });
+        }
+
         let stored = get_stored_task(&self.store, task_id)
             .await?
             .ok_or(ExecutionSchedulerError::TaskNotFound { task_id })?;
@@ -281,6 +308,7 @@ impl<R: Runtime> ExecutionScheduler<R> {
             let queued = QueuedExecution {
                 task_id,
                 project_key: stored.project_key.clone(),
+                run_policy: policy,
             };
             inner.queue.push_back(queued.clone());
             queued
@@ -299,6 +327,15 @@ impl<R: Runtime> ExecutionScheduler<R> {
         }
         self.notify.notify_waiters();
         Ok(())
+    }
+
+    pub async fn submit(&self, task_id: TaskId) -> Result<(), ExecutionSchedulerError> {
+        let policy = ExecutionRunPolicy {
+            runtime_profile_id: self.runtime.identity().profile_id,
+            max_duration: self.limits.max_duration,
+            max_repair_attempts: self.limits.max_repair_attempts,
+        };
+        self.submit_with_policy(task_id, policy).await
     }
 
     pub async fn cancel(&self, task_id: TaskId) -> Result<(), ExecutionSchedulerError> {
@@ -553,15 +590,15 @@ async fn run_task<R: Runtime>(
     }
 
     let execution_id = ExecutionId::new();
-    let identity = runtime.identity();
     let repository_snapshot_json = repository_snapshot(&preflight);
     let claim = store
         .claim_ready_task_for_execution(&NewExecutionRecord {
             id: execution_id.to_string(),
             task_id: queued.task_id.to_string(),
-            runtime_profile: identity.profile_id.clone(),
+            runtime_profile: queued.run_policy.runtime_profile_id.clone(),
             phase: "running".to_owned(),
             repository_snapshot_json: Some(repository_snapshot_json),
+            runtime_metadata_json: None,
         })
         .await;
 
@@ -596,7 +633,7 @@ async fn run_task<R: Runtime>(
         },
     );
 
-    let deadline = Instant::now() + limits.max_duration;
+    let deadline = Instant::now() + queued.run_policy.max_duration;
     let mut task_state = TaskState::Running;
     let mut repair_attempts = 0_u32;
     let mut action = RuntimeAction::Implement;
@@ -654,7 +691,7 @@ async fn run_task<R: Runtime>(
             },
             trusted_working_dir: preflight.project.local_path().to_path_buf(),
             action: action.clone(),
-            profile_id: identity.profile_id.clone(),
+            profile_id: queued.run_policy.runtime_profile_id.clone(),
         };
 
         let outcome = match tokio::time::timeout(
@@ -762,7 +799,7 @@ async fn run_task<R: Runtime>(
                     );
                 }
 
-                if repair_attempts >= limits.max_repair_attempts {
+                if repair_attempts >= queued.run_policy.max_repair_attempts {
                     return finish(
                         &store,
                         &event_tx,

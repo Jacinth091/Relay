@@ -508,19 +508,19 @@ impl AntigravityRuntime {
             }
         };
 
-        match discover_command(&executable, &["--headless", "exec", "--help"]).await {
+        match discover_command(&executable, &["--help"]).await {
             Ok(output) if output.status.success() => {
                 AntigravityRuntimeHealth::Available { version }
             }
             Ok(output) => AntigravityRuntimeHealth::Incompatible {
                 version,
-                reason: safe_process_error(&output.stderr, "AGY exec compatibility probe failed"),
+                reason: safe_process_error(&output.stderr, "AGY compatibility probe failed"),
             },
             Err(DiscoveryError::Spawn(error)) => {
                 AntigravityRuntimeHealth::DiscoveryFailed { error }
             }
             Err(DiscoveryError::Timeout) => AntigravityRuntimeHealth::DiscoveryFailed {
-                error: "AGY exec compatibility probe timed out".to_owned(),
+                error: "AGY compatibility probe timed out".to_owned(),
             },
         }
     }
@@ -940,14 +940,19 @@ impl Runtime for AntigravityRuntime {
                 .map_err(RuntimeError::StartFailed)?;
 
             let mut args = vec![
-                "--headless".to_owned(),
-                "exec".to_owned(),
-                "--json".to_owned(),
-                "--cd".to_owned(),
+                "-p".to_owned(),
+                "--cwd".to_owned(),
                 request.trusted_working_dir.display().to_string(),
-                "--output-last-message".to_owned(),
-                temp.result_path.display().to_string(),
+                "--output-format".to_owned(),
+                "stream-json".to_owned(),
+                "--sandbox".to_owned(),
             ];
+
+            if request.profile_id.ends_with("/review") {
+                args.push("--mode=plan".to_owned());
+            } else {
+                args.push("--mode=accept-edits".to_owned());
+            }
 
             if let Some(model) = &runtime.config.model_override {
                 args.extend(["--model".to_owned(), model.clone()]);

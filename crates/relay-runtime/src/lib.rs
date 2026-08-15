@@ -64,6 +64,16 @@ pub struct RuntimeCapabilities {
     pub deterministic_outcome: bool,
 }
 
+impl Default for RuntimeCapabilities {
+    fn default() -> Self {
+        Self {
+            streaming_output: true,
+            cancellation: true,
+            deterministic_outcome: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeAction {
     Implement,

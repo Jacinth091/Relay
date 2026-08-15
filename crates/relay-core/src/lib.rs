@@ -18,8 +18,8 @@ pub use durable_state::{
 };
 pub use execution::{
     BoundedOutputSnapshot, CoreExecutionEvent, ExecutionLimits, ExecutionReport,
-    ExecutionScheduler, ExecutionSchedulerError, PreflightFailure, RetainedOutputChunk,
-    SchedulerSnapshot, SchedulerTaskSnapshot, SchedulerTaskStatus,
+    ExecutionRunPolicy, ExecutionScheduler, ExecutionSchedulerError, PreflightFailure,
+    RetainedOutputChunk, SchedulerSnapshot, SchedulerTaskSnapshot, SchedulerTaskStatus,
 };
 pub use project_registry::{
     ExpectedRemote, GitHubRepositoryMetadata, ProjectKey, ProjectRegistry, ProjectRegistryError,

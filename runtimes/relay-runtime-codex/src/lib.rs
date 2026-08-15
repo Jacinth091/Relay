@@ -5,8 +5,6 @@
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt as _;
 use std::{
     env,
     path::{Path, PathBuf},

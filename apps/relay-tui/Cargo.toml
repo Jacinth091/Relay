@@ -11,7 +11,8 @@ name = "relay"
 path = "src/main.rs"
 
 [dependencies]
-crossterm = "0.28.1"
+crossterm = { version = "0.28.1", features = ["event-stream"] }
+futures = "0.3"
 ratatui = "0.29.0"
 relay-core = { path = "../../crates/relay-core" }
 relay-runtime = { path = "../../crates/relay-runtime" }

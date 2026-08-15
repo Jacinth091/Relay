@@ -6,37 +6,19 @@ pub enum RelayCommand {
     New,
     Tasks,
     Projects,
-    ProjectAdd {
-        path: Option<PathBuf>,
-    },
+    ProjectAdd { path: Option<PathBuf> },
     Runtimes,
-    RuntimeDetail {
-        provider: String,
-    },
-    RuntimeUse {
-        profile: String,
-    },
-    RuntimeTest {
-        provider: String,
-    },
-    RuntimeProfile {
-        profile: String,
-    },
+    RuntimeDetail { provider: String },
+    RuntimeUse { profile: String },
+    RuntimeTest { provider: String },
+    RuntimeProfile { profile: String },
     Settings,
     Doctor,
     Help,
-    Run {
-        task: String,
-    },
-    Cancel {
-        task: String,
-    },
-    Diff {
-        task: Option<String>,
-    },
-    Logs {
-        task: Option<String>,
-    },
+    Run { task: String },
+    Cancel { task: String },
+    Diff { task: Option<String> },
+    Logs { task: Option<String> },
     Quit,
 }
 

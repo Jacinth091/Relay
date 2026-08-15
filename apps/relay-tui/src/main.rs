@@ -12,10 +12,7 @@ use std::{
 
 use command::{RelayCommand, command_suggestions, parse_relay_command};
 use crossterm::{
-    event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers,
-    },
+    event::{DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -33,13 +30,17 @@ use relay_core::{
     SchedulerTaskStatus, SqliteStore, StoredTask, TaskId, TaskImportCandidate, TaskState,
     default_config_path, default_database_path, list_stored_tasks,
 };
+mod events;
+mod theme;
+
 use relay_runtime::{
     CancellationToken, Runtime, RuntimeCapabilities, RuntimeIdentity, RuntimeOutputStream,
-    RuntimeRequest, RuntimeStartFuture,
+    RuntimeRequest, RuntimeStartFuture, sanitize_terminal_output,
 };
 use relay_runtime_antigravity::{AntigravityRuntime, AntigravityRuntimeHealth};
 use relay_runtime_codex::{CodexRuntime, CodexRuntimeHealth};
 use relay_runtime_fake::FakeRuntime;
+use theme::*;
 use tokio::process::Command as TokioCommand;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -257,55 +258,65 @@ fn restore_terminal(terminal: &mut Tui) -> Result<(), Box<dyn Error>> {
 }
 
 async fn run(terminal: &mut Tui, state: &mut AppState) -> Result<(), Box<dyn Error>> {
-    loop {
-        state.tick().await;
-        terminal.draw(|frame| render(frame, state))?;
-
-        if event::poll(Duration::from_millis(30))? && handle_event(state, event::read()?).await? {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(15)).await;
-    }
+    events::run_event_loop(terminal, state).await
 }
 
 fn render(frame: &mut Frame, state: &AppState) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(2)])
+        .constraints([
+            Constraint::Length(1), // Header
+            Constraint::Min(3),    // Main content area
+            Constraint::Length(2), // Command footer
+        ])
         .split(frame.area());
 
+    let runtime_status_marker =
+        if state.runtime_health.is_ready() || state.antigravity_health.is_ready() {
+            marker_active()
+        } else {
+            marker_waiting()
+        };
+    let header_text = format!(
+        "Relay                                  {} {} {}",
+        state.active_runtime_provider, runtime_status_marker, state.active_profile_id
+    );
+    let header_widget = Paragraph::new(header_text).style(style_header());
+    frame.render_widget(header_widget, areas[0]);
+
     match state.screen {
-        Screen::Dashboard => render_dashboard(frame, state, areas[0]),
-        Screen::Tasks => render_tasks(frame, state, areas[0]),
-        Screen::Projects => render_projects(frame, state, areas[0]),
-        Screen::AddProject => render_add_project(frame, state, areas[0]),
-        Screen::NewTask => render_new_task(frame, state, areas[0]),
-        Screen::ImportFile => render_import_file(frame, state, areas[0]),
-        Screen::PasteTask => render_paste_task(frame, state, areas[0]),
-        Screen::TaskPreview => render_task_preview(frame, state, areas[0]),
-        Screen::TaskReview => render_task_review(frame, state, areas[0]),
-        Screen::Execution => render_execution(frame, state, areas[0]),
-        Screen::Result => render_result(frame, state, areas[0]),
-        Screen::Runtimes => render_runtimes(frame, state, areas[0]),
-        Screen::RuntimeDetail => render_runtime_detail(frame, state, areas[0]),
-        Screen::Diff => render_diff(frame, state, areas[0]),
-        Screen::Logs => render_logs(frame, state, areas[0]),
-        Screen::Settings => render_settings(frame, state, areas[0]),
-        Screen::Doctor => render_doctor(frame, state, areas[0]),
+        Screen::Dashboard => render_dashboard(frame, state, areas[1]),
+        Screen::Tasks => render_tasks(frame, state, areas[1]),
+        Screen::Projects => render_projects(frame, state, areas[1]),
+        Screen::AddProject => render_add_project(frame, state, areas[1]),
+        Screen::NewTask => render_new_task(frame, state, areas[1]),
+        Screen::ImportFile => render_import_file(frame, state, areas[1]),
+        Screen::PasteTask => render_paste_task(frame, state, areas[1]),
+        Screen::TaskPreview => render_task_preview(frame, state, areas[1]),
+        Screen::TaskReview => render_task_review(frame, state, areas[1]),
+        Screen::Execution => render_execution(frame, state, areas[1]),
+        Screen::Result => render_result(frame, state, areas[1]),
+        Screen::Runtimes => render_runtimes(frame, state, areas[1]),
+        Screen::RuntimeDetail => render_runtime_detail(frame, state, areas[1]),
+        Screen::Diff => render_diff(frame, state, areas[1]),
+        Screen::Logs => render_logs(frame, state, areas[1]),
+        Screen::Settings => render_settings(frame, state, areas[1]),
+        Screen::Doctor => render_doctor(frame, state, areas[1]),
     }
 
     let prompt = if state.command_mode {
         format!("> {}", state.command_input)
     } else {
-        "Type /help for commands".to_owned()
+        "> /_  (/help for commands)".to_owned()
     };
     let suggestions = if state.command_mode {
         command_suggestions(&state.command_input).join("  ")
     } else {
         String::new()
     };
-    let help = Paragraph::new(format!("{prompt}\n{} {}", help_text(state), suggestions));
-    frame.render_widget(help, areas[1]);
+    let footer_text = format!("────────────────────────────────────────\n{prompt} {suggestions}");
+    let footer_widget = Paragraph::new(footer_text).style(style_muted());
+    frame.render_widget(footer_widget, areas[2]);
 }
 
 fn render_dashboard(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -426,7 +437,7 @@ fn render_logs(frame: &mut Frame, state: &AppState, area: Rect) {
                 if output.is_empty() {
                     format!("{header}No output captured.")
                 } else {
-                    format!("{header}{output}")
+                    format!("{header}{}", sanitize_terminal_output(&output))
                 }
             })
             .unwrap_or_else(|| "No execution logs available.".to_owned())
@@ -579,14 +590,21 @@ fn render_add_project(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn render_new_task(frame: &mut Frame, state: &AppState, area: Rect) {
+    let option_paste = if state.new_task_option == 0 {
+        "> Paste task"
+    } else {
+        "  Paste task"
+    };
+    let option_file = if state.new_task_option == 1 {
+        "> Import task file"
+    } else {
+        "  Import task file"
+    };
     let body = format!(
-        "Import a user-approved Relay handoff.\n\nF: Import File\nV: Paste Task\n\n{}",
-        state.feedback
+        "New Task\n\nImport a user-approved Relay handoff.\n\n{}\n{}\n\nUse Up/Down to navigate, Enter to select, Esc to cancel.\n\n{}",
+        option_paste, option_file, state.feedback
     );
-    let new_task = Paragraph::new(body)
-        .wrap(Wrap { trim: true })
-        .block(Block::default().title(" New Task ").borders(Borders::ALL));
-    frame.render_widget(new_task, area);
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), area);
 }
 
 fn render_import_file(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -721,17 +739,6 @@ fn render_result(frame: &mut Frame, state: &AppState, area: Rect) {
     );
 }
 
-async fn handle_event(state: &mut AppState, event: Event) -> Result<bool, Box<dyn Error>> {
-    match event {
-        Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(state, key).await,
-        Event::Paste(text) if state.screen == Screen::PasteTask => {
-            state.paste_text.push_str(&text);
-            Ok(false)
-        }
-        _ => Ok(false),
-    }
-}
-
 async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn Error>> {
     if state.command_mode {
         match key.code {
@@ -835,8 +842,22 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
             Ok(false)
         }
         Screen::NewTask => match key.code {
-            KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => {
-                state.screen = Screen::Dashboard;
+            KeyCode::Up => {
+                state.new_task_option = state.new_task_option.saturating_sub(1);
+                Ok(false)
+            }
+            KeyCode::Down => {
+                if state.new_task_option < 1 {
+                    state.new_task_option += 1;
+                }
+                Ok(false)
+            }
+            KeyCode::Enter => {
+                if state.new_task_option == 0 {
+                    state.start_paste_task();
+                } else {
+                    state.start_import_file();
+                }
                 Ok(false)
             }
             KeyCode::Char('f') | KeyCode::Char('F') => {
@@ -845,6 +866,10 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
             }
             KeyCode::Char('v') | KeyCode::Char('V') => {
                 state.start_paste_task();
+                Ok(false)
+            }
+            KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => {
+                state.screen = Screen::Dashboard;
                 Ok(false)
             }
             KeyCode::Char('q') | KeyCode::Char('Q') => Ok(true),
@@ -977,16 +1002,15 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
             }
             _ => Ok(false),
         },
-        Screen::Runtimes
-        | Screen::RuntimeDetail
-        | Screen::Settings
-        | Screen::Doctor => match key.code {
-            KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => {
-                state.screen = Screen::Dashboard;
-                Ok(false)
+        Screen::Runtimes | Screen::RuntimeDetail | Screen::Settings | Screen::Doctor => {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => {
+                    state.screen = Screen::Dashboard;
+                    Ok(false)
+                }
+                _ => Ok(false),
             }
-            _ => Ok(false),
-        },
+        }
     }
 }
 
@@ -1376,34 +1400,6 @@ fn safety_failure_text(reason: &RepositorySafetyFailure) -> String {
     }
 }
 
-fn help_text(state: &AppState) -> &'static str {
-    match state.screen {
-        Screen::Dashboard if state.registry_writable => {
-            "N: new task  T: tasks  P: projects  A: add project  Q / Esc: quit"
-        }
-        Screen::Dashboard => "N: new task  T: tasks  P: projects  Q / Esc: quit",
-        Screen::Tasks => "Up / Down: select  Enter: open  D / Esc: dashboard  Q: quit",
-        Screen::Projects if state.registry_writable => {
-            "R: refresh  A: add project  D / Esc: dashboard  Q: quit"
-        }
-        Screen::Projects => "R: refresh  D / Esc: dashboard  Q: quit",
-        Screen::AddProject => "Tab: next field  Enter: register  Esc: projects",
-        Screen::NewTask => "F: import file  V: paste task  D / Esc: dashboard  Q: quit",
-        Screen::ImportFile => "Enter: validate  Esc: new task",
-        Screen::PasteTask => "Paste text, Enter: validate  Ctrl+Enter: newline  Esc: new task",
-        Screen::TaskPreview => "I / Enter: import  C / Esc: cancel  Q: quit",
-        Screen::TaskReview => "R: run when eligible  B / Esc: tasks  Q: quit",
-        Screen::Execution => "C: cancel  B: background / tasks",
-        Screen::Result => "T: tasks  D: dashboard  N: new task",
-        Screen::Runtimes
-        | Screen::RuntimeDetail
-        | Screen::Diff
-        | Screen::Logs
-        | Screen::Settings
-        | Screen::Doctor => "Esc / D: dashboard",
-    }
-}
-
 fn task_preview_text(candidate: &TaskImportCandidate) -> String {
     format!(
         "Task ID: created after Import\n{}\n\nSubmission transport: {:?}\nValidation: VALID\n\nActions: Import / Cancel",
@@ -1558,6 +1554,7 @@ struct AppState {
     import_file_path: String,
     paste_text: String,
     task_candidate: Option<TaskImportCandidate>,
+    new_task_option: usize,
     repository_inspections: BTreeMap<ProjectKey, RepositoryInspection>,
     feedback: String,
 }
@@ -1778,9 +1775,22 @@ impl AppState {
             import_file_path: String::new(),
             paste_text: String::new(),
             task_candidate: None,
+            new_task_option: 0,
             repository_inspections: BTreeMap::new(),
             feedback,
         }
+    }
+
+    fn handle_paste(&mut self, text: &str) {
+        if self.command_mode {
+            self.command_input.push_str(text);
+        } else if self.screen == Screen::PasteTask {
+            self.paste_text.push_str(text);
+        }
+    }
+
+    fn has_active_execution(&self) -> bool {
+        self.scheduler_driver.is_some() || matches!(self.screen, Screen::Execution)
     }
 
     fn enter_projects(&mut self) {
@@ -2677,7 +2687,7 @@ mod tests {
         assert!(listing.contains("* Do not execute."));
         assert!(listing.contains("* Review in memory."));
         assert!(!listing.to_ascii_lowercase().contains("run"));
-        assert!(!help_text(&reopened).to_ascii_lowercase().contains("run"));
+        assert!(!listing.to_ascii_lowercase().contains("run"));
     }
 
     #[tokio::test]
@@ -2685,9 +2695,7 @@ mod tests {
         let mut state = app_state_with_project();
 
         state.start_paste_task();
-        handle_event(&mut state, Event::Paste(task_json()))
-            .await
-            .unwrap();
+        state.handle_paste(&task_json());
 
         assert_eq!(state.screen, Screen::PasteTask);
         assert!(state.task_candidate.is_none());
@@ -2704,9 +2712,7 @@ mod tests {
         let mut state = app_state_with_project();
 
         state.start_paste_task();
-        handle_event(&mut state, Event::Paste(task_markdown()))
-            .await
-            .unwrap();
+        state.handle_paste(&task_markdown());
 
         assert_eq!(state.screen, Screen::PasteTask);
         assert!(state.task_candidate.is_none());
@@ -2760,7 +2766,7 @@ mod tests {
         state.submit_paste_task();
         state.confirm_task_import().await;
 
-        assert!(help_text(&state).contains("run"));
+        assert!(state.selected_stored_task().is_some());
         assert!(
             state
                 .relay

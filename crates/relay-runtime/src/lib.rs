@@ -219,8 +219,10 @@ mod activity;
 mod integration;
 mod profile;
 mod router;
+pub mod sanitizer;
 
 pub use activity::*;
 pub use integration::*;
 pub use profile::*;
 pub use router::*;
+pub use sanitizer::*;

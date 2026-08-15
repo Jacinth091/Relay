@@ -4,13 +4,18 @@
 //! supplied only on stdin and is never interpreted as shell syntax.
 
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::CommandExt as _;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
 use std::{
     env,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 use relay_runtime::{
     CancellationToken, CapabilityStatus, EffectiveRuntimeProfile, FilesystemCapability,
@@ -367,19 +372,29 @@ fn resolve_candidate(candidate: &Path) -> Option<PathBuf> {
 
 fn launcher_command(executable: &Path, args: &[String]) -> Command {
     #[cfg(windows)]
-    if executable
+    let mut command = if executable
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"))
     {
-        let mut command = Command::new("cmd.exe");
-        command.args(["/D", "/C", "call"]);
-        command.arg(executable);
-        command.args(args);
-        return command;
-    }
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/D", "/C", "call"]);
+        cmd.arg(executable);
+        cmd.args(args);
+        cmd
+    } else {
+        let mut cmd = Command::new(executable);
+        cmd.args(args);
+        cmd
+    };
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    #[cfg(not(windows))]
     let mut command = Command::new(executable);
+    #[cfg(not(windows))]
     command.args(args);
+
     command
 }
 

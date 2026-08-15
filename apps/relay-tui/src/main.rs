@@ -591,8 +591,14 @@ fn render_settings(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn render_doctor(frame: &mut Frame, state: &AppState, area: Rect) {
+    let status_header = if state.health_refresh.is_some() {
+        "Relay Doctor — [Checking system diagnostics...]"
+    } else {
+        "Relay Doctor — [Diagnostics ready]"
+    };
+
     let body = format!(
-        "Relay Doctor\n\nCurrent execution requirements\n\n{}\n{} Relay config\n{} SQLite\n{}\n  {}\n{}\n  {}\n\nFuture integrations\n{}\nGitHub Issue ingress: not implemented until M10\nRelay Direct / MCP: not implemented until M12\n\nNo secrets or environment data are displayed.",
+        "{status_header}\n\nCurrent execution requirements\n\n{}\n{} Relay config\n{} SQLite\n{}\n  {}\n{}\n  {}\n\nFuture integrations\n{}\nGitHub Issue ingress: not implemented until M10\nRelay Direct / MCP: not implemented until M12\n\nActions:\n  [R] Re-check diagnostics   [Esc] Dashboard",
         git_health_marker(&state.git_health),
         if state.registry_writable { "✓" } else { "×" },
         if state.store.is_some() { "✓" } else { "×" },
@@ -1142,6 +1148,10 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
         },
         Screen::Runtimes | Screen::RuntimeDetail | Screen::Settings | Screen::Doctor => {
             match key.code {
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    state.begin_health_refresh(true);
+                    Ok(false)
+                }
                 KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => {
                     state.screen = Screen::Dashboard;
                     Ok(false)

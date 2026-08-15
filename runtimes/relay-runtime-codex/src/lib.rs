@@ -237,9 +237,48 @@ impl CodexRuntime {
             "--output-last-message".to_owned(),
             result_path.display().to_string(),
         ];
-        if let Some(model) = &self.config.model_override {
-            args.extend(["--model".to_owned(), model.clone()]);
+        let selected_model = request
+            .runtime_selection
+            .model
+            .as_option()
+            .or(self.config.model_override.as_deref());
+
+        if let Some(model) = selected_model {
+            args.extend(["--model".to_owned(), model.to_owned()]);
         }
+
+        let selected_reasoning = request
+            .runtime_selection
+            .reasoning_effort
+            .as_option()
+            .or_else(|| {
+                if request.profile_id.ends_with("/deep") {
+                    Some(relay_runtime::ReasoningEffort::XHigh)
+                } else if request.profile_id.ends_with("/review") {
+                    Some(relay_runtime::ReasoningEffort::Medium)
+                } else if request.profile_id.ends_with("/implement") {
+                    Some(relay_runtime::ReasoningEffort::High)
+                } else {
+                    None
+                }
+            });
+
+        if let Some(effort) = selected_reasoning {
+            let effort_str = match effort {
+                relay_runtime::ReasoningEffort::Default => None,
+                relay_runtime::ReasoningEffort::Low => Some("low"),
+                relay_runtime::ReasoningEffort::Medium => Some("medium"),
+                relay_runtime::ReasoningEffort::High => Some("high"),
+                relay_runtime::ReasoningEffort::XHigh => Some("xhigh"),
+            };
+            if let Some(str_val) = effort_str {
+                args.extend([
+                    "-c".to_owned(),
+                    format!("model_reasoning_effort=\"{str_val}\""),
+                ]);
+            }
+        }
+
         args.push("-".to_owned());
         CodexCommandSpec {
             executable,
@@ -1190,6 +1229,7 @@ mod tests {
             trusted_working_dir: PathBuf::from("C:/trusted/repo"),
             action: RuntimeAction::Implement,
             profile_id: "codex/default".to_owned(),
+            runtime_selection: relay_runtime::RuntimeExecutionSelection::default(),
         }
     }
     #[test]
@@ -1358,5 +1398,22 @@ mod tests {
         terminate_process_tree(&mut child).await;
         assert!(child.try_wait().unwrap().is_some());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn command_spec_translates_model_and_reasoning_selection() {
+        let runtime = CodexRuntime::default();
+        let mut req = request("test goal");
+        req.runtime_selection = relay_runtime::RuntimeExecutionSelection {
+            profile_id: "codex/implement".to_owned(),
+            model: relay_runtime::RuntimeModelSelection::Explicit("gpt-5.3-codex".to_owned()),
+            reasoning_effort: relay_runtime::RuntimeReasoningSelection::Explicit(
+                relay_runtime::ReasoningEffort::High,
+            ),
+        };
+        let spec = runtime.command_spec(&req, Path::new("schema"), Path::new("result"));
+        assert!(spec.args.contains(&"--model".to_owned()));
+        assert!(spec.args.contains(&"gpt-5.3-codex".to_owned()));
+        assert!(spec.args.contains(&"model_reasoning_effort=\"high\"".to_owned()));
     }
 }

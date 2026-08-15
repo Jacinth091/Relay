@@ -1,6 +1,7 @@
 mod command;
 mod command_completion;
 mod project_discovery;
+mod runtime_settings;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -1679,6 +1680,9 @@ struct AppState {
     antigravity_health: AntigravityRuntimeHealth,
     active_runtime_provider: String,
     active_profile_id: String,
+    active_model: relay_core::RuntimeModelSelection,
+    active_reasoning_effort: relay_core::RuntimeReasoningSelection,
+    runtime_settings: runtime_settings::RuntimeSettings,
     runtime_detail_provider: Option<String>,
     diff_output: Option<String>,
     diff_scroll: u16,
@@ -2030,6 +2034,12 @@ impl AppState {
             antigravity_health: AntigravityRuntimeHealth::Checking,
             active_runtime_provider: "codex".to_owned(),
             active_profile_id: "codex/implement".to_owned(),
+            active_model: relay_core::RuntimeModelSelection::ProviderDefault,
+            active_reasoning_effort: relay_core::RuntimeReasoningSelection::ProfileDefault,
+            runtime_settings: runtime_settings::RuntimeSettings::load_from_path(
+                &runtime_settings::RuntimeSettings::default_path(),
+            )
+            .unwrap_or_default(),
             runtime_detail_provider: None,
             diff_output: None,
             diff_scroll: 0,
@@ -2254,8 +2264,14 @@ impl AppState {
             scheduler.limits().max_duration,
         );
         let max_repair_attempts = std::cmp::min(2, scheduler.limits().max_repair_attempts);
+        let selection = self.runtime_settings.resolve_selection(
+            Some(task.project_key.as_str()),
+            Some(&self.active_profile_id),
+            self.active_model.as_option(),
+            self.active_reasoning_effort.as_option(),
+        );
         let policy = relay_core::ExecutionRunPolicy {
-            runtime_profile_id: self.active_profile_id.clone(),
+            runtime_selection: selection,
             max_duration,
             max_repair_attempts,
         };

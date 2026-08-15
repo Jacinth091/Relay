@@ -954,11 +954,31 @@ impl Runtime for AntigravityRuntime {
                 args.push("--mode=accept-edits".to_owned());
             }
 
-            if let Some(model) = &runtime.config.model_override {
-                args.extend(["--model".to_owned(), model.clone()]);
+            let selected_model = request
+                .runtime_selection
+                .model
+                .as_option()
+                .or(runtime.config.model_override.as_deref());
+
+            if let Some(model) = selected_model {
+                args.extend(["--model".to_owned(), model.to_owned()]);
             }
-            if let Some(effort) = &runtime.config.effort {
-                args.extend(["--effort".to_owned(), effort.clone()]);
+
+            let selected_effort = request
+                .runtime_selection
+                .reasoning_effort
+                .as_option()
+                .map(|e| match e {
+                    ReasoningEffort::Default => "medium",
+                    ReasoningEffort::Low => "low",
+                    ReasoningEffort::Medium => "medium",
+                    ReasoningEffort::High => "high",
+                    ReasoningEffort::XHigh => "xhigh",
+                })
+                .or(runtime.config.effort.as_deref());
+
+            if let Some(effort) = selected_effort {
+                args.extend(["--effort".to_owned(), effort.to_owned()]);
             }
 
             args.push("-".to_owned());

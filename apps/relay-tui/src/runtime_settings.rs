@@ -81,6 +81,10 @@ impl Default for RuntimeSettings {
     }
 }
 
+use relay_core::{
+    ReasoningEffort, RuntimeExecutionSelection, RuntimeModelSelection, RuntimeReasoningSelection,
+};
+
 impl RuntimeSettings {
     pub fn default_path() -> PathBuf {
         if let Ok(override_path) = std::env::var("RELAY_RUNTIME_CONFIG_PATH") {
@@ -90,6 +94,51 @@ impl RuntimeSettings {
             return config_dir.join("relay").join("runtimes.toml");
         }
         PathBuf::from("runtimes.toml")
+    }
+
+    pub fn resolve_selection(
+        &self,
+        project_key: Option<&str>,
+        override_profile: Option<&str>,
+        override_model: Option<&str>,
+        override_effort: Option<ReasoningEffort>,
+    ) -> RuntimeExecutionSelection {
+        let profile_id = override_profile
+            .or_else(|| project_key.and_then(|k| self.projects.get(k)).map(|s| s.as_str()))
+            .unwrap_or(self.runtime.default_profile.as_str())
+            .to_owned();
+
+        let profile_override = self.profile_overrides.get(&profile_id);
+
+        let raw_model = override_model
+            .map(|s| s.to_owned())
+            .or_else(|| profile_override.and_then(|p| p.model.clone()));
+
+        let model = match raw_model.as_deref() {
+            Some("default") | None => RuntimeModelSelection::ProviderDefault,
+            Some(explicit) => RuntimeModelSelection::Explicit(explicit.to_owned()),
+        };
+
+        let reasoning_effort = if let Some(effort) = override_effort {
+            RuntimeReasoningSelection::Explicit(effort)
+        } else if let Some(raw_effort) = profile_override.and_then(|p| p.reasoning_effort.as_deref())
+        {
+            match raw_effort {
+                "low" => RuntimeReasoningSelection::Explicit(ReasoningEffort::Low),
+                "medium" => RuntimeReasoningSelection::Explicit(ReasoningEffort::Medium),
+                "high" => RuntimeReasoningSelection::Explicit(ReasoningEffort::High),
+                "xhigh" => RuntimeReasoningSelection::Explicit(ReasoningEffort::XHigh),
+                _ => RuntimeReasoningSelection::ProfileDefault,
+            }
+        } else {
+            RuntimeReasoningSelection::ProfileDefault
+        };
+
+        RuntimeExecutionSelection {
+            profile_id,
+            model,
+            reasoning_effort,
+        }
     }
 
     pub fn load_from_path(path: &Path) -> Result<Self, String> {
@@ -102,6 +151,7 @@ impl RuntimeSettings {
             .map_err(|e| format!("Failed to parse runtime config '{path:?}': {e}"))
     }
 
+    #[allow(dead_code)]
     pub fn save_to_path(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -113,6 +163,7 @@ impl RuntimeSettings {
             .map_err(|e| format!("Failed to write runtime config '{path:?}': {e}"))
     }
 
+    #[allow(dead_code)]
     pub fn resolve_profile_for_project(
         &self,
         project_key: &str,

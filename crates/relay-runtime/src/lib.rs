@@ -91,6 +91,7 @@ pub struct RuntimeRequest {
     pub trusted_working_dir: PathBuf,
     pub action: RuntimeAction,
     pub profile_id: String,
+    pub runtime_selection: RuntimeExecutionSelection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -11,6 +11,9 @@ mod task_ingress;
 use std::path::Path;
 
 pub use relay_protocol::{AmbiguityPolicy, HandoffTask};
+pub use relay_runtime::{
+    ReasoningEffort, RuntimeExecutionSelection, RuntimeModelSelection, RuntimeReasoningSelection,
+};
 
 pub use durable_state::{
     SqliteStore, StoredTask, TaskPersistenceError, TaskState, default_database_path,

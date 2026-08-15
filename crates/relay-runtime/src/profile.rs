@@ -64,3 +64,54 @@ pub enum ProfileSelection {
     /// Global default
     GlobalDefault(String),
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeModelSelection {
+    #[default]
+    ProviderDefault,
+    Explicit(String),
+}
+
+impl RuntimeModelSelection {
+    pub fn as_option(&self) -> Option<&str> {
+        match self {
+            Self::ProviderDefault => None,
+            Self::Explicit(model) => Some(model.as_str()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeReasoningSelection {
+    #[default]
+    ProfileDefault,
+    Explicit(ReasoningEffort),
+}
+
+impl RuntimeReasoningSelection {
+    pub fn as_option(&self) -> Option<ReasoningEffort> {
+        match self {
+            Self::ProfileDefault => None,
+            Self::Explicit(effort) => Some(*effort),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeExecutionSelection {
+    pub profile_id: String,
+    pub model: RuntimeModelSelection,
+    pub reasoning_effort: RuntimeReasoningSelection,
+}
+
+impl Default for RuntimeExecutionSelection {
+    fn default() -> Self {
+        Self {
+            profile_id: "codex/implement".to_owned(),
+            model: RuntimeModelSelection::ProviderDefault,
+            reasoning_effort: RuntimeReasoningSelection::ProfileDefault,
+        }
+    }
+}

@@ -18,11 +18,21 @@ use crate::{
     TaskPersistenceError, TaskState, TrustedProject, get_stored_task,
 };
 
+use relay_runtime::{
+    RuntimeExecutionSelection, RuntimeModelSelection, RuntimeReasoningSelection,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionRunPolicy {
-    pub runtime_profile_id: String,
+    pub runtime_selection: RuntimeExecutionSelection,
     pub max_duration: Duration,
     pub max_repair_attempts: u32,
+}
+
+impl ExecutionRunPolicy {
+    pub fn profile_id(&self) -> &str {
+        &self.runtime_selection.profile_id
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,7 +341,11 @@ impl<R: Runtime> ExecutionScheduler<R> {
 
     pub async fn submit(&self, task_id: TaskId) -> Result<(), ExecutionSchedulerError> {
         let policy = ExecutionRunPolicy {
-            runtime_profile_id: self.runtime.identity().profile_id,
+            runtime_selection: RuntimeExecutionSelection {
+                profile_id: self.runtime.identity().profile_id,
+                model: RuntimeModelSelection::ProviderDefault,
+                reasoning_effort: RuntimeReasoningSelection::ProfileDefault,
+            },
             max_duration: self.limits.max_duration,
             max_repair_attempts: self.limits.max_repair_attempts,
         };
@@ -591,14 +605,20 @@ async fn run_task<R: Runtime>(
 
     let execution_id = ExecutionId::new();
     let repository_snapshot_json = repository_snapshot(&preflight);
+    let runtime_meta = serde_json::json!({
+        "provider": queued.run_policy.profile_id().split('/').next().unwrap_or("codex"),
+        "profile": queued.run_policy.profile_id(),
+        "model": queued.run_policy.runtime_selection.model.as_option().unwrap_or("default"),
+        "reasoning_effort": queued.run_policy.runtime_selection.reasoning_effort.as_option().map(|e| format!("{e:?}")).unwrap_or_else(|| "default".to_owned()),
+    });
     let claim = store
         .claim_ready_task_for_execution(&NewExecutionRecord {
             id: execution_id.to_string(),
             task_id: queued.task_id.to_string(),
-            runtime_profile: queued.run_policy.runtime_profile_id.clone(),
+            runtime_profile: queued.run_policy.profile_id().to_owned(),
             phase: "running".to_owned(),
             repository_snapshot_json: Some(repository_snapshot_json),
-            runtime_metadata_json: None,
+            runtime_metadata_json: Some(runtime_meta.to_string()),
         })
         .await;
 
@@ -691,7 +711,8 @@ async fn run_task<R: Runtime>(
             },
             trusted_working_dir: preflight.project.local_path().to_path_buf(),
             action: action.clone(),
-            profile_id: queued.run_policy.runtime_profile_id.clone(),
+            profile_id: queued.run_policy.profile_id().to_owned(),
+            runtime_selection: queued.run_policy.runtime_selection.clone(),
         };
 
         let outcome = match tokio::time::timeout(

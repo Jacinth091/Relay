@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 crossterm = { version = "0.28.1", features = ["event-stream"] }
+dirs = "6.0.0"
 futures = "0.3"
 ratatui = "0.29.0"
 relay-core = { path = "../../crates/relay-core" }
@@ -19,4 +20,6 @@ relay-runtime = { path = "../../crates/relay-runtime" }
 relay-runtime-antigravity = { path = "../../runtimes/relay-runtime-antigravity" }
 relay-runtime-codex = { path = "../../runtimes/relay-runtime-codex" }
 relay-runtime-fake = { path = "../../runtimes/relay-runtime-fake" }
+serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1.43.0", features = ["macros", "process", "rt", "sync", "time"] }
+toml = "0.8"

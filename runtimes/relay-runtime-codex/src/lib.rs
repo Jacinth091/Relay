@@ -1414,6 +1414,9 @@ mod tests {
         let spec = runtime.command_spec(&req, Path::new("schema"), Path::new("result"));
         assert!(spec.args.contains(&"--model".to_owned()));
         assert!(spec.args.contains(&"gpt-5.3-codex".to_owned()));
-        assert!(spec.args.contains(&"model_reasoning_effort=\"high\"".to_owned()));
+        assert!(
+            spec.args
+                .contains(&"model_reasoning_effort=\"high\"".to_owned())
+        );
     }
 }

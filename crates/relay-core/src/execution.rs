@@ -18,9 +18,7 @@ use crate::{
     TaskPersistenceError, TaskState, TrustedProject, get_stored_task,
 };
 
-use relay_runtime::{
-    RuntimeExecutionSelection, RuntimeModelSelection, RuntimeReasoningSelection,
-};
+use relay_runtime::{RuntimeExecutionSelection, RuntimeModelSelection, RuntimeReasoningSelection};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionRunPolicy {

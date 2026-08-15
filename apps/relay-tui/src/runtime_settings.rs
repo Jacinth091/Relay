@@ -104,7 +104,11 @@ impl RuntimeSettings {
         override_effort: Option<ReasoningEffort>,
     ) -> RuntimeExecutionSelection {
         let profile_id = override_profile
-            .or_else(|| project_key.and_then(|k| self.projects.get(k)).map(|s| s.as_str()))
+            .or_else(|| {
+                project_key
+                    .and_then(|k| self.projects.get(k))
+                    .map(|s| s.as_str())
+            })
             .unwrap_or(self.runtime.default_profile.as_str())
             .to_owned();
 
@@ -121,7 +125,8 @@ impl RuntimeSettings {
 
         let reasoning_effort = if let Some(effort) = override_effort {
             RuntimeReasoningSelection::Explicit(effort)
-        } else if let Some(raw_effort) = profile_override.and_then(|p| p.reasoning_effort.as_deref())
+        } else if let Some(raw_effort) =
+            profile_override.and_then(|p| p.reasoning_effort.as_deref())
         {
             match raw_effort {
                 "low" => RuntimeReasoningSelection::Explicit(ReasoningEffort::Low),
@@ -154,8 +159,9 @@ impl RuntimeSettings {
     #[allow(dead_code)]
     pub fn save_to_path(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create runtime config directory '{parent:?}': {e}"))?;
+            fs::create_dir_all(parent).map_err(|e| {
+                format!("Failed to create runtime config directory '{parent:?}': {e}")
+            })?;
         }
         let content = toml::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize runtime config: {e}"))?;

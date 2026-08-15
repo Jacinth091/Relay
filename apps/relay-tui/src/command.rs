@@ -6,13 +6,37 @@ pub enum RelayCommand {
     New,
     Tasks,
     Projects,
-    ProjectAdd { path: Option<PathBuf> },
-    Runtime,
+    ProjectAdd {
+        path: Option<PathBuf>,
+    },
+    Runtimes,
+    RuntimeDetail {
+        provider: String,
+    },
+    RuntimeUse {
+        profile: String,
+    },
+    RuntimeTest {
+        provider: String,
+    },
+    RuntimeProfile {
+        profile: String,
+    },
     Settings,
     Doctor,
     Help,
-    Run { task: String },
-    Cancel { task: String },
+    Run {
+        task: String,
+    },
+    Cancel {
+        task: String,
+    },
+    Diff {
+        task: Option<String>,
+    },
+    Logs {
+        task: Option<String>,
+    },
     Quit,
 }
 
@@ -22,12 +46,18 @@ pub const COMMANDS: &[&str] = &[
     "/tasks",
     "/projects",
     "/project add [path]",
-    "/runtime",
+    "/runtimes",
+    "/runtime <provider>",
+    "/runtime use <profile>",
+    "/runtime test <provider>",
+    "/runtime profile <profile>",
     "/settings",
     "/doctor",
     "/help",
     "/run <task>",
     "/cancel <task>",
+    "/diff [task]",
+    "/logs [task]",
     "/quit",
 ];
 
@@ -47,7 +77,33 @@ pub fn parse_relay_command(input: &str) -> Result<RelayCommand, String> {
                 path: Some(PathBuf::from(argument[4..].trim())),
             })
         }
-        "/runtime" if argument.is_empty() => Ok(RelayCommand::Runtime),
+        "/runtimes" if argument.is_empty() => Ok(RelayCommand::Runtimes),
+        "/runtime" if argument.is_empty() => Ok(RelayCommand::Runtimes),
+        "/runtime" if argument == "use" => Err("Missing argument for /runtime use".to_owned()),
+        "/runtime" if argument.starts_with("use ") && argument[4..].trim().chars().count() > 0 => {
+            Ok(RelayCommand::RuntimeUse {
+                profile: argument[4..].trim().to_owned(),
+            })
+        }
+        "/runtime" if argument == "test" => Err("Missing argument for /runtime test".to_owned()),
+        "/runtime" if argument.starts_with("test ") && argument[5..].trim().chars().count() > 0 => {
+            Ok(RelayCommand::RuntimeTest {
+                provider: argument[5..].trim().to_owned(),
+            })
+        }
+        "/runtime" if argument == "profile" => {
+            Err("Missing argument for /runtime profile".to_owned())
+        }
+        "/runtime"
+            if argument.starts_with("profile ") && argument[8..].trim().chars().count() > 0 =>
+        {
+            Ok(RelayCommand::RuntimeProfile {
+                profile: argument[8..].trim().to_owned(),
+            })
+        }
+        "/runtime" => Ok(RelayCommand::RuntimeDetail {
+            provider: argument.to_owned(),
+        }),
         "/settings" if argument.is_empty() => Ok(RelayCommand::Settings),
         "/doctor" if argument.is_empty() => Ok(RelayCommand::Doctor),
         "/help" if argument.is_empty() => Ok(RelayCommand::Help),
@@ -56,6 +112,20 @@ pub fn parse_relay_command(input: &str) -> Result<RelayCommand, String> {
         }),
         "/cancel" if !argument.is_empty() => Ok(RelayCommand::Cancel {
             task: argument.to_owned(),
+        }),
+        "/diff" => Ok(RelayCommand::Diff {
+            task: if argument.is_empty() {
+                None
+            } else {
+                Some(argument.to_owned())
+            },
+        }),
+        "/logs" => Ok(RelayCommand::Logs {
+            task: if argument.is_empty() {
+                None
+            } else {
+                Some(argument.to_owned())
+            },
         }),
         "/quit" if argument.is_empty() => Ok(RelayCommand::Quit),
         _ => Err("Unknown Relay command. Type /help.".to_owned()),
@@ -102,5 +172,74 @@ mod tests {
             command_suggestions("/pro"),
             vec!["/projects", "/project add [path]"]
         );
+    }
+    #[test]
+    fn parses_new_runtime_and_diff_commands() {
+        assert_eq!(parse_relay_command("/runtimes"), Ok(RelayCommand::Runtimes));
+        assert_eq!(
+            parse_relay_command("/runtime codex"),
+            Ok(RelayCommand::RuntimeDetail {
+                provider: "codex".to_owned()
+            })
+        );
+        assert_eq!(
+            parse_relay_command("/runtime antigravity"),
+            Ok(RelayCommand::RuntimeDetail {
+                provider: "antigravity".to_owned()
+            })
+        );
+        assert_eq!(
+            parse_relay_command("/runtime use codex/implement"),
+            Ok(RelayCommand::RuntimeUse {
+                profile: "codex/implement".to_owned()
+            })
+        );
+        assert_eq!(
+            parse_relay_command("/runtime test codex"),
+            Ok(RelayCommand::RuntimeTest {
+                provider: "codex".to_owned()
+            })
+        );
+        assert_eq!(
+            parse_relay_command("/runtime profile codex/implement"),
+            Ok(RelayCommand::RuntimeProfile {
+                profile: "codex/implement".to_owned()
+            })
+        );
+        assert_eq!(parse_relay_command("/runtime"), Ok(RelayCommand::Runtimes));
+
+        assert_eq!(
+            parse_relay_command("/diff"),
+            Ok(RelayCommand::Diff { task: None })
+        );
+        assert_eq!(
+            parse_relay_command("/diff abc123"),
+            Ok(RelayCommand::Diff {
+                task: Some("abc123".to_owned())
+            })
+        );
+        assert_eq!(
+            parse_relay_command("/logs"),
+            Ok(RelayCommand::Logs { task: None })
+        );
+        assert_eq!(
+            parse_relay_command("/logs abc123"),
+            Ok(RelayCommand::Logs {
+                task: Some("abc123".to_owned())
+            })
+        );
+
+        assert!(parse_relay_command("/runtime use").is_err());
+        assert!(parse_relay_command("/runtime test").is_err());
+        assert!(parse_relay_command("/runtime profile").is_err());
+    }
+    #[test]
+    fn suggestions_for_runtime() {
+        let suggestions = command_suggestions("/runtime");
+        assert!(suggestions.contains(&"/runtime <provider>"));
+        assert!(suggestions.contains(&"/runtime use <profile>"));
+        assert!(suggestions.contains(&"/runtime test <provider>"));
+        assert!(suggestions.contains(&"/runtime profile <profile>"));
+        assert!(suggestions.contains(&"/runtimes"));
     }
 }

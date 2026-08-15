@@ -13,9 +13,12 @@ use std::{
 };
 
 use relay_runtime::{
-    CancellationToken, Runtime, RuntimeAction, RuntimeCapabilities, RuntimeError, RuntimeEvent,
-    RuntimeIdentity, RuntimeOutcome, RuntimeOutcomeKind, RuntimeOutputStream, RuntimeRequest,
-    RuntimeSession, RuntimeStartFuture,
+    CancellationToken, CapabilityStatus, EffectiveRuntimeProfile, FilesystemCapability,
+    ReasoningEffort, Runtime, RuntimeAction, RuntimeCapabilities, RuntimeCapabilityContext,
+    RuntimeCapabilityReport, RuntimeConfigError, RuntimeDescriptor, RuntimeError, RuntimeEvent,
+    RuntimeIdentity, RuntimeIntegration, RuntimeModelCatalog, RuntimeModelInfo, RuntimeOutcome,
+    RuntimeOutcomeKind, RuntimeOutputStream, RuntimeProbe, RuntimeProfile,
+    RuntimeProfileDescriptor, RuntimeRequest, RuntimeSession, RuntimeStartFuture,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -240,6 +243,200 @@ impl CodexRuntime {
 impl Default for CodexRuntime {
     fn default() -> Self {
         Self::new(CodexRuntimeConfig::default())
+    }
+}
+
+impl RuntimeIntegration for CodexRuntime {
+    fn descriptor(&self) -> RuntimeDescriptor {
+        RuntimeDescriptor {
+            provider_id: "codex".to_owned(),
+            display_name: "Codex CLI".to_owned(),
+            description: "Native Codex CLI execution adapter".to_owned(),
+            is_development_only: false,
+        }
+    }
+
+    fn probe(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RuntimeProbe> + Send + '_>> {
+        Box::pin(async move {
+            let health = self.discover().await;
+            match health {
+                CodexRuntimeHealth::Available { version } => RuntimeProbe {
+                    installed: true,
+                    version: Some(version),
+                    authenticated: true,
+                    compatible: true,
+                    account_identity: None,
+                    notes: vec!["Codex available and authenticated".to_owned()],
+                },
+                CodexRuntimeHealth::NotAuthenticated { version, error } => RuntimeProbe {
+                    installed: true,
+                    version,
+                    authenticated: false,
+                    compatible: true,
+                    account_identity: None,
+                    notes: vec![format!("Not authenticated: {error}")],
+                },
+                CodexRuntimeHealth::Incompatible { version, reason } => RuntimeProbe {
+                    installed: true,
+                    version: Some(version),
+                    authenticated: true,
+                    compatible: false,
+                    account_identity: None,
+                    notes: vec![format!("Incompatible: {reason}")],
+                },
+                CodexRuntimeHealth::NotInstalled { error }
+                | CodexRuntimeHealth::DiscoveryFailed { error } => RuntimeProbe {
+                    installed: false,
+                    version: None,
+                    authenticated: false,
+                    compatible: false,
+                    account_identity: None,
+                    notes: vec![error],
+                },
+                CodexRuntimeHealth::Checking => RuntimeProbe {
+                    installed: false,
+                    version: None,
+                    authenticated: false,
+                    compatible: false,
+                    account_identity: None,
+                    notes: vec!["Health check pending".to_owned()],
+                },
+            }
+        })
+    }
+
+    fn profiles(&self) -> Vec<RuntimeProfileDescriptor> {
+        vec![
+            RuntimeProfileDescriptor {
+                id: "codex/review".to_owned(),
+                display_name: "Codex / Review".to_owned(),
+                purpose: "Inspection and read-only task review".to_owned(),
+            },
+            RuntimeProfileDescriptor {
+                id: "codex/implement".to_owned(),
+                display_name: "Codex / Implement".to_owned(),
+                purpose: "Normal code changes inside workspace".to_owned(),
+            },
+            RuntimeProfileDescriptor {
+                id: "codex/deep".to_owned(),
+                display_name: "Codex / Deep".to_owned(),
+                purpose: "Deep reasoning for complex implementation tasks".to_owned(),
+            },
+        ]
+    }
+
+    fn models(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RuntimeModelCatalog> + Send + '_>> {
+        Box::pin(async move {
+            RuntimeModelCatalog {
+                default_model: "default".to_owned(),
+                available_models: vec![
+                    RuntimeModelInfo {
+                        id: "default".to_owned(),
+                        display_name: "Default (Account/CLI Setting)".to_owned(),
+                    },
+                    RuntimeModelInfo {
+                        id: "o3".to_owned(),
+                        display_name: "o3".to_owned(),
+                    },
+                    RuntimeModelInfo {
+                        id: "o3-mini".to_owned(),
+                        display_name: "o3-mini".to_owned(),
+                    },
+                ],
+            }
+        })
+    }
+
+    fn resolve_profile(
+        &self,
+        profile_id: &str,
+    ) -> Result<EffectiveRuntimeProfile, RuntimeConfigError> {
+        let profile = match profile_id {
+            "codex/review" => RuntimeProfile {
+                id: "codex/review".to_owned(),
+                provider: "codex".to_owned(),
+                display_name: "Codex / Review".to_owned(),
+                model: "default".to_owned(),
+                reasoning_effort: ReasoningEffort::Medium,
+                filesystem: FilesystemCapability::ReadOnly,
+                network: false,
+                extra_writable_roots: vec![],
+                max_duration: Duration::from_secs(20 * 60),
+                max_repair_attempts: 1,
+                relay_approval_owner: true,
+            },
+            "codex/implement" | "codex/default" => RuntimeProfile {
+                id: "codex/implement".to_owned(),
+                provider: "codex".to_owned(),
+                display_name: "Codex / Implement".to_owned(),
+                model: "default".to_owned(),
+                reasoning_effort: ReasoningEffort::High,
+                filesystem: FilesystemCapability::WorkspaceWrite,
+                network: false,
+                extra_writable_roots: vec![],
+                max_duration: Duration::from_secs(30 * 60),
+                max_repair_attempts: 2,
+                relay_approval_owner: true,
+            },
+            "codex/deep" => RuntimeProfile {
+                id: "codex/deep".to_owned(),
+                provider: "codex".to_owned(),
+                display_name: "Codex / Deep".to_owned(),
+                model: "default".to_owned(),
+                reasoning_effort: ReasoningEffort::XHigh,
+                filesystem: FilesystemCapability::WorkspaceWrite,
+                network: false,
+                extra_writable_roots: vec![],
+                max_duration: Duration::from_secs(60 * 60),
+                max_repair_attempts: 3,
+                relay_approval_owner: true,
+            },
+            _ => {
+                return Err(RuntimeConfigError::UnknownProfile {
+                    profile_id: profile_id.to_owned(),
+                });
+            }
+        };
+        Ok(EffectiveRuntimeProfile {
+            profile,
+            provider_config_snapshot: Some(format!(
+                "executable={}",
+                self.config.executable.display()
+            )),
+        })
+    }
+
+    fn verify_capabilities(
+        &self,
+        profile: &EffectiveRuntimeProfile,
+        context: &RuntimeCapabilityContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RuntimeCapabilityReport> + Send + '_>>
+    {
+        let is_dir = context.working_directory.is_dir();
+        let path_str = context.working_directory.display().to_string();
+        let fs_write_status = match profile.profile.filesystem {
+            FilesystemCapability::ReadOnly => CapabilityStatus::Configured,
+            FilesystemCapability::WorkspaceWrite => {
+                if is_dir {
+                    CapabilityStatus::Verified
+                } else {
+                    CapabilityStatus::Mismatch
+                }
+            }
+        };
+        Box::pin(async move {
+            RuntimeCapabilityReport {
+                filesystem_read: CapabilityStatus::Verified,
+                filesystem_write: fs_write_status,
+                command_execution: CapabilityStatus::Verified,
+                network: CapabilityStatus::Configured,
+                notes: vec![format!("Working directory: {path_str}")],
+            }
+        })
     }
 }
 

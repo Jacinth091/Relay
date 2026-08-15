@@ -37,6 +37,7 @@ use relay_runtime::{
     CancellationToken, Runtime, RuntimeCapabilities, RuntimeIdentity, RuntimeOutputStream,
     RuntimeRequest, RuntimeStartFuture,
 };
+use relay_runtime_antigravity::{AntigravityRuntime, AntigravityRuntimeHealth};
 use relay_runtime_codex::{CodexRuntime, CodexRuntimeHealth};
 use relay_runtime_fake::FakeRuntime;
 use tokio::process::Command as TokioCommand;
@@ -112,12 +113,21 @@ async fn probe_version(executable: &str, args: &[&str]) -> Result<String, String
     })
 }
 
-async fn collect_health() -> HealthSnapshot {
+async fn collect_health(active_provider: String, full_probe: bool) -> HealthSnapshot {
     let git_health = match probe_version("git", &["--version"]).await {
         Ok(version) => ToolHealth::Available(version),
         Err(error) => ToolHealth::Unavailable(error),
     };
-    let runtime_health = CodexRuntime::default().discover().await;
+    let runtime_health = if full_probe || active_provider == "codex" {
+        CodexRuntime::default().discover().await
+    } else {
+        CodexRuntimeHealth::Checking
+    };
+    let antigravity_health = if full_probe || active_provider == "antigravity" {
+        AntigravityRuntime::default().discover().await
+    } else {
+        AntigravityRuntimeHealth::Checking
+    };
     let github_cli_health = match probe_version("gh", &["--version"]).await {
         Ok(version) => {
             let auth = timeout(Duration::from_secs(3), {
@@ -142,6 +152,7 @@ async fn collect_health() -> HealthSnapshot {
     HealthSnapshot {
         git_health,
         runtime_health,
+        antigravity_health,
         github_cli_health,
     }
 }
@@ -171,7 +182,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         durable_tasks,
         format!("{feedback}\n{database_feedback}"),
     );
-    state.begin_health_refresh();
+    state.begin_health_refresh(false);
     let mut terminal = initialize_terminal()?;
 
     let run_result = run(&mut terminal, &mut state).await;
@@ -275,7 +286,10 @@ fn render(frame: &mut Frame, state: &AppState) {
         Screen::TaskReview => render_task_review(frame, state, areas[0]),
         Screen::Execution => render_execution(frame, state, areas[0]),
         Screen::Result => render_result(frame, state, areas[0]),
-        Screen::Runtime => render_runtime(frame, state, areas[0]),
+        Screen::Runtimes => render_runtimes(frame, state, areas[0]),
+        Screen::RuntimeDetail => render_runtime_detail(frame, state, areas[0]),
+        Screen::Diff => render_diff(frame, state, areas[0]),
+        Screen::Logs => render_logs(frame, state, areas[0]),
         Screen::Settings => render_settings(frame, state, areas[0]),
         Screen::Doctor => render_doctor(frame, state, areas[0]),
     }
@@ -302,26 +316,143 @@ fn render_dashboard(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_widget(dashboard, area);
 }
 
-fn render_runtime(frame: &mut Frame, state: &AppState, area: Rect) {
-    let body = format!(
-        "Runtime\n\n{}\n\nExecution\nSandbox: workspace-write\nUser config: ignored for execution\nAdditional writable roots: none\nApproval: Relay Run + Codex never\nMaximum duration: {} minutes\n\nAuthentication: {}",
-        state.runtime_label(),
-        app_execution_limits().max_duration.as_secs() / 60,
+fn render_runtimes(frame: &mut Frame, state: &AppState, area: Rect) {
+    let mut lines = vec!["Runtimes\n".to_owned()];
+
+    // Codex
+    let codex_marker = if state.runtime_health.is_ready() {
+        "●"
+    } else {
+        "○"
+    };
+    let codex_selected = if state.active_runtime_provider == "codex" {
+        "> "
+    } else {
+        "  "
+    };
+    lines.push(format!("{codex_selected}Codex CLI"));
+    lines.push(format!(
+        "  {codex_marker} {}",
         state.runtime_health.display_status()
+    ));
+    lines.push(format!(
+        "  Profile: {}",
+        if state.active_runtime_provider == "codex" {
+            &state.active_profile_id
+        } else {
+            "codex/implement"
+        }
+    ));
+    lines.push(String::new());
+
+    // Antigravity
+    let agy_marker = if state.antigravity_health.is_ready() {
+        "●"
+    } else {
+        "○"
+    };
+    let agy_selected = if state.active_runtime_provider == "antigravity" {
+        "> "
+    } else {
+        "  "
+    };
+    lines.push(format!("{agy_selected}Antigravity"));
+    lines.push(format!(
+        "  {agy_marker} {}",
+        state.antigravity_health.display_status()
+    ));
+    lines.push(format!(
+        "  Profile: {}",
+        if state.active_runtime_provider == "antigravity" {
+            &state.active_profile_id
+        } else {
+            "antigravity/implement"
+        }
+    ));
+    lines.push(String::new());
+
+    lines.push(format!("\nDefault: {}", state.active_profile_id));
+
+    let body = lines.join("\n");
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), area);
+}
+
+fn render_runtime_detail(frame: &mut Frame, state: &AppState, area: Rect) {
+    let provider = state.runtime_detail_provider.as_deref().unwrap_or("codex");
+    let body = match provider {
+        "codex" => {
+            let health_detail =
+                codex_health_detail(&state.runtime_health, &CodexRuntime::default());
+            format!(
+                "Runtime / Codex\n\nStatus\n{}\n\nActive profile\n  {}\n\nAI\n  Model: Default\n  Reasoning: High\n\nCapabilities\n  Workspace read: ✓\n  Workspace write: ✓\n  Commands: ✓\n  Network: ×\n  Commit: ×\n  Push: ×\n\nLimits\n  Duration: {} min\n  Repairs: {}",
+                health_detail,
+                state.active_profile_id,
+                app_execution_limits().max_duration.as_secs() / 60,
+                app_execution_limits().max_repair_attempts
+            )
+        }
+        "antigravity" => {
+            format!(
+                "Runtime / Antigravity\n\nStatus\n  {}\n\nActive profile\n  antigravity/implement\n\nAI\n  Model: Default\n  Effort: High\n\nCapabilities\n  Workspace read: ✓\n  Workspace write: ✓\n  Commands: ✓\n  Network: ×\n  Commit: ×\n  Push: ×",
+                state.antigravity_health.display_status()
+            )
+        }
+        _ => format!("Unknown runtime provider: {provider}"),
+    };
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), area);
+}
+
+fn render_diff(frame: &mut Frame, state: &AppState, area: Rect) {
+    let body = state
+        .diff_output
+        .as_deref()
+        .unwrap_or("No diff available.\n\nRun a task first, then use /diff to view changes.");
+    frame.render_widget(
+        Paragraph::new(body.to_owned())
+            .wrap(Wrap { trim: false })
+            .scroll((state.diff_scroll, 0)),
+        area,
     );
-    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: true }), area);
+}
+
+fn render_logs(frame: &mut Frame, state: &AppState, area: Rect) {
+    let body = if let Some(task_id) = state.selected_task {
+        state
+            .execution_views
+            .get(&task_id)
+            .map(|view| {
+                let header = format!("Logs — Task {}\n\n", task_id);
+                let output: String = view.output.iter().cloned().collect::<Vec<_>>().join("");
+                if output.is_empty() {
+                    format!("{header}No output captured.")
+                } else {
+                    format!("{header}{output}")
+                }
+            })
+            .unwrap_or_else(|| "No execution logs available.".to_owned())
+    } else {
+        "No task selected. Use /logs <task> to view logs.".to_owned()
+    };
+    frame.render_widget(
+        Paragraph::new(body)
+            .wrap(Wrap { trim: false })
+            .scroll((state.logs_scroll, 0)),
+        area,
+    );
 }
 
 fn render_settings(frame: &mut Frame, state: &AppState, area: Rect) {
     let limits = app_execution_limits();
     let body = format!(
-        "Settings\n\nExecution\n  Global parallelism: {}\n  Per-project parallelism: {}\n  Repair attempts: {}\n  Maximum execution: {} minutes\n\nSafety\n  Explicit Run approval: On\n  Automatic commit: Off\n  Automatic push: Off\n\nStorage\n  Config: {}\n  SQLite: {}\n\nRuntime\n  {}",
+        "Settings\n\nExecution\n  Global parallelism: {}\n  Per-project parallelism: {}\n  Repair attempts: {}\n  Maximum execution: {} minutes\n\nSafety\n  Explicit Run approval: On\n  Automatic commit: Off\n  Automatic push: Off\n\nStorage\n  Config: {}\n  SQLite: {}\n\nRuntime\n  Provider: {}\n  Profile: {}\n  Status: {}",
         limits.max_parallel,
         limits.per_project_max_parallel,
         limits.max_repair_attempts,
         limits.max_duration.as_secs() / 60,
         state.config_path.display(),
         state.database_path.display(),
+        state.active_runtime_provider,
+        state.active_profile_id,
         state.runtime_health.display_status()
     );
     frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: true }), area);
@@ -329,7 +460,7 @@ fn render_settings(frame: &mut Frame, state: &AppState, area: Rect) {
 
 fn render_doctor(frame: &mut Frame, state: &AppState, area: Rect) {
     let body = format!(
-        "Relay Doctor\n\nCurrent execution requirements\n\n{}\n{} Relay config\n{} SQLite\n{}\n  {}\n\nFuture integrations\n{}\nGitHub Issue ingress: not implemented until M10\nRelay Direct / MCP: not implemented until M12\n\nNo secrets or environment data are displayed.",
+        "Relay Doctor\n\nCurrent execution requirements\n\n{}\n{} Relay config\n{} SQLite\n{}\n  {}\n{}\n  {}\n\nFuture integrations\n{}\nGitHub Issue ingress: not implemented until M10\nRelay Direct / MCP: not implemented until M12\n\nNo secrets or environment data are displayed.",
         git_health_marker(&state.git_health),
         if state.registry_writable { "✓" } else { "×" },
         if state.store.is_some() { "✓" } else { "×" },
@@ -339,6 +470,12 @@ fn render_doctor(frame: &mut Frame, state: &AppState, area: Rect) {
             "× Codex CLI"
         },
         codex_health_detail(&state.runtime_health, &CodexRuntime::default()),
+        if state.antigravity_health.is_ready() {
+            "✓ Antigravity"
+        } else {
+            "× Antigravity"
+        },
+        state.antigravity_health.display_status(),
         state.github_cli_health
     );
     frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: true }), area);
@@ -810,7 +947,40 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
             }
             _ => Ok(false),
         },
-        Screen::Runtime | Screen::Settings | Screen::Doctor => match key.code {
+        Screen::Diff => match key.code {
+            KeyCode::Up => {
+                state.diff_scroll = state.diff_scroll.saturating_sub(1);
+                Ok(false)
+            }
+            KeyCode::Down => {
+                state.diff_scroll = state.diff_scroll.saturating_add(1);
+                Ok(false)
+            }
+            KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => {
+                state.screen = Screen::Dashboard;
+                Ok(false)
+            }
+            _ => Ok(false),
+        },
+        Screen::Logs => match key.code {
+            KeyCode::Up => {
+                state.logs_scroll = state.logs_scroll.saturating_sub(1);
+                Ok(false)
+            }
+            KeyCode::Down => {
+                state.logs_scroll = state.logs_scroll.saturating_add(1);
+                Ok(false)
+            }
+            KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => {
+                state.screen = Screen::Dashboard;
+                Ok(false)
+            }
+            _ => Ok(false),
+        },
+        Screen::Runtimes
+        | Screen::RuntimeDetail
+        | Screen::Settings
+        | Screen::Doctor => match key.code {
             KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => {
                 state.screen = Screen::Dashboard;
                 Ok(false)
@@ -829,7 +999,10 @@ fn command_mode_available(screen: Screen) -> bool {
             | Screen::TaskReview
             | Screen::Execution
             | Screen::Result
-            | Screen::Runtime
+            | Screen::Runtimes
+            | Screen::RuntimeDetail
+            | Screen::Diff
+            | Screen::Logs
             | Screen::Settings
             | Screen::Doctor
     )
@@ -849,11 +1022,10 @@ async fn execute_relay_command(state: &mut AppState, input: &str) -> Result<bool
         RelayCommand::Tasks => state.enter_tasks(),
         RelayCommand::Projects => state.enter_projects(),
         RelayCommand::ProjectAdd { path } => state.start_detected_project(path),
-        RelayCommand::Runtime => state.screen = Screen::Runtime,
         RelayCommand::Settings => state.screen = Screen::Settings,
         RelayCommand::Doctor => {
             state.screen = Screen::Doctor;
-            state.begin_health_refresh();
+            state.begin_health_refresh(true);
         }
         RelayCommand::Help => {
             state.screen = Screen::Dashboard;
@@ -862,6 +1034,65 @@ async fn execute_relay_command(state: &mut AppState, input: &str) -> Result<bool
         RelayCommand::Quit => return Ok(true),
         RelayCommand::Run { task } => state.run_task_selector(&task).await,
         RelayCommand::Cancel { task } => state.cancel_task_selector(&task),
+        RelayCommand::Runtimes => {
+            state.screen = Screen::Runtimes;
+            state.begin_health_refresh(true);
+        }
+        RelayCommand::RuntimeDetail { provider } => {
+            state.runtime_detail_provider = Some(provider.clone());
+            state.screen = Screen::RuntimeDetail;
+            state.begin_health_refresh(true);
+        }
+        RelayCommand::RuntimeUse { profile } => {
+            if profile.starts_with("antigravity/") {
+                state.active_runtime_provider = "antigravity".to_owned();
+                state.active_profile_id = profile.clone();
+            } else {
+                state.active_runtime_provider = "codex".to_owned();
+                state.active_profile_id = profile.clone();
+            }
+        }
+        RelayCommand::RuntimeTest { .. } => state.begin_health_refresh(true),
+        RelayCommand::Diff { task } => {
+            if let Some(t) = task {
+                state.run_task_selector(&t).await;
+            }
+            let diff = match state.selected_stored_task() {
+                Some(task) => match state.relay.resolve_project(task.project_key.as_str()) {
+                    Ok(project) => {
+                        match std::process::Command::new("git")
+                            .arg("diff")
+                            .current_dir(project.local_path())
+                            .output()
+                        {
+                            Ok(output) => {
+                                let out = String::from_utf8_lossy(&output.stdout).to_string();
+                                if out.is_empty() {
+                                    "No changes detected.".to_owned()
+                                } else {
+                                    out
+                                }
+                            }
+                            Err(e) => format!("Failed to run git diff: {}", e),
+                        }
+                    }
+                    Err(e) => format!("Project resolution failed: {}", e),
+                },
+                None => "No task selected.".to_owned(),
+            };
+            state.diff_output = Some(diff);
+            state.screen = Screen::Diff;
+        }
+        RelayCommand::RuntimeProfile { profile } => {
+            state.active_profile_id = profile;
+            state.screen = Screen::RuntimeDetail;
+        }
+        RelayCommand::Logs { task } => {
+            if let Some(t) = task {
+                state.run_task_selector(&t).await;
+            }
+            state.screen = Screen::Logs;
+        }
     }
     Ok(false)
 }
@@ -1164,7 +1395,12 @@ fn help_text(state: &AppState) -> &'static str {
         Screen::TaskReview => "R: run when eligible  B / Esc: tasks  Q: quit",
         Screen::Execution => "C: cancel  B: background / tasks",
         Screen::Result => "T: tasks  D: dashboard  N: new task",
-        Screen::Runtime | Screen::Settings | Screen::Doctor => "Esc / D: dashboard",
+        Screen::Runtimes
+        | Screen::RuntimeDetail
+        | Screen::Diff
+        | Screen::Logs
+        | Screen::Settings
+        | Screen::Doctor => "Esc / D: dashboard",
     }
 }
 
@@ -1238,6 +1474,7 @@ fn add_field_line(state: &AppState, field: AddProjectField, label: &str, value: 
 #[derive(Debug, Clone)]
 enum AppRuntime {
     Codex(CodexRuntime),
+    Antigravity(AntigravityRuntime),
     Fake(FakeRuntime),
 }
 
@@ -1258,12 +1495,14 @@ impl Runtime for AppRuntime {
     fn identity(&self) -> RuntimeIdentity {
         match self {
             Self::Codex(runtime) => runtime.identity(),
+            Self::Antigravity(runtime) => runtime.identity(),
             Self::Fake(runtime) => runtime.identity(),
         }
     }
     fn capabilities(&self) -> RuntimeCapabilities {
         match self {
             Self::Codex(runtime) => runtime.capabilities(),
+            Self::Antigravity(runtime) => runtime.capabilities(),
             Self::Fake(runtime) => runtime.capabilities(),
         }
     }
@@ -1274,6 +1513,7 @@ impl Runtime for AppRuntime {
     ) -> RuntimeStartFuture {
         match self {
             Self::Codex(runtime) => runtime.start(request, cancellation),
+            Self::Antigravity(runtime) => runtime.start(request, cancellation),
             Self::Fake(runtime) => runtime.start(request, cancellation),
         }
     }
@@ -1292,6 +1532,13 @@ struct AppState {
     runtime_health: CodexRuntimeHealth,
     git_health: ToolHealth,
     github_cli_health: String,
+    antigravity_health: AntigravityRuntimeHealth,
+    active_runtime_provider: String,
+    active_profile_id: String,
+    runtime_detail_provider: Option<String>,
+    diff_output: Option<String>,
+    diff_scroll: u16,
+    logs_scroll: u16,
     health_refresh: Option<JoinHandle<HealthSnapshot>>,
     command_input: String,
     command_mode: bool,
@@ -1331,6 +1578,7 @@ struct ExecutionViewState {
 struct HealthSnapshot {
     git_health: ToolHealth,
     runtime_health: CodexRuntimeHealth,
+    antigravity_health: AntigravityRuntimeHealth,
     github_cli_health: String,
 }
 
@@ -1352,14 +1600,20 @@ fn git_health_marker(health: &ToolHealth) -> &'static str {
 }
 
 impl AppState {
-    fn begin_health_refresh(&mut self) {
+    fn begin_health_refresh(&mut self, full_probe: bool) {
         if let Some(task) = self.health_refresh.take() {
             task.abort();
         }
-        self.runtime_health = CodexRuntimeHealth::Checking;
+        if full_probe || self.active_runtime_provider == "codex" {
+            self.runtime_health = CodexRuntimeHealth::Checking;
+        }
+        if full_probe || self.active_runtime_provider == "antigravity" {
+            self.antigravity_health = AntigravityRuntimeHealth::Checking;
+        }
         self.git_health = ToolHealth::Checking;
         self.github_cli_health = "checking (optional M10 prerequisite)".to_owned();
-        self.health_refresh = Some(tokio::spawn(collect_health()));
+        let provider = self.active_runtime_provider.clone();
+        self.health_refresh = Some(tokio::spawn(collect_health(provider, full_probe)));
     }
 
     async fn poll_health_refresh(&mut self) {
@@ -1372,7 +1626,12 @@ impl AppState {
         let task = self.health_refresh.take().expect("health task exists");
         if let Ok(snapshot) = task.await {
             self.git_health = snapshot.git_health;
-            self.runtime_health = snapshot.runtime_health;
+            if snapshot.runtime_health != CodexRuntimeHealth::Checking {
+                self.runtime_health = snapshot.runtime_health;
+            }
+            if snapshot.antigravity_health != AntigravityRuntimeHealth::Checking {
+                self.antigravity_health = snapshot.antigravity_health;
+            }
             self.github_cli_health = snapshot.github_cli_health;
         }
     }
@@ -1494,6 +1753,13 @@ impl AppState {
             runtime_health: CodexRuntimeHealth::Checking,
             git_health: ToolHealth::Checking,
             github_cli_health: "not checked (optional M10 prerequisite)".to_owned(),
+            antigravity_health: AntigravityRuntimeHealth::Checking,
+            active_runtime_provider: "codex".to_owned(),
+            active_profile_id: "codex/implement".to_owned(),
+            runtime_detail_provider: None,
+            diff_output: None,
+            diff_scroll: 0,
+            logs_scroll: 0,
             health_refresh: None,
             command_input: String::new(),
             command_mode: false,
@@ -2131,7 +2397,10 @@ enum Screen {
     TaskReview,
     Execution,
     Result,
-    Runtime,
+    Runtimes,
+    RuntimeDetail,
+    Diff,
+    Logs,
     Settings,
     Doctor,
 }
@@ -2749,7 +3018,7 @@ mod tests {
     #[tokio::test]
     async fn starting_health_refresh_invalidates_previous_readiness() {
         let mut state = app_state_with_project();
-        state.begin_health_refresh();
+        state.begin_health_refresh(true);
         assert!(matches!(state.runtime_health, CodexRuntimeHealth::Checking));
         assert!(matches!(state.git_health, ToolHealth::Checking));
         if let Some(task) = state.health_refresh.take() {

@@ -1085,6 +1085,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "relay-runtime-antigravity"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "relay-protocol",
+ "relay-runtime",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "relay-runtime-codex"
 version = "0.1.0"
 dependencies = [
@@ -1123,6 +1137,7 @@ dependencies = [
  "ratatui",
  "relay-core",
  "relay-runtime",
+ "relay-runtime-antigravity",
  "relay-runtime-codex",
  "relay-runtime-fake",
  "tokio",

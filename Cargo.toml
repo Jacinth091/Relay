@@ -7,6 +7,7 @@ members = [
     "crates/relay-store",
     "runtimes/relay-runtime-fake",
     "runtimes/relay-runtime-codex",
+    "runtimes/relay-runtime-antigravity",
 ]
 resolver = "3"
 

@@ -16,12 +16,13 @@ use std::{
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 use relay_runtime::{
-    CancellationToken, CapabilityStatus, EffectiveRuntimeProfile, FilesystemCapability,
-    ReasoningEffort, Runtime, RuntimeAction, RuntimeCapabilities, RuntimeCapabilityContext,
-    RuntimeCapabilityReport, RuntimeConfigError, RuntimeDescriptor, RuntimeError, RuntimeEvent,
-    RuntimeIdentity, RuntimeIntegration, RuntimeModelCatalog, RuntimeModelInfo, RuntimeOutcome,
-    RuntimeOutcomeKind, RuntimeOutputStream, RuntimeProbe, RuntimeProfile,
-    RuntimeProfileDescriptor, RuntimeRequest, RuntimeSession, RuntimeStartFuture,
+    CancellationToken, CapabilityStatus, EffectiveRuntimeProfile, FileChangeKind,
+    FilesystemCapability, ReasoningEffort, Runtime, RuntimeAction, RuntimeActivity,
+    RuntimeCapabilities, RuntimeCapabilityContext, RuntimeCapabilityReport, RuntimeConfigError,
+    RuntimeDescriptor, RuntimeError, RuntimeEvent, RuntimeIdentity, RuntimeIntegration,
+    RuntimeModelCatalog, RuntimeModelInfo, RuntimeOutcome, RuntimeOutcomeKind, RuntimeOutputStream,
+    RuntimeProbe, RuntimeProfile, RuntimeProfileDescriptor, RuntimeRequest, RuntimeSession,
+    RuntimeStartFuture, RuntimeText, RuntimeTextFormat,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -31,12 +32,9 @@ use tokio::{
     sync::mpsc,
     time::timeout,
 };
-use uuid::Uuid;
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_OUTPUT_FRAME_BYTES: usize = 256 * 1024;
-const MAX_RESULT_BYTES: u64 = 64 * 1024;
-const MAX_RESULT_TEXT_BYTES: usize = 8 * 1024;
 const EVENT_OUTPUT_BYTE_LIMIT: usize = 2 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +116,7 @@ impl RuntimeIntegration for AntigravityRuntime {
             display_name: "Antigravity".to_owned(),
             description: "Google Antigravity CLI execution adapter".to_owned(),
             is_development_only: false,
+            machine_interface_verified: true,
         }
     }
 
@@ -198,20 +197,11 @@ impl RuntimeIntegration for AntigravityRuntime {
         Box::pin(async move {
             RuntimeModelCatalog {
                 default_model: "default".to_owned(),
-                available_models: vec![
-                    RuntimeModelInfo {
-                        id: "default".to_owned(),
-                        display_name: "Default (Account/CLI Setting)".to_owned(),
-                    },
-                    RuntimeModelInfo {
-                        id: "gemini-3.6-pro".to_owned(),
-                        display_name: "Gemini 3.6 Pro".to_owned(),
-                    },
-                    RuntimeModelInfo {
-                        id: "gemini-3.6-flash".to_owned(),
-                        display_name: "Gemini 3.6 Flash".to_owned(),
-                    },
-                ],
+                available_models: vec![RuntimeModelInfo {
+                    id: "default".to_owned(),
+                    display_name: "Default (Account/CLI Setting)".to_owned(),
+                    supported_reasoning_efforts: vec![],
+                }],
             }
         })
     }
@@ -287,7 +277,7 @@ impl RuntimeIntegration for AntigravityRuntime {
             FilesystemCapability::ReadOnly => CapabilityStatus::Configured,
             FilesystemCapability::WorkspaceWrite => {
                 if is_dir {
-                    CapabilityStatus::Verified
+                    CapabilityStatus::Unknown
                 } else {
                     CapabilityStatus::Mismatch
                 }
@@ -556,36 +546,6 @@ impl From<RelayResultKind> for RuntimeOutcomeKind {
     }
 }
 
-struct RuntimeTempFiles {
-    result_path: PathBuf,
-}
-
-impl RuntimeTempFiles {
-    fn create() -> Result<Self, RuntimeError> {
-        let id = Uuid::new_v4();
-        let root = env::temp_dir();
-        let result_path = root.join(format!("relay-agy-{id}-result.json"));
-        Ok(Self { result_path })
-    }
-
-    async fn read_result(&self) -> Result<RelayResult, String> {
-        let metadata = tokio::fs::metadata(&self.result_path)
-            .await
-            .map_err(|error| format!("missing AGY structured result: {error}"))?;
-        if metadata.len() > MAX_RESULT_BYTES {
-            return Err("AGY structured result exceeded the 64 KiB limit".to_owned());
-        }
-        let bytes = tokio::fs::read(&self.result_path)
-            .await
-            .map_err(|error| format!("could not read AGY structured result: {error}"))?;
-        let mut result: RelayResult = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("invalid AGY structured result: {error}"))?;
-        result.summary = bounded_result_text(&result.summary);
-        result.verification_summary = bounded_result_text(&result.verification_summary);
-        Ok(result)
-    }
-}
-
 fn truncate_utf8_to_bytes(value: &mut String, max_bytes: usize) {
     if value.len() <= max_bytes {
         return;
@@ -598,21 +558,6 @@ fn truncate_utf8_to_bytes(value: &mut String, max_bytes: usize) {
         .unwrap_or(0);
     value.truncate(boundary);
     value.push('…');
-}
-
-fn bounded_result_text(input: &str) -> String {
-    let mut safe = input
-        .chars()
-        .filter(|character| *character == '\n' || *character == '\t' || !character.is_control())
-        .collect::<String>();
-    truncate_utf8_to_bytes(&mut safe, MAX_RESULT_TEXT_BYTES);
-    safe
-}
-
-impl Drop for RuntimeTempFiles {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.result_path);
-    }
 }
 
 async fn terminate_process_tree(child: &mut tokio::process::Child) {
@@ -668,6 +613,7 @@ pub fn build_prompt(request: &RuntimeRequest) -> String {
     )
 }
 
+#[allow(dead_code)]
 fn render_agy_json_event(event: &Value) -> Option<Vec<u8>> {
     let kind = event.get("type")?.as_str()?;
     let text = match kind {
@@ -687,6 +633,85 @@ fn render_agy_json_event(event: &Value) -> Option<Vec<u8>> {
     Some(format!("{text}\n").into_bytes())
 }
 
+fn normalize_agy_activity(event: &Value) -> Option<RuntimeActivity> {
+    let kind = event.get("type")?.as_str()?;
+    match kind {
+        "thread.started" => Some(RuntimeActivity::SessionStarted),
+        "turn.started" => Some(RuntimeActivity::Analyzing {
+            description: "AGY started working".to_owned(),
+        }),
+        "item.started" | "item.completed" => {
+            let item = event.get("item").unwrap_or(event);
+            match item.get("type").and_then(Value::as_str).unwrap_or_default() {
+                "command_execution" => {
+                    let command = item
+                        .get("command")
+                        .or_else(|| item.get("cmd"))
+                        .and_then(Value::as_str)
+                        .map(bounded_event_text)
+                        .unwrap_or_else(|| "command".to_owned());
+                    if kind == "item.started" {
+                        Some(RuntimeActivity::CommandStarted {
+                            logical_command: command,
+                            raw_command: None,
+                            working_directory: item
+                                .get("cwd")
+                                .and_then(Value::as_str)
+                                .map(PathBuf::from),
+                        })
+                    } else {
+                        Some(RuntimeActivity::CommandCompleted {
+                            logical_command: command,
+                            success: item
+                                .get("status")
+                                .and_then(Value::as_str)
+                                .map(|s| s == "completed" || s == "success")
+                                .unwrap_or(true),
+                            exit_code: item
+                                .get("exit_code")
+                                .and_then(Value::as_i64)
+                                .and_then(|code| i32::try_from(code).ok()),
+                            working_directory: item
+                                .get("cwd")
+                                .and_then(Value::as_str)
+                                .map(PathBuf::from),
+                        })
+                    }
+                }
+                "agent_message" | "message" => item
+                    .get("text")
+                    .or_else(|| item.get("message"))
+                    .and_then(Value::as_str)
+                    .map(|text| RuntimeActivity::AgentMessage {
+                        message: RuntimeText {
+                            content: bounded_event_text(text),
+                            format: RuntimeTextFormat::Markdown,
+                        },
+                    }),
+                "file_change" | "file_changes" => {
+                    item.get("path").and_then(Value::as_str).map(|path| {
+                        RuntimeActivity::FileChanged {
+                            path: PathBuf::from(path),
+                            change_kind: FileChangeKind::Modified,
+                        }
+                    })
+                }
+                _ => None,
+            }
+        }
+        "item/agentMessage/delta" | "agent_message.delta" => event
+            .get("delta")
+            .and_then(Value::as_str)
+            .map(|text| RuntimeActivity::AgentMessage {
+                message: RuntimeText {
+                    content: bounded_event_text(text),
+                    format: RuntimeTextFormat::Markdown,
+                },
+            }),
+        _ => None,
+    }
+}
+
 fn bounded_event_text(input: &str) -> String {
     let mut safe: String = input
         .chars()
@@ -698,8 +723,8 @@ fn bounded_event_text(input: &str) -> String {
 
 #[derive(Default)]
 struct StreamState {
-    turn_completed: bool,
-    turn_failed: bool,
+    terminal_result: Option<RelayResult>,
+    failed: bool,
 }
 
 async fn read_stdout(
@@ -736,16 +761,27 @@ async fn read_stdout(
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
                 match kind {
-                    "turn.completed" => state.turn_completed = true,
-                    "turn.failed" => state.turn_failed = true,
+                    "result" => {
+                        let payload = event
+                            .get("result")
+                            .cloned()
+                            .unwrap_or_else(|| event.clone());
+                        match serde_json::from_value::<RelayResult>(payload) {
+                            Ok(result) => state.terminal_result = Some(result),
+                            Err(error) => return Err(format!("invalid AGY result event: {error}")),
+                        }
+                    }
+                    "error" => state.failed = true,
                     _ => {}
                 }
 
-                if let Some(rendered) = render_agy_json_event(&event) {
+                if let Some(activity) = normalize_agy_activity(&event) {
+                    let _ = tx.send(RuntimeEvent::Activity(activity)).await;
+                } else if kind == "error" {
                     let _ = tx
                         .send(RuntimeEvent::Output {
-                            stream: RuntimeOutputStream::Stdout,
-                            bytes: rendered,
+                            stream: RuntimeOutputStream::Stderr,
+                            bytes: format!("{line}\n").into_bytes(),
                         })
                         .await;
                 }
@@ -795,7 +831,6 @@ async fn run_child(
     stderr: tokio::process::ChildStderr,
     tx: mpsc::Sender<RuntimeEvent>,
     cancellation: CancellationToken,
-    temp: RuntimeTempFiles,
 ) {
     let mut stdout_reader = tokio::spawn(read_stdout(stdout, tx.clone()));
     let mut stderr_reader = tokio::spawn(read_stderr(stderr, tx.clone()));
@@ -875,24 +910,21 @@ async fn run_child(
             RuntimeOutcomeKind::RuntimeFailure,
             format!("AGY exited with {status}"),
         )),
-        (Ok(_), Ok(stream), Ok(_)) if stream.turn_failed => {
-            RuntimeEvent::Outcome(RuntimeOutcome::new(
-                RuntimeOutcomeKind::RuntimeFailure,
-                "AGY reported turn.failed",
-            ))
-        }
-        (Ok(_), Ok(stream), Ok(_)) if !stream.turn_completed => RuntimeEvent::InvalidOutput {
-            reason: "AGY exited without turn.completed".to_owned(),
-        },
-        (Ok(_), Ok(_), Ok(_)) => match temp.read_result().await {
-            Ok(result) => RuntimeEvent::Outcome(RuntimeOutcome::new(
+        (Ok(_), Ok(stream), Ok(_)) if stream.failed => RuntimeEvent::Outcome(RuntimeOutcome::new(
+            RuntimeOutcomeKind::RuntimeFailure,
+            "AGY reported an error",
+        )),
+        (Ok(_), Ok(stream), Ok(_)) => match stream.terminal_result {
+            Some(result) => RuntimeEvent::Outcome(RuntimeOutcome::new(
                 result.outcome.into(),
                 format!(
                     "{}\nVerification: {}",
                     result.summary, result.verification_summary
                 ),
             )),
-            Err(error) => RuntimeEvent::InvalidOutput { reason: error },
+            None => RuntimeEvent::InvalidOutput {
+                reason: "AGY exited without a terminal result event".to_owned(),
+            },
         },
     };
     let _ = tx.send(outcome).await;
@@ -912,6 +944,7 @@ impl Runtime for AntigravityRuntime {
             streaming_output: true,
             cancellation: true,
             deterministic_outcome: true,
+            permission_support: relay_runtime::RuntimePermissionSupport::PreapprovedOnly,
         }
     }
 
@@ -934,7 +967,6 @@ impl Runtime for AntigravityRuntime {
                     "unsupported runtime stack '{stack}'"
                 )));
             }
-            let temp = RuntimeTempFiles::create()?;
             let executable = runtime
                 .resolve_executable()
                 .map_err(RuntimeError::StartFailed)?;
@@ -1031,12 +1063,13 @@ impl Runtime for AntigravityRuntime {
 
             let (tx, rx) = mpsc::channel(32);
             tokio::spawn(async move {
-                run_child(child, stdout, stderr, tx, cancellation, temp).await;
+                run_child(child, stdout, stderr, tx, cancellation).await;
             });
 
             Ok(RuntimeSession {
                 session_id: format!("agy-{}", request.execution_id),
                 events: rx,
+                control: None,
             })
         })
     }

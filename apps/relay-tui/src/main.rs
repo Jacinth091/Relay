@@ -1,5 +1,6 @@
 mod command;
 mod command_completion;
+mod diff;
 mod project_discovery;
 mod runtime_settings;
 
@@ -33,15 +34,20 @@ use relay_core::{
     default_config_path, default_database_path, list_stored_tasks,
 };
 mod events;
+mod markdown;
 mod theme;
 
+#[cfg(not(test))]
+use relay_runtime::RuntimeIntegration;
 use relay_runtime::{
-    CancellationToken, Runtime, RuntimeCapabilities, RuntimeIdentity, RuntimeOutputStream,
-    RuntimeRequest, RuntimeStartFuture, sanitize_terminal_output,
+    CancellationToken, Runtime, RuntimeActivity, RuntimeCapabilities, RuntimeIdentity,
+    RuntimeOutputStream, RuntimePermissionDecision, RuntimePermissionRequest, RuntimeRequest,
+    RuntimeRouter, RuntimeStartFuture, sanitize_terminal_output,
 };
 use relay_runtime_antigravity::{AntigravityRuntime, AntigravityRuntimeHealth};
 use relay_runtime_codex::{CodexRuntime, CodexRuntimeHealth};
 use relay_runtime_fake::FakeRuntime;
+use relay_store::ExecutionRecord;
 use theme::*;
 use tokio::process::Command as TokioCommand;
 use tokio::sync::broadcast;
@@ -118,17 +124,27 @@ async fn probe_version(executable: &str, args: &[&str]) -> Result<String, String
     })
 }
 
-async fn collect_health(active_provider: String, full_probe: bool) -> HealthSnapshot {
+async fn collect_health(
+    active_provider: String,
+    full_probe: bool,
+    provider_filter: Option<String>,
+) -> HealthSnapshot {
     let git_health = match probe_version("git", &["--version"]).await {
         Ok(version) => ToolHealth::Available(version),
         Err(error) => ToolHealth::Unavailable(error),
     };
-    let runtime_health = if full_probe || active_provider == "codex" {
+    let runtime_health = if provider_filter.as_deref().is_none_or(|p| p == "codex")
+        && (full_probe || active_provider == "codex")
+    {
         CodexRuntime::default().discover().await
     } else {
         CodexRuntimeHealth::Checking
     };
-    let antigravity_health = if full_probe || active_provider == "antigravity" {
+    let antigravity_health = if provider_filter
+        .as_deref()
+        .is_none_or(|p| p == "antigravity")
+        && (full_probe || active_provider == "antigravity")
+    {
         AntigravityRuntime::default().discover().await
     } else {
         AntigravityRuntimeHealth::Checking
@@ -189,6 +205,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         durable_tasks,
         format!("{feedback}\n{database_feedback}"),
     );
+    state.refresh_durable_tasks().await;
     state.begin_health_refresh(false);
     let mut terminal = initialize_terminal()?;
 
@@ -441,6 +458,13 @@ fn render_tasks(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), area);
 }
 
+fn visible_scroll(body: &str, viewport_height: u16) -> u16 {
+    body.lines()
+        .count()
+        .saturating_sub(viewport_height as usize)
+        .min(u16::MAX as usize) as u16
+}
+
 fn render_projects(frame: &mut Frame, state: &AppState, area: Rect) {
     let body = project_listing(&state.relay, &state.repository_inspections, &state.feedback);
     frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), area);
@@ -513,10 +537,29 @@ fn render_runtime_detail(frame: &mut Frame, state: &AppState, area: Rect) {
         "codex" => {
             let health_detail =
                 codex_health_detail(&state.runtime_health, &CodexRuntime::default());
+            let interface =
+                if std::env::var("RELAY_CODEX_TRANSPORT").ok().as_deref() == Some("app-server") {
+                    "App Server"
+                } else {
+                    "Codex exec"
+                };
+            let approval = if interface == "App Server" {
+                "Live approval ✓"
+            } else {
+                "Pre-approved envelope"
+            };
             format!(
-                "Runtime / Codex\n\nStatus\n{}\n\nActive profile\n  {}\n\nAI\n  Model: Default\n  Reasoning: High\n\nCapabilities\n  Workspace read: ✓\n  Workspace write: ✓\n  Commands: ✓\n  Network: ×\n  Commit: ×\n  Push: ×\n\nLimits\n  Duration: {} min\n  Repairs: {}",
+                "Runtime / Codex\n\nStatus\n{}\n\nAuthentication\n  Managed Codex login (no secrets displayed)\n\nInterface\n  {}\n\nActive profile\n  {}\n\nAI\n  Model: {}\n  Reasoning: {}\n\nPermissions\n  {}\n\nUsage\n  Rate limits: available through provider dashboard\n\nCapabilities\n  Workspace read: ✓\n  Workspace write: ✓\n  Commands: ✓\n  Network: ×\n  Commit: ×\n  Push: ×\n\nLimits\n  Duration: {} min\n  Repairs: {}",
                 health_detail,
+                interface,
                 state.active_profile_id,
+                state.active_model.as_option().unwrap_or("provider default"),
+                state
+                    .active_reasoning_effort
+                    .as_option()
+                    .map(|effort| format!("{effort:?}"))
+                    .unwrap_or_else(|| "profile default".to_owned()),
+                approval,
                 app_execution_limits().max_duration.as_secs() / 60,
                 app_execution_limits().max_repair_attempts
             )
@@ -535,7 +578,11 @@ fn render_runtime_detail(frame: &mut Frame, state: &AppState, area: Rect) {
 fn render_diff(frame: &mut Frame, state: &AppState, area: Rect) {
     let theme = Theme::default();
     let lines = match state.diff_output.as_deref() {
-        Some(diff_text) if !diff_text.is_empty() => format_diff_lines(diff_text, &theme),
+        Some(diff_text) if !diff_text.is_empty() => {
+            let document = diff::parse(diff_text);
+            let display = diff::display_lines(&document).join("\n");
+            format_diff_lines(&display, &theme)
+        }
         _ => vec![ratatui::text::Line::from(
             "No diff available.\n\nRun a task first, then use /diff to view changes.",
         )],
@@ -765,7 +812,7 @@ fn render_task_review(frame: &mut Frame, state: &AppState, area: Rect) {
         .map(|task| {
             let preflight = state.ui_preflight(task);
             let action = if task.state == TaskState::Ready && preflight == "eligible" {
-                "\n\n[R] Run  [B] Back"
+                "\n\n[R] Run  [B] Back\nOne-run tuning: /run <task> --model=<id> --reasoning=<low|medium|high|xhigh>"
             } else if matches!(
                 task.state,
                 TaskState::Done | TaskState::Failed | TaskState::Cancelled
@@ -777,7 +824,7 @@ fn render_task_review(frame: &mut Frame, state: &AppState, area: Rect) {
             ) {
                 "\n\nATTENTION REQUIRED: external resolution is required.\n[B] Back"
             } else {
-                "\n\n[B] Back"
+                "\n\n[B] Back\nOne-run tuning: /run <task> --model=<id> --reasoning=<low|medium|high|xhigh>"
             };
             let requested_stack = task.handoff.stack.as_deref().unwrap_or("not requested");
             let effective_stack = state
@@ -789,8 +836,12 @@ fn render_task_review(frame: &mut Frame, state: &AppState, area: Rect) {
                 task.project_key,
                 requested_stack,
                 effective_stack,
-                AppRuntime::default().identity().profile_id,
-                state.runtime_health.display_status(),
+                state.active_profile_id,
+                if state.active_runtime_provider == "antigravity" {
+                    state.antigravity_health.display_status()
+                } else {
+                    state.runtime_health.display_status()
+                },
                 task.state.as_str(),
                 preflight,
                 handoff_summary_text(
@@ -813,27 +864,46 @@ fn render_execution(frame: &mut Frame, state: &AppState, area: Rect) {
     let body = state.selected_task.and_then(|id| state.execution_views.get(&id).map(|view| (id, view))).map(|(id, view)| {
         let task = state.durable_tasks.iter().find(|task| task.id == id);
         let output = view.output.iter().cloned().collect::<Vec<_>>().join("");
-        format!("Task: {id}\nProject: {}\nRuntime: {}\nScheduler: {}\nPhase: {}\nRepair: {}\nElapsed: {}s\n{}\n\nOutput:\n{}\n\nTry:\n  /cancel\n  /diff\n  /logs\n  /tasks",
+        format!("Task: {id}\nProject: {}\nRuntime: {}\nModel: {}\nReasoning: {}\nScheduler: {}\nPhase: {}\nRepair: {}\nElapsed: {}s\n{}\n{}\n\nOutput:\n{}\n\nTry:\n  /cancel\n  /diff\n  /logs\n  /tasks",
             task.map(|task| task.project_key.as_str()).unwrap_or("unknown"),
-            state.runtime_label(),
+            view.frozen_profile.as_deref().map(|p| state.runtime_label_for_profile(p)).unwrap_or_else(|| state.runtime_label()),
+            view.frozen_model.as_deref().unwrap_or("provider default"),
+            view.frozen_reasoning.as_deref().unwrap_or("profile default"),
             view.scheduler_status.as_ref().map(scheduler_status_text).unwrap_or("not scheduled"),
             view.durable_state.map(|state| state.as_str()).unwrap_or("state pending"), view.repair_attempt,
             view.started_at.map(|started| started.elapsed().as_secs()).unwrap_or(0),
-            view.persistence_error.as_ref().map(|error| format!("STATE UNCERTAIN / DURABILITY FAILURE\n{error}")).unwrap_or_else(|| if view.cancellation_requested { "Cancellation requested...".to_owned() } else { String::new() }), output)
+            view.persistence_error.as_ref().map(|error| format!("STATE UNCERTAIN / DURABILITY FAILURE\n{error}")).unwrap_or_else(|| if view.cancellation_requested { "Cancellation requested...".to_owned() } else { String::new() }),
+            state.pending_permission.as_ref().filter(|(task_id, _)| *task_id == id).map(|(_, request)| format!("! WAITING FOR PERMISSION\nKind: {:?}\n{}{}{}Reason: {}\n\n[Y] Allow once  [S] Allow for run  [N/Esc] Deny", request.kind, request.command.as_deref().map(|command| format!("Command: {command}\n")).unwrap_or_default(), request.cwd.as_ref().map(|cwd| format!("cwd: {}\n", cwd.display())).unwrap_or_default(), if request.requested.paths.is_empty() { String::new() } else { format!("Paths:\n{}\n", request.requested.paths.iter().map(|path| format!("  {}\n", path.display())).collect::<String>()) }, request.reason.as_deref().unwrap_or("provider approval required"))).unwrap_or_default(), output)
     }).unwrap_or_else(|| "No execution selected.".to_owned());
-    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), area);
+    let scroll = state
+        .execution_scroll
+        .min(visible_scroll(&body, area.height));
+    frame.render_widget(
+        Paragraph::new(body)
+            .scroll((scroll, 0))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn render_result(frame: &mut Frame, state: &AppState, area: Rect) {
     let body = state.selected_stored_task().map(|task| {
         let report = state.last_reports.get(&task.id);
         let repository = state.relay.inspect_project_repository(task.project_key.as_str()).ok().map(|i| repository_inspection_line(&i.eligibility, &i.status)).unwrap_or_else(|| "unavailable".to_owned());
-        format!("Task: {}\nProject: {}\nRuntime: {}\nState: {}\nOutcome: {}\nVerification: {}\nRepairs: {}\nRepository: {}\n\nSummary:\n{}\n\nTry:\n  /diff\n  /logs\n  /tasks\n  /new",
-            task.id, task.project_key, state.runtime_label(), task.state.as_str(), report.and_then(|r| r.outcome).map(|o| o.as_str()).unwrap_or("not confirmed"),
-            if task.state == TaskState::Done { "PASS" } else { "not available" }, state.execution_views.get(&task.id).map(|v| v.repair_attempt).unwrap_or(0), repository,
+        format!("Task: {}\nProject: {}\nRuntime: {}\nModel: {}\nReasoning: {}\nState: {}\nOutcome: {}\nVerification: {}\nRepairs: {}\nRepository: {}\n\nSummary:\n{}\n\nTry:\n  /diff\n  /logs\n  /tasks\n  /new",
+            task.id, task.project_key, state.execution_profile(task.id).map(|p| state.runtime_label_for_profile(&p)).unwrap_or_else(|| state.runtime_label()), task.state.as_str(), report.and_then(|r| r.outcome).map(|o| o.as_str()).unwrap_or("not confirmed"),
+            state.execution_model(task.id).as_deref().unwrap_or("provider default"),
+            state.execution_reasoning(task.id).as_deref().unwrap_or("profile default"),
+            match task.state { TaskState::Done => "PASS", TaskState::NeedsDecision => "NEEDS DECISION", TaskState::NeedsClarification => "NEEDS CLARIFICATION", TaskState::Failed => "FAILED", TaskState::Cancelled => "CANCELLED", _ => "not available" }, state.execution_views.get(&task.id).map(|v| v.repair_attempt).unwrap_or(0), repository,
             report.and_then(|r| r.outcome_summary.as_deref()).unwrap_or("No confirmed execution report."))
     }).unwrap_or_else(|| "No durable task selected.".to_owned());
-    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), area);
+    let scroll = state.result_scroll.min(visible_scroll(&body, area.height));
+    frame.render_widget(
+        Paragraph::new(body)
+            .scroll((scroll, 0))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn Error>> {
@@ -1080,6 +1150,61 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
             _ => Ok(false),
         },
         Screen::Execution => match key.code {
+            KeyCode::Char('y')
+            | KeyCode::Char('Y')
+            | KeyCode::Char('s')
+            | KeyCode::Char('S')
+            | KeyCode::Char('n')
+            | KeyCode::Char('N')
+            | KeyCode::Esc
+                if state.pending_permission.is_some() =>
+            {
+                if let Some((task_id, request)) = state.pending_permission.take() {
+                    let decision = match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            RuntimePermissionDecision::AllowOnce
+                        }
+                        KeyCode::Char('s') | KeyCode::Char('S') => {
+                            RuntimePermissionDecision::AllowForRun
+                        }
+                        _ => RuntimePermissionDecision::Deny,
+                    };
+                    if let Some(scheduler) = state.scheduler.clone() {
+                        let _ = scheduler
+                            .resolve_permission(task_id, request.request_id, decision)
+                            .await;
+                    }
+                }
+                Ok(false)
+            }
+            KeyCode::Up => {
+                state.execution_follow_tail = false;
+                state.execution_scroll = state.execution_scroll.saturating_sub(1);
+                Ok(false)
+            }
+            KeyCode::Down => {
+                state.execution_scroll = state.execution_scroll.saturating_add(1);
+                Ok(false)
+            }
+            KeyCode::PageUp => {
+                state.execution_follow_tail = false;
+                state.execution_scroll = state.execution_scroll.saturating_sub(20);
+                Ok(false)
+            }
+            KeyCode::PageDown => {
+                state.execution_scroll = state.execution_scroll.saturating_add(20);
+                Ok(false)
+            }
+            KeyCode::Home => {
+                state.execution_follow_tail = false;
+                state.execution_scroll = 0;
+                Ok(false)
+            }
+            KeyCode::End => {
+                state.execution_follow_tail = true;
+                state.execution_scroll = u16::MAX;
+                Ok(false)
+            }
             KeyCode::Char('c') | KeyCode::Char('C') => {
                 state.cancel_confirmation = state.selected_task;
                 state.feedback = "Cancel execution? Y: confirm  N / Esc: keep running".to_owned();
@@ -1103,6 +1228,30 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
             _ => Ok(false),
         },
         Screen::Result => match key.code {
+            KeyCode::Up => {
+                state.result_scroll = state.result_scroll.saturating_sub(1);
+                Ok(false)
+            }
+            KeyCode::Down => {
+                state.result_scroll = state.result_scroll.saturating_add(1);
+                Ok(false)
+            }
+            KeyCode::PageUp => {
+                state.result_scroll = state.result_scroll.saturating_sub(20);
+                Ok(false)
+            }
+            KeyCode::PageDown => {
+                state.result_scroll = state.result_scroll.saturating_add(20);
+                Ok(false)
+            }
+            KeyCode::Home => {
+                state.result_scroll = 0;
+                Ok(false)
+            }
+            KeyCode::End => {
+                state.result_scroll = u16::MAX;
+                Ok(false)
+            }
             KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Esc => {
                 state.screen = Screen::Tasks;
                 Ok(false)
@@ -1126,6 +1275,22 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
                 state.diff_scroll = state.diff_scroll.saturating_add(1);
                 Ok(false)
             }
+            KeyCode::PageUp => {
+                state.diff_scroll = state.diff_scroll.saturating_sub(20);
+                Ok(false)
+            }
+            KeyCode::PageDown => {
+                state.diff_scroll = state.diff_scroll.saturating_add(20);
+                Ok(false)
+            }
+            KeyCode::Home => {
+                state.diff_scroll = 0;
+                Ok(false)
+            }
+            KeyCode::End => {
+                state.diff_scroll = u16::MAX;
+                Ok(false)
+            }
             KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => {
                 state.screen = Screen::Dashboard;
                 Ok(false)
@@ -1139,6 +1304,22 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
             }
             KeyCode::Down => {
                 state.logs_scroll = state.logs_scroll.saturating_add(1);
+                Ok(false)
+            }
+            KeyCode::PageUp => {
+                state.logs_scroll = state.logs_scroll.saturating_sub(20);
+                Ok(false)
+            }
+            KeyCode::PageDown => {
+                state.logs_scroll = state.logs_scroll.saturating_add(20);
+                Ok(false)
+            }
+            KeyCode::Home => {
+                state.logs_scroll = 0;
+                Ok(false)
+            }
+            KeyCode::End => {
+                state.logs_scroll = u16::MAX;
                 Ok(false)
             }
             KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => {
@@ -1205,7 +1386,15 @@ async fn execute_relay_command(state: &mut AppState, input: &str) -> Result<bool
             state.feedback = command::COMMANDS.join("\n");
         }
         RelayCommand::Quit => return Ok(true),
-        RelayCommand::Run { task } => state.run_task_selector(&task).await,
+        RelayCommand::Run {
+            task,
+            model,
+            reasoning,
+        } => {
+            state.one_run_model_override = model;
+            state.one_run_reasoning_override = reasoning;
+            state.run_task_selector(&task).await;
+        }
         RelayCommand::Cancel { task } => state.cancel_task_selector(&task),
         RelayCommand::Runtimes => {
             state.screen = Screen::Runtimes;
@@ -1217,15 +1406,133 @@ async fn execute_relay_command(state: &mut AppState, input: &str) -> Result<bool
             state.begin_health_refresh(true);
         }
         RelayCommand::RuntimeUse { profile } => {
-            if profile.starts_with("antigravity/") {
-                state.active_runtime_provider = "antigravity".to_owned();
-                state.active_profile_id = profile.clone();
-            } else {
-                state.active_runtime_provider = "codex".to_owned();
-                state.active_profile_id = profile.clone();
+            let Some(provider) = profile.split('/').next().filter(|p| !p.is_empty()) else {
+                state.feedback = "Runtime profile must use provider/name format.".to_owned();
+                return Ok(false);
+            };
+            let router = build_runtime_router();
+            let Some(integration) = router.integration(provider) else {
+                state.feedback = format!("Unknown runtime provider '{provider}'.");
+                return Ok(false);
+            };
+            if let Err(error) = integration.resolve_profile(&profile) {
+                state.feedback = format!("Cannot use runtime profile '{profile}': {error}");
+                return Ok(false);
+            }
+            state.active_runtime_provider = provider.to_owned();
+            state.active_profile_id = profile.clone();
+            state.runtime_settings.runtime.default_profile = profile;
+            match state
+                .runtime_settings
+                .save_to_path(&runtime_settings::RuntimeSettings::default_path())
+            {
+                Ok(()) => {
+                    state.feedback = format!("Active runtime profile: {}", state.active_profile_id)
+                }
+                Err(error) => {
+                    state.feedback = format!(
+                        "Runtime selected in memory but could not persist settings: {error}"
+                    )
+                }
             }
         }
-        RelayCommand::RuntimeTest { .. } => state.begin_health_refresh(true),
+        RelayCommand::RuntimeModel { model } => {
+            let provider = state
+                .active_profile_id
+                .split('/')
+                .next()
+                .unwrap_or_default();
+            if let Some(integration) = build_runtime_router().integration(provider) {
+                let catalog = integration.models().await;
+                if !catalog.available_models.is_empty()
+                    && !catalog
+                        .available_models
+                        .iter()
+                        .any(|candidate| candidate.id == model)
+                {
+                    state.feedback =
+                        format!("Model '{model}' is not available from provider '{provider}'.");
+                    return Ok(false);
+                }
+            }
+            let entry = state
+                .runtime_settings
+                .profile_overrides
+                .entry(state.active_profile_id.clone())
+                .or_default();
+            entry.model = Some(model.clone());
+            state.active_model = relay_core::RuntimeModelSelection::Explicit(model.clone());
+            state.feedback = match state
+                .runtime_settings
+                .save_to_path(&runtime_settings::RuntimeSettings::default_path())
+            {
+                Ok(()) => format!("Model selected for {}: {model}", state.active_profile_id),
+                Err(error) => {
+                    format!("Model selected in memory but could not persist settings: {error}")
+                }
+            };
+        }
+        RelayCommand::RuntimeReasoning { effort } => {
+            let parsed = match effort.to_ascii_lowercase().as_str() {
+                "low" => Some(relay_core::ReasoningEffort::Low),
+                "medium" => Some(relay_core::ReasoningEffort::Medium),
+                "high" => Some(relay_core::ReasoningEffort::High),
+                "xhigh" => Some(relay_core::ReasoningEffort::XHigh),
+                _ => None,
+            };
+            let Some(parsed) = parsed else {
+                state.feedback = "Reasoning must be low, medium, high, or xhigh.".to_owned();
+                return Ok(false);
+            };
+            let provider = state
+                .active_profile_id
+                .split('/')
+                .next()
+                .unwrap_or_default();
+            let selected_model = state.active_model.as_option().unwrap_or("default");
+            if let Some(integration) = build_runtime_router().integration(provider) {
+                let catalog = integration.models().await;
+                let effective_model = if selected_model == "default" {
+                    catalog.default_model.as_str()
+                } else {
+                    selected_model
+                };
+                if let Some(model_info) = catalog
+                    .available_models
+                    .iter()
+                    .find(|model| model.id == effective_model)
+                {
+                    if !model_info.supported_reasoning_efforts.is_empty()
+                        && !model_info.supported_reasoning_efforts.contains(&parsed)
+                    {
+                        state.feedback = format!(
+                            "Reasoning '{effort}' is not supported by model '{effective_model}'."
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
+            let entry = state
+                .runtime_settings
+                .profile_overrides
+                .entry(state.active_profile_id.clone())
+                .or_default();
+            entry.reasoning_effort = Some(effort.to_ascii_lowercase());
+            state.active_reasoning_effort = relay_core::RuntimeReasoningSelection::Explicit(parsed);
+            state.feedback = match state
+                .runtime_settings
+                .save_to_path(&runtime_settings::RuntimeSettings::default_path())
+            {
+                Ok(()) => format!(
+                    "Reasoning selected for {}: {effort}",
+                    state.active_profile_id
+                ),
+                Err(error) => {
+                    format!("Reasoning selected in memory but could not persist settings: {error}")
+                }
+            };
+        }
+        RelayCommand::RuntimeTest { provider } => state.begin_provider_health_refresh(provider),
         RelayCommand::Diff { task } => {
             if let Some(t) = task {
                 state.select_task_by_selector(&t);
@@ -1234,7 +1541,7 @@ async fn execute_relay_command(state: &mut AppState, input: &str) -> Result<bool
                 Some(task) => match state.relay.resolve_project(task.project_key.as_str()) {
                     Ok(project) => {
                         match std::process::Command::new("git")
-                            .arg("diff")
+                            .args(["diff", "--no-ext-diff", "--no-color", "--unified=3"])
                             .current_dir(project.local_path())
                             .output()
                         {
@@ -1254,6 +1561,7 @@ async fn execute_relay_command(state: &mut AppState, input: &str) -> Result<bool
                 None => "No task selected.".to_owned(),
             };
             state.diff_output = Some(diff);
+            state.diff_scroll = 0;
             state.screen = Screen::Diff;
         }
         RelayCommand::RuntimeProfile { profile } => {
@@ -1264,6 +1572,7 @@ async fn execute_relay_command(state: &mut AppState, input: &str) -> Result<bool
             if let Some(t) = task {
                 state.select_task_by_selector(&t);
             }
+            state.logs_scroll = 0;
             state.screen = Screen::Logs;
         }
     }
@@ -1390,6 +1699,7 @@ fn activity_home(state: &AppState) -> String {
 fn scheduler_status_text(status: &SchedulerTaskStatus) -> &'static str {
     match status {
         SchedulerTaskStatus::Running => "RUNNING",
+        SchedulerTaskStatus::WaitingPermission => "WAITING FOR PERMISSION",
         SchedulerTaskStatus::QueuedReady => "QUEUED / ready for scheduler",
         SchedulerTaskStatus::QueuedGlobal => "WAITING — global execution slot",
         SchedulerTaskStatus::QueuedProject => "WAITING — project execution slot",
@@ -1416,6 +1726,7 @@ fn task_selection_listing(state: &AppState) -> String {
                 .find(|snapshot| snapshot.task_id == task.id)
                 .map(|snapshot| match snapshot.status {
                     SchedulerTaskStatus::Running => "RUNNING".to_owned(),
+                    SchedulerTaskStatus::WaitingPermission => "WAIT:PERMISSION".to_owned(),
                     SchedulerTaskStatus::QueuedReady => "QUEUED".to_owned(),
                     SchedulerTaskStatus::QueuedGlobal => "WAIT:GLOBAL".to_owned(),
                     SchedulerTaskStatus::QueuedProject => "WAIT:PROJ".to_owned(),
@@ -1623,6 +1934,40 @@ enum AppRuntime {
     Fake(FakeRuntime),
 }
 
+/// Build the single provider router owned by the production scheduler. The
+/// router is intentionally long-lived so a queued execution is dispatched by
+/// its frozen profile rather than by the mutable UI default.
+fn build_runtime_router() -> RuntimeRouter {
+    let mut router = RuntimeRouter::new();
+    #[cfg(test)]
+    {
+        let runtime = Arc::new(FakeRuntime::default());
+        let runtime_dyn: Arc<dyn Runtime> = runtime;
+        router.register(
+            "codex",
+            runtime_dyn.clone(),
+            Arc::new(CodexRuntime::default()),
+        );
+        router.register(
+            "antigravity",
+            runtime_dyn,
+            Arc::new(AntigravityRuntime::default()),
+        );
+    }
+    #[cfg(not(test))]
+    {
+        let codex = Arc::new(CodexRuntime::default());
+        let codex_runtime: Arc<dyn Runtime> = codex.clone();
+        let codex_integration: Arc<dyn RuntimeIntegration> = codex;
+        router.register("codex", codex_runtime, codex_integration);
+        let antigravity = Arc::new(AntigravityRuntime::default());
+        let agy_runtime: Arc<dyn Runtime> = antigravity.clone();
+        let agy_integration: Arc<dyn RuntimeIntegration> = antigravity;
+        router.register("antigravity", agy_runtime, agy_integration);
+    }
+    router
+}
+
 impl Default for AppRuntime {
     fn default() -> Self {
         #[cfg(test)]
@@ -1664,7 +2009,6 @@ impl Runtime for AppRuntime {
     }
 }
 
-#[derive(Debug)]
 struct AppState {
     relay: Relay,
     config_path: PathBuf,
@@ -1673,7 +2017,7 @@ struct AppState {
     store: Option<SqliteStore>,
     durable_tasks: Vec<StoredTask>,
     selected_task: Option<TaskId>,
-    scheduler: Option<Arc<ExecutionScheduler<AppRuntime>>>,
+    scheduler: Option<Arc<ExecutionScheduler<RuntimeRouter>>>,
     runtime_health: CodexRuntimeHealth,
     git_health: ToolHealth,
     github_cli_health: String,
@@ -1682,11 +2026,16 @@ struct AppState {
     active_profile_id: String,
     active_model: relay_core::RuntimeModelSelection,
     active_reasoning_effort: relay_core::RuntimeReasoningSelection,
+    one_run_model_override: Option<String>,
+    one_run_reasoning_override: Option<String>,
     runtime_settings: runtime_settings::RuntimeSettings,
     runtime_detail_provider: Option<String>,
     diff_output: Option<String>,
     diff_scroll: u16,
     logs_scroll: u16,
+    execution_scroll: u16,
+    execution_follow_tail: bool,
+    result_scroll: u16,
     health_refresh: Option<JoinHandle<HealthSnapshot>>,
     command_input: String,
     command_mode: bool,
@@ -1699,6 +2048,7 @@ struct AppState {
         Option<JoinHandle<Result<Vec<ExecutionReport>, relay_core::ExecutionSchedulerError>>>,
     execution_views: HashMap<TaskId, ExecutionViewState>,
     last_reports: HashMap<TaskId, ExecutionReport>,
+    execution_records: HashMap<TaskId, ExecutionRecord>,
     preflight_retry_pending: HashSet<TaskId>,
     scheduler_rebind_pending: bool,
     cancel_confirmation: Option<TaskId>,
@@ -1712,10 +2062,14 @@ struct AppState {
     new_task_option: usize,
     repository_inspections: BTreeMap<ProjectKey, RepositoryInspection>,
     feedback: String,
+    pending_permission: Option<(TaskId, RuntimePermissionRequest)>,
 }
 
 #[derive(Debug, Default)]
 struct ExecutionViewState {
+    frozen_profile: Option<String>,
+    frozen_model: Option<String>,
+    frozen_reasoning: Option<String>,
     scheduler_status: Option<SchedulerTaskStatus>,
     durable_state: Option<TaskState>,
     repair_attempt: u32,
@@ -1765,7 +2119,18 @@ impl AppState {
         self.git_health = ToolHealth::Checking;
         self.github_cli_health = "checking (optional M10 prerequisite)".to_owned();
         let provider = self.active_runtime_provider.clone();
-        self.health_refresh = Some(tokio::spawn(collect_health(provider, full_probe)));
+        self.health_refresh = Some(tokio::spawn(collect_health(provider, full_probe, None)));
+    }
+
+    fn begin_provider_health_refresh(&mut self, provider: String) {
+        if let Some(task) = self.health_refresh.take() {
+            task.abort();
+        }
+        self.health_refresh = Some(tokio::spawn(collect_health(
+            provider.clone(),
+            true,
+            Some(provider),
+        )));
     }
 
     async fn poll_health_refresh(&mut self) {
@@ -1845,6 +2210,11 @@ impl AppState {
     }
 
     fn build_completion_context(&self) -> command_completion::CompletionContext {
+        let codex_available = self.runtime_health.is_ready();
+        let antigravity_available = matches!(
+            self.antigravity_health,
+            AntigravityRuntimeHealth::Available { .. }
+        );
         let providers = vec![
             command_completion::ProviderCompletion {
                 provider_id: "codex".to_owned(),
@@ -1864,48 +2234,54 @@ impl AppState {
                 provider_id: "codex".to_owned(),
                 display_name: "Codex / Implement".to_owned(),
                 description: "Code generation and workspace edits".to_owned(),
-                available: true,
-                disabled_reason: None,
+                available: codex_available,
+                disabled_reason: (!codex_available)
+                    .then(|| self.runtime_health.display_status().to_owned()),
             },
             command_completion::ProfileCompletion {
                 profile_id: "codex/review".to_owned(),
                 provider_id: "codex".to_owned(),
                 display_name: "Codex / Review".to_owned(),
                 description: "Read-only inspection & review".to_owned(),
-                available: true,
-                disabled_reason: None,
+                available: codex_available,
+                disabled_reason: (!codex_available)
+                    .then(|| self.runtime_health.display_status().to_owned()),
             },
             command_completion::ProfileCompletion {
                 profile_id: "codex/deep".to_owned(),
                 provider_id: "codex".to_owned(),
                 display_name: "Codex / Deep".to_owned(),
                 description: "High reasoning effort agent turns".to_owned(),
-                available: true,
-                disabled_reason: None,
+                available: codex_available,
+                disabled_reason: (!codex_available)
+                    .then(|| self.runtime_health.display_status().to_owned()),
             },
             command_completion::ProfileCompletion {
                 profile_id: "antigravity/implement".to_owned(),
                 provider_id: "antigravity".to_owned(),
                 display_name: "Antigravity / Implement".to_owned(),
                 description: "Google Antigravity autonomous edits".to_owned(),
-                available: true,
-                disabled_reason: None,
+                available: antigravity_available,
+                disabled_reason: (!antigravity_available)
+                    .then(|| self.antigravity_health.display_status().to_owned()),
             },
             command_completion::ProfileCompletion {
                 profile_id: "antigravity/review".to_owned(),
                 provider_id: "antigravity".to_owned(),
                 display_name: "Antigravity / Review".to_owned(),
                 description: "Read-only planning & inspection mode".to_owned(),
-                available: true,
-                disabled_reason: None,
+                available: antigravity_available,
+                disabled_reason: (!antigravity_available)
+                    .then(|| self.antigravity_health.display_status().to_owned()),
             },
             command_completion::ProfileCompletion {
                 profile_id: "antigravity/deep".to_owned(),
                 provider_id: "antigravity".to_owned(),
                 display_name: "Antigravity / Deep".to_owned(),
                 description: "High effort agent turns".to_owned(),
-                available: true,
-                disabled_reason: None,
+                available: antigravity_available,
+                disabled_reason: (!antigravity_available)
+                    .then(|| self.antigravity_health.display_status().to_owned()),
             },
         ];
 
@@ -1980,12 +2356,24 @@ impl AppState {
         }
     }
     fn runtime_label(&self) -> String {
-        let identity = AppRuntime::default().identity();
+        self.runtime_label_for_profile(&self.active_profile_id)
+    }
+
+    fn runtime_label_for_profile(&self, profile: &str) -> String {
+        let provider = profile.split('/').next().unwrap_or("codex");
         format!(
             "{}\nProfile: {}\nStatus: {}",
-            identity.display_name,
-            identity.profile_id,
-            self.runtime_health.display_status()
+            if provider == "antigravity" {
+                "Antigravity"
+            } else {
+                "Codex"
+            },
+            profile,
+            if provider == "antigravity" {
+                self.antigravity_health.display_status()
+            } else {
+                self.runtime_health.display_status()
+            }
         )
     }
     #[cfg(test)]
@@ -2010,11 +2398,18 @@ impl AppState {
         durable_tasks: Vec<StoredTask>,
         feedback: String,
     ) -> Self {
+        let runtime_settings = runtime_settings::RuntimeSettings::load_from_path(
+            &runtime_settings::RuntimeSettings::default_path(),
+        )
+        .unwrap_or_default();
+        let default_profile = runtime_settings.runtime.default_profile.clone();
         let scheduler = store.as_ref().map(|store| {
+            let mut router = build_runtime_router();
+            router.set_default_profile(default_profile.clone());
             Arc::new(ExecutionScheduler::new(
                 relay.clone(),
                 store.clone(),
-                Arc::new(AppRuntime::default()),
+                Arc::new(router),
                 app_execution_limits(),
             ))
         });
@@ -2032,18 +2427,24 @@ impl AppState {
             git_health: ToolHealth::Checking,
             github_cli_health: "not checked (optional M10 prerequisite)".to_owned(),
             antigravity_health: AntigravityRuntimeHealth::Checking,
-            active_runtime_provider: "codex".to_owned(),
-            active_profile_id: "codex/implement".to_owned(),
+            active_runtime_provider: default_profile
+                .split('/')
+                .next()
+                .unwrap_or("codex")
+                .to_owned(),
+            active_profile_id: default_profile,
             active_model: relay_core::RuntimeModelSelection::ProviderDefault,
             active_reasoning_effort: relay_core::RuntimeReasoningSelection::ProfileDefault,
-            runtime_settings: runtime_settings::RuntimeSettings::load_from_path(
-                &runtime_settings::RuntimeSettings::default_path(),
-            )
-            .unwrap_or_default(),
+            one_run_model_override: None,
+            one_run_reasoning_override: None,
+            runtime_settings,
             runtime_detail_provider: None,
             diff_output: None,
             diff_scroll: 0,
             logs_scroll: 0,
+            execution_scroll: 0,
+            execution_follow_tail: true,
+            result_scroll: 0,
             health_refresh: None,
             command_input: String::new(),
             command_mode: false,
@@ -2054,6 +2455,7 @@ impl AppState {
             scheduler_driver: None,
             execution_views: HashMap::new(),
             last_reports: HashMap::new(),
+            execution_records: HashMap::new(),
             preflight_retry_pending: HashSet::new(),
             scheduler_rebind_pending: false,
             cancel_confirmation: None,
@@ -2067,6 +2469,7 @@ impl AppState {
             new_task_option: 0,
             repository_inspections: BTreeMap::new(),
             feedback,
+            pending_permission: None,
         }
     }
 
@@ -2076,10 +2479,6 @@ impl AppState {
         } else if self.screen == Screen::PasteTask {
             self.paste_text.push_str(text);
         }
-    }
-
-    fn has_active_execution(&self) -> bool {
-        self.scheduler_driver.is_some() || matches!(self.screen, Screen::Execution)
     }
 
     pub fn input_context(&self) -> events::InputContext {
@@ -2165,11 +2564,14 @@ impl AppState {
             .iter()
             .any(|snapshot| snapshot.task_id == task.id);
         self.screen = if active {
+            self.execution_scroll = 0;
+            self.execution_follow_tail = true;
             Screen::Execution
         } else if matches!(
             task.state,
             TaskState::Done | TaskState::Failed | TaskState::Cancelled
         ) {
+            self.result_scroll = 0;
             Screen::Result
         } else {
             Screen::TaskReview
@@ -2183,14 +2585,21 @@ impl AppState {
         if self.scheduler.is_none() {
             return "unavailable: local runtime or store is unavailable".to_owned();
         }
-        if !self.runtime_health.is_ready() {
-            return format!("unavailable: {}", self.runtime_health.display_status());
+        let provider = self.active_profile_id.split('/').next().unwrap_or_default();
+        let health_ready = match provider {
+            "codex" => self.runtime_health.is_ready(),
+            "antigravity" => matches!(
+                self.antigravity_health,
+                AntigravityRuntimeHealth::Available { .. }
+            ),
+            _ => false,
+        };
+        if !health_ready {
+            return format!("unavailable: runtime provider '{provider}' is not ready");
         }
         match self.effective_stack(task) {
-            Ok("chatgpt-codex") => {}
-            Ok(stack) => {
-                return format!("unavailable: unsupported runtime stack '{stack}'");
-            }
+            Ok("chatgpt-codex" | "codex" | "antigravity" | "agy") => {}
+            Ok(stack) => return format!("unavailable: unsupported runtime stack '{stack}'"),
             Err(error) => return format!("unavailable: {error}"),
         }
         if !task.handoff.extensions.is_empty() {
@@ -2264,19 +2673,104 @@ impl AppState {
             scheduler.limits().max_duration,
         );
         let max_repair_attempts = std::cmp::min(2, scheduler.limits().max_repair_attempts);
+        let one_run_effort = match self.one_run_reasoning_override.as_deref() {
+            None => None,
+            Some("low") => Some(relay_core::ReasoningEffort::Low),
+            Some("medium") => Some(relay_core::ReasoningEffort::Medium),
+            Some("high") => Some(relay_core::ReasoningEffort::High),
+            Some("xhigh") => Some(relay_core::ReasoningEffort::XHigh),
+            Some(other) => {
+                self.feedback = format!("Unsupported one-run reasoning effort '{other}'.");
+                self.one_run_reasoning_override = None;
+                return;
+            }
+        };
+        let one_run_model = self
+            .one_run_model_override
+            .as_deref()
+            .filter(|model| *model != "default")
+            .map(str::to_owned);
+        if one_run_model.is_some() || one_run_effort.is_some() {
+            let provider = self.active_profile_id.split('/').next().unwrap_or_default();
+            if let Some(integration) = build_runtime_router().integration(provider) {
+                let catalog = integration.models().await;
+                if let Some(model) = one_run_model.as_deref()
+                    && !catalog.available_models.is_empty()
+                    && !catalog
+                        .available_models
+                        .iter()
+                        .any(|candidate| candidate.id == model)
+                {
+                    self.feedback = format!(
+                        "One-run model '{model}' is not available from provider '{provider}'."
+                    );
+                    return;
+                }
+                if let Some(effort) = one_run_effort {
+                    let model_id = one_run_model
+                        .as_deref()
+                        .unwrap_or(catalog.default_model.as_str());
+                    if let Some(model_info) = catalog
+                        .available_models
+                        .iter()
+                        .find(|model| model.id == model_id)
+                        && !model_info.supported_reasoning_efforts.is_empty()
+                        && !model_info.supported_reasoning_efforts.contains(&effort)
+                    {
+                        self.feedback = format!(
+                            "One-run reasoning '{:?}' is not supported by model '{model_id}'.",
+                            effort
+                        );
+                        return;
+                    }
+                }
+            }
+        }
         let selection = self.runtime_settings.resolve_selection(
             Some(task.project_key.as_str()),
             Some(&self.active_profile_id),
-            self.active_model.as_option(),
-            self.active_reasoning_effort.as_option(),
+            one_run_model.as_deref().or(self.active_model.as_option()),
+            one_run_effort.or(self.active_reasoning_effort.as_option()),
         );
+        let permission_envelope = build_runtime_router()
+            .integration(selection.profile_id.split('/').next().unwrap_or_default())
+            .and_then(|integration| integration.resolve_profile(&selection.profile_id).ok())
+            .map(|effective| relay_runtime::RuntimePermissionEnvelope {
+                trusted_workspace: None,
+                workspace_write: matches!(
+                    effective.profile.filesystem,
+                    relay_runtime::FilesystemCapability::WorkspaceWrite
+                ),
+                network: effective.profile.network,
+                additional_writable_roots: effective.profile.extra_writable_roots,
+            })
+            .unwrap_or_default();
         let policy = relay_core::ExecutionRunPolicy {
             runtime_selection: selection,
+            permission_envelope,
             max_duration,
             max_repair_attempts,
         };
+        self.execution_views
+            .entry(task.id)
+            .or_default()
+            .frozen_profile = Some(policy.runtime_selection.profile_id.clone());
+        if let Some(view) = self.execution_views.get_mut(&task.id) {
+            view.frozen_model = policy
+                .runtime_selection
+                .model
+                .as_option()
+                .map(str::to_owned);
+            view.frozen_reasoning = policy
+                .runtime_selection
+                .reasoning_effort
+                .as_option()
+                .map(|e| format!("{e:?}"));
+        }
         match scheduler.submit_with_policy(task.id, policy).await {
             Ok(()) => {
+                self.one_run_model_override = None;
+                self.one_run_reasoning_override = None;
                 self.execution_views
                     .entry(task.id)
                     .or_default()
@@ -2311,12 +2805,68 @@ impl AppState {
     async fn refresh_durable_tasks(&mut self) {
         if let Some(store) = &self.store {
             match list_stored_tasks(store).await {
-                Ok(tasks) => self.durable_tasks = tasks,
+                Ok(tasks) => {
+                    self.durable_tasks = tasks.clone();
+                    self.execution_records.clear();
+                    for task in tasks {
+                        if let Ok(records) =
+                            store.list_executions_for_task(&task.id.to_string()).await
+                        {
+                            if let Some(record) = records
+                                .into_iter()
+                                .max_by(|a, b| a.started_at.cmp(&b.started_at))
+                            {
+                                self.execution_records.insert(task.id, record);
+                            }
+                        }
+                    }
+                }
                 Err(error) => {
                     self.feedback = format!("Could not refresh durable task state: {error}")
                 }
             }
         }
+    }
+
+    fn execution_profile(&self, task_id: TaskId) -> Option<String> {
+        self.execution_views
+            .get(&task_id)
+            .and_then(|v| v.frozen_profile.clone())
+            .or_else(|| {
+                self.execution_records
+                    .get(&task_id)
+                    .map(|r| r.runtime_profile.clone())
+            })
+    }
+
+    fn execution_model(&self, task_id: TaskId) -> Option<String> {
+        self.execution_views
+            .get(&task_id)
+            .and_then(|v| v.frozen_model.clone())
+            .or_else(|| {
+                self.execution_records
+                    .get(&task_id)
+                    .and_then(|r| r.runtime_metadata_json.as_deref())
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                    .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_owned))
+            })
+    }
+
+    fn execution_reasoning(&self, task_id: TaskId) -> Option<String> {
+        self.execution_views
+            .get(&task_id)
+            .and_then(|v| v.frozen_reasoning.clone())
+            .or_else(|| {
+                self.execution_records
+                    .get(&task_id)
+                    .and_then(|r| r.runtime_metadata_json.as_deref())
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                    .and_then(|v| {
+                        v.get("reasoning_effort")
+                            .and_then(|m| m.as_str())
+                            .map(str::to_owned)
+                    })
+            })
     }
 
     fn clear_preflight_retry_state(&mut self) {
@@ -2339,7 +2889,11 @@ impl AppState {
         let scheduler = Arc::new(ExecutionScheduler::new(
             self.relay.clone(),
             store.clone(),
-            Arc::new(AppRuntime::default()),
+            Arc::new({
+                let mut router = build_runtime_router();
+                router.set_default_profile(self.active_profile_id.clone());
+                router
+            }),
             app_execution_limits(),
         ));
         self.scheduler_events = Some(scheduler.subscribe());
@@ -2368,13 +2922,16 @@ impl AppState {
         self.refresh_durable_tasks().await;
     }
 
-    async fn ensure_scheduler_driver(&mut self, scheduler: Arc<ExecutionScheduler<AppRuntime>>) {
+    async fn ensure_scheduler_driver(&mut self, scheduler: Arc<ExecutionScheduler<RuntimeRouter>>) {
         self.reap_finished_scheduler_driver().await;
         self.scheduler_snapshot = scheduler.snapshot().await;
         self.start_scheduler_driver_if_queued(scheduler);
     }
 
-    fn start_scheduler_driver_if_queued(&mut self, scheduler: Arc<ExecutionScheduler<AppRuntime>>) {
+    fn start_scheduler_driver_if_queued(
+        &mut self,
+        scheduler: Arc<ExecutionScheduler<RuntimeRouter>>,
+    ) {
         let has_queued_work = self.scheduler_snapshot.tasks.iter().any(|task| {
             matches!(
                 task.status,
@@ -2462,6 +3019,20 @@ impl AppState {
                 bytes,
                 ..
             } => self.append_output(task_id, stream, &bytes),
+            CoreExecutionEvent::RuntimeActivity {
+                task_id, activity, ..
+            } => {
+                self.append_activity(task_id, &activity);
+            }
+            CoreExecutionEvent::PermissionRequested {
+                task_id, request, ..
+            } => {
+                let view = self.execution_views.entry(task_id).or_default();
+                view.scheduler_status = Some(SchedulerTaskStatus::WaitingPermission);
+                self.feedback = format!("Permission requested: {:?}", request.kind);
+                self.pending_permission = Some((task_id, request));
+                return true;
+            }
             CoreExecutionEvent::VerificationStarted { task_id, .. } => {
                 self.execution_views
                     .entry(task_id)
@@ -2552,6 +3123,86 @@ impl AppState {
                 break;
             }
         }
+        if self.execution_follow_tail {
+            self.execution_scroll = u16::MAX;
+        }
+    }
+
+    fn append_activity(&mut self, task_id: TaskId, activity: &RuntimeActivity) {
+        let line = match activity {
+            RuntimeActivity::SessionStarted => "session started".to_owned(),
+            RuntimeActivity::Analyzing { description } => format!("analyzing: {description}"),
+            RuntimeActivity::FileRead { path, lines_read } => format!(
+                "read {}{}",
+                path.display(),
+                lines_read
+                    .map(|lines| format!(" ({lines} lines)"))
+                    .unwrap_or_default()
+            ),
+            RuntimeActivity::CommandStarted {
+                logical_command,
+                working_directory,
+                ..
+            } => format!(
+                "$ {logical_command}{}",
+                working_directory
+                    .as_ref()
+                    .map(|cwd| format!("  (cwd {})", self.concise_activity_path(task_id, cwd)))
+                    .unwrap_or_default()
+            ),
+            RuntimeActivity::CommandProgress { progress_line, .. } => progress_line.clone(),
+            RuntimeActivity::CommandCompleted {
+                logical_command,
+                success,
+                exit_code,
+                ..
+            } => format!(
+                "{} {logical_command}{}",
+                if *success { "✓" } else { "×" },
+                exit_code
+                    .map(|code| format!(" (exit {code})"))
+                    .unwrap_or_default()
+            ),
+            RuntimeActivity::FileChanged { path, change_kind } => {
+                format!(
+                    "{} {}",
+                    change_kind.marker(),
+                    self.concise_activity_path(task_id, path)
+                )
+            }
+            RuntimeActivity::VerificationStarted { description } => {
+                format!("verify: {description}")
+            }
+            RuntimeActivity::VerificationProgress { detail, .. } => detail.clone(),
+            RuntimeActivity::VerificationCompleted {
+                description,
+                passed,
+            } => format!("{} {description}", if *passed { "✓" } else { "×" }),
+            RuntimeActivity::AgentMessage { message } => match message.format {
+                relay_runtime::RuntimeTextFormat::Markdown => markdown::render(&message.content),
+                relay_runtime::RuntimeTextFormat::Plain => message.content.clone(),
+            },
+            RuntimeActivity::Warning { message } => format!("warning: {message}"),
+            RuntimeActivity::ProviderDiagnostic { message } => format!("diagnostic: {message}"),
+        };
+        self.append_output(
+            task_id,
+            RuntimeOutputStream::Stdout,
+            format!("{line}\n").as_bytes(),
+        );
+    }
+
+    fn concise_activity_path(&self, task_id: TaskId, path: &std::path::Path) -> String {
+        let Some(task) = self.durable_tasks.iter().find(|task| task.id == task_id) else {
+            return path.display().to_string();
+        };
+        let Ok(project) = self.relay.resolve_project(task.project_key.as_str()) else {
+            return path.display().to_string();
+        };
+        path.strip_prefix(project.local_path())
+            .unwrap_or(path)
+            .display()
+            .to_string()
     }
 
     fn refresh_repository_inspections(&mut self) {

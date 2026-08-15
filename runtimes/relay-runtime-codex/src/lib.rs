@@ -3,6 +3,8 @@
 //! All executable selection is trusted local configuration. Task content is
 //! supplied only on stdin and is never interpreted as shell syntax.
 
+pub mod app_server;
+
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
 use std::{
@@ -16,17 +18,18 @@ use std::{
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 use relay_runtime::{
-    CancellationToken, CapabilityStatus, EffectiveRuntimeProfile, FilesystemCapability,
-    ReasoningEffort, Runtime, RuntimeAction, RuntimeCapabilities, RuntimeCapabilityContext,
-    RuntimeCapabilityReport, RuntimeConfigError, RuntimeDescriptor, RuntimeError, RuntimeEvent,
-    RuntimeIdentity, RuntimeIntegration, RuntimeModelCatalog, RuntimeModelInfo, RuntimeOutcome,
-    RuntimeOutcomeKind, RuntimeOutputStream, RuntimeProbe, RuntimeProfile,
-    RuntimeProfileDescriptor, RuntimeRequest, RuntimeSession, RuntimeStartFuture,
+    CancellationToken, CapabilityStatus, EffectiveRuntimeProfile, FileChangeKind,
+    FilesystemCapability, ReasoningEffort, Runtime, RuntimeAction, RuntimeActivity,
+    RuntimeCapabilities, RuntimeCapabilityContext, RuntimeCapabilityReport, RuntimeConfigError,
+    RuntimeDescriptor, RuntimeError, RuntimeEvent, RuntimeIdentity, RuntimeIntegration,
+    RuntimeModelCatalog, RuntimeModelInfo, RuntimeOutcome, RuntimeOutcomeKind, RuntimeOutputStream,
+    RuntimeProbe, RuntimeProfile, RuntimeProfileDescriptor, RuntimeRequest, RuntimeSession,
+    RuntimeStartFuture, RuntimeText, RuntimeTextFormat,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
     sync::mpsc,
     time::timeout,
@@ -186,6 +189,27 @@ impl CodexRuntime {
         }
     }
 
+    async fn discover_account_identity(&self) -> Option<String> {
+        let executable = self.resolve_executable().ok()?;
+        let output = discover_command(&executable, &["login", "status"])
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        text.lines()
+            .map(str::trim)
+            .find(|line| line.contains('@'))
+            .map(str::to_owned)
+    }
+
+    /// Read a provider-owned app-server diagnostic without starting an agent turn.
+    pub async fn app_server_read(&self, method: &str) -> Result<Value, String> {
+        let executable = self.resolve_executable()?;
+        query_app_server(&executable, method, serde_json::json!({})).await
+    }
+
     pub fn command_spec(
         &self,
         request: &RuntimeRequest,
@@ -301,6 +325,7 @@ impl RuntimeIntegration for CodexRuntime {
             display_name: "Codex CLI".to_owned(),
             description: "Native Codex CLI execution adapter".to_owned(),
             is_development_only: false,
+            machine_interface_verified: true,
         }
     }
 
@@ -315,7 +340,7 @@ impl RuntimeIntegration for CodexRuntime {
                     version: Some(version),
                     authenticated: true,
                     compatible: true,
-                    account_identity: None,
+                    account_identity: self.discover_account_identity().await,
                     notes: vec!["Codex available and authenticated".to_owned()],
                 },
                 CodexRuntimeHealth::NotAuthenticated { version, error } => RuntimeProbe {
@@ -378,23 +403,22 @@ impl RuntimeIntegration for CodexRuntime {
     fn models(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RuntimeModelCatalog> + Send + '_>> {
+        let runtime = self.clone();
         Box::pin(async move {
+            if env::var("RELAY_CODEX_TRANSPORT").as_deref() == Ok("app-server") {
+                if let Ok(executable) = runtime.resolve_executable() {
+                    if let Ok(catalog) = discover_app_server_models(&executable).await {
+                        return catalog;
+                    }
+                }
+            }
             RuntimeModelCatalog {
                 default_model: "default".to_owned(),
-                available_models: vec![
-                    RuntimeModelInfo {
-                        id: "default".to_owned(),
-                        display_name: "Default (Account/CLI Setting)".to_owned(),
-                    },
-                    RuntimeModelInfo {
-                        id: "o3".to_owned(),
-                        display_name: "o3".to_owned(),
-                    },
-                    RuntimeModelInfo {
-                        id: "o3-mini".to_owned(),
-                        display_name: "o3-mini".to_owned(),
-                    },
-                ],
+                available_models: vec![RuntimeModelInfo {
+                    id: "default".to_owned(),
+                    display_name: "Default (Account/CLI Setting)".to_owned(),
+                    supported_reasoning_efforts: vec![],
+                }],
             }
         })
     }
@@ -509,6 +533,12 @@ impl Runtime for CodexRuntime {
             streaming_output: true,
             cancellation: true,
             deterministic_outcome: true,
+            permission_support: if env::var("RELAY_CODEX_TRANSPORT").as_deref() == Ok("app-server")
+            {
+                relay_runtime::RuntimePermissionSupport::LiveApproval
+            } else {
+                relay_runtime::RuntimePermissionSupport::PreapprovedOnly
+            },
         }
     }
 
@@ -519,6 +549,9 @@ impl Runtime for CodexRuntime {
     ) -> RuntimeStartFuture {
         let runtime = self.clone();
         Box::pin(async move {
+            if env::var("RELAY_CODEX_TRANSPORT").as_deref() == Ok("app-server") {
+                return start_app_server(runtime, request, cancellation).await;
+            }
             if cancellation.is_cancelled() {
                 return Err(RuntimeError::StartFailed(
                     "execution cancelled before Codex start".to_owned(),
@@ -588,9 +621,405 @@ impl Runtime for CodexRuntime {
             Ok(RuntimeSession {
                 session_id: format!("codex-{}", request.execution_id),
                 events: rx,
+                control: None,
             })
         })
     }
+}
+
+async fn start_app_server(
+    runtime: CodexRuntime,
+    request: RuntimeRequest,
+    cancellation: CancellationToken,
+) -> Result<RuntimeSession, RuntimeError> {
+    let executable = runtime
+        .resolve_executable()
+        .map_err(RuntimeError::StartFailed)?;
+    let mut command = launcher_command(
+        &executable,
+        &[
+            "app-server".to_owned(),
+            "--listen".to_owned(),
+            "stdio://".to_owned(),
+        ],
+    );
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    sanitize_git_environment(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|e| RuntimeError::StartFailed(format!("could not start Codex app-server: {e}")))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| RuntimeError::StartFailed("app-server stdin unavailable".to_owned()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| RuntimeError::StartFailed("app-server stdout unavailable".to_owned()))?;
+    let (tx, rx) = mpsc::channel(64);
+    let (control_tx, mut control_rx) = mpsc::channel(16);
+    let cwd = request.trusted_working_dir.clone();
+    let prompt = build_prompt(&request);
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stdout).lines();
+        let mut next_id = 1_u64;
+        if write_rpc(
+            &mut stdin,
+            next_id,
+            "initialize",
+            app_server::initialize_params(env!("CARGO_PKG_VERSION")),
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
+        next_id += 1;
+        if read_rpc_response(&mut reader, next_id - 1).await.is_err() {
+            let _ = tx
+                .send(RuntimeEvent::InvalidOutput {
+                    reason: "Codex app-server initialize failed".to_owned(),
+                })
+                .await;
+            return;
+        }
+        let _ = stdin
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}\n")
+            .await;
+        next_id += 1;
+        if write_rpc(
+            &mut stdin,
+            next_id,
+            "configRequirements/read",
+            serde_json::json!({}),
+        )
+        .await
+        .is_err()
+        {
+            let _ = tx
+                .send(RuntimeEvent::InvalidOutput {
+                    reason: "Codex app-server config requirements probe failed".to_owned(),
+                })
+                .await;
+            terminate_process_tree(&mut child).await;
+            return;
+        }
+        let requirements = match read_rpc_response(&mut reader, next_id).await {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = tx
+                    .send(RuntimeEvent::InvalidOutput {
+                        reason: format!("Codex managed configuration could not be read: {error}"),
+                    })
+                    .await;
+                terminate_process_tree(&mut child).await;
+                return;
+            }
+        };
+        let sandbox_name = if request.profile_id.ends_with("/review") {
+            "readOnly"
+        } else {
+            "workspaceWrite"
+        };
+        if let Some(modes) = requirements
+            .pointer("/result/allowedSandboxModes")
+            .and_then(Value::as_array)
+            && !modes
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|mode| mode.eq_ignore_ascii_case(sandbox_name))
+        {
+            let _ = tx.send(RuntimeEvent::InvalidOutput { reason: format!("Relay profile is incompatible with managed sandbox requirements ({sandbox_name})") }).await;
+            terminate_process_tree(&mut child).await;
+            return;
+        }
+        if write_rpc(
+            &mut stdin,
+            next_id,
+            "thread/start",
+            app_server::thread_start_params(&cwd),
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
+        let thread_response = match read_rpc_response(&mut reader, next_id).await {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = tx
+                    .send(RuntimeEvent::InvalidOutput {
+                        reason: format!("Codex app-server thread/start failed: {error}"),
+                    })
+                    .await;
+                return;
+            }
+        };
+        let thread_id = thread_response
+            .pointer("/result/thread/id")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                thread_response
+                    .pointer("/result/id")
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("")
+            .to_owned();
+        if thread_id.is_empty() {
+            let _ = tx
+                .send(RuntimeEvent::InvalidOutput {
+                    reason: "Codex app-server returned no thread id".to_owned(),
+                })
+                .await;
+            return;
+        }
+        next_id += 1;
+        let sandbox_policy = if request.profile_id.ends_with("/review") {
+            serde_json::json!({"type":"readOnly"})
+        } else {
+            serde_json::json!({"type":"workspaceWrite", "writableRoots":[cwd], "networkAccess":false})
+        };
+        if write_rpc(&mut stdin, next_id, "turn/start", serde_json::json!({"threadId":thread_id, "input":prompt, "cwd":cwd, "model":request.runtime_selection.model.as_option(), "effort":request.runtime_selection.reasoning_effort.as_option().map(|e| format!("{e:?}")), "sandboxPolicy":sandbox_policy})).await.is_err() { return; }
+        loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => { let _ = write_rpc(&mut stdin, next_id, "turn/interrupt", serde_json::json!({"threadId":thread_id})).await; break; }
+                Some(control) = control_rx.recv() => {
+                    if let relay_runtime::RuntimeControl::PermissionDecision { request_id, decision } = control {
+                        if let Ok(id) = request_id.parse::<u64>() {
+                            let decision = match decision {
+                                relay_runtime::RuntimePermissionDecision::AllowOnce => "accept",
+                                relay_runtime::RuntimePermissionDecision::AllowForRun => "acceptForSession",
+                                relay_runtime::RuntimePermissionDecision::Deny => "decline",
+                                relay_runtime::RuntimePermissionDecision::Cancel => "cancel",
+                            };
+                            if let Ok(line) = app_server::encode_response(id, serde_json::json!({"decision": decision})) {
+                                let _ = stdin.write_all(&line).await;
+                            }
+                        }
+                    }
+                }
+                line = reader.next_line() => {
+                    let Ok(Some(line)) = line else { break; };
+                    let Ok(value) = serde_json::from_str::<Value>(&line) else { let _ = tx.send(RuntimeEvent::InvalidOutput { reason: "invalid app-server JSONL".to_owned() }).await; break; };
+                    if let Some(activity) = normalize_codex_activity(&value) {
+                        let _ = tx.send(RuntimeEvent::Activity(activity)).await;
+                    }
+                    let kind = value.get("method").or_else(|| value.get("type")).and_then(Value::as_str).unwrap_or("");
+                    if kind.contains("requestApproval") {
+                        let request_id = value.get("id").and_then(Value::as_u64).map(|id| id.to_string()).unwrap_or_else(|| "unknown".to_owned());
+                        let permission_kind = if kind.contains("commandExecution") { relay_runtime::RuntimePermissionKind::CommandExecution } else if kind.contains("fileChange") { relay_runtime::RuntimePermissionKind::FileChange } else { relay_runtime::RuntimePermissionKind::Permissions };
+                        let params = value.get("params");
+                        let command = params.and_then(|p| p.get("command")).and_then(Value::as_str).map(str::to_owned);
+                        let requested = relay_runtime::RuntimeRequestedPermissions {
+                            workspace_write: permission_kind == relay_runtime::RuntimePermissionKind::FileChange,
+                            network: params.and_then(|p| p.get("networkApprovalContext")).is_some(),
+                            paths: params.and_then(|p| p.get("fileChange")).and_then(|p| p.get("paths")).and_then(Value::as_array).map(|paths| paths.iter().filter_map(Value::as_str).map(PathBuf::from).collect()).unwrap_or_default(),
+                        };
+                        let _ = tx.send(RuntimeEvent::PermissionRequested(relay_runtime::RuntimePermissionRequest {
+                            request_id,
+                            kind: permission_kind,
+                            reason: params.and_then(|p| p.get("reason")).and_then(Value::as_str).map(str::to_owned),
+                            command,
+                            cwd: Some(cwd.clone()),
+                            requested,
+                            available_decisions: vec![
+                                relay_runtime::RuntimePermissionDecisionKind::AllowOnce,
+                                relay_runtime::RuntimePermissionDecisionKind::AllowForRun,
+                                relay_runtime::RuntimePermissionDecisionKind::Deny,
+                                relay_runtime::RuntimePermissionDecisionKind::Cancel,
+                            ],
+                        })).await;
+                    } else if kind == "turn/completed" || kind == "result" {
+                        let summary = value.get("params").and_then(|p| p.get("summary")).and_then(Value::as_str).unwrap_or("Codex app-server turn completed");
+                        let _ = tx.send(RuntimeEvent::Outcome(RuntimeOutcome::new(RuntimeOutcomeKind::Success, summary))).await; break;
+                    } else if let Some(text) = value.get("text").and_then(Value::as_str).or_else(|| value.get("delta").and_then(Value::as_str)) {
+                        let _ = tx.send(RuntimeEvent::Output { stream: RuntimeOutputStream::Stdout, bytes: format!("{text}\n").into_bytes() }).await;
+                    }
+                }
+            }
+        }
+        terminate_process_tree(&mut child).await;
+    });
+    Ok(RuntimeSession {
+        session_id: format!("codex-app-server-{}", request.execution_id),
+        events: rx,
+        control: Some(control_tx),
+    })
+}
+
+async fn write_rpc(
+    stdin: &mut tokio::process::ChildStdin,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> Result<(), String> {
+    let line = app_server::encode_request(id, method, params).map_err(|e| e.to_string())?;
+    stdin.write_all(&line).await.map_err(|e| e.to_string())
+}
+
+async fn read_rpc_response<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut tokio::io::Lines<R>,
+    expected_id: u64,
+) -> Result<Value, String> {
+    loop {
+        let line = tokio::time::timeout(Duration::from_secs(15), reader.next_line())
+            .await
+            .map_err(|_| "app-server response timed out".to_owned())?
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "app-server closed before response".to_owned())?;
+        let value: Value = serde_json::from_str(&line).map_err(|error| error.to_string())?;
+        if value.get("id").and_then(Value::as_u64) == Some(expected_id) {
+            if let Some(error) = value.get("error") {
+                return Err(error.to_string());
+            }
+            return Ok(value);
+        }
+    }
+}
+
+async fn query_app_server(executable: &Path, method: &str, params: Value) -> Result<Value, String> {
+    let mut command = launcher_command(
+        executable,
+        &[
+            "app-server".to_owned(),
+            "--listen".to_owned(),
+            "stdio://".to_owned(),
+        ],
+    );
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "app-server stdin unavailable".to_owned())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "app-server stdout unavailable".to_owned())?;
+    let mut reader = BufReader::new(stdout).lines();
+    write_rpc(
+        &mut stdin,
+        1,
+        "initialize",
+        app_server::initialize_params(env!("CARGO_PKG_VERSION")),
+    )
+    .await?;
+    let _ = read_rpc_response(&mut reader, 1).await?;
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}\n")
+        .await
+        .map_err(|error| error.to_string())?;
+    write_rpc(&mut stdin, 2, method, params).await?;
+    let result = read_rpc_response(&mut reader, 2).await?;
+    terminate_process_tree(&mut child).await;
+    Ok(result.get("result").cloned().unwrap_or(Value::Null))
+}
+
+async fn discover_app_server_models(executable: &Path) -> Result<RuntimeModelCatalog, String> {
+    let mut command = launcher_command(
+        executable,
+        &[
+            "app-server".to_owned(),
+            "--listen".to_owned(),
+            "stdio://".to_owned(),
+        ],
+    );
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "model probe stdin unavailable".to_owned())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "model probe stdout unavailable".to_owned())?;
+    let mut reader = BufReader::new(stdout).lines();
+    write_rpc(
+        &mut stdin,
+        1,
+        "initialize",
+        app_server::initialize_params(env!("CARGO_PKG_VERSION")),
+    )
+    .await?;
+    let _ = read_rpc_response(&mut reader, 1).await?;
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}\n")
+        .await
+        .map_err(|e| e.to_string())?;
+    write_rpc(&mut stdin, 2, "model/list", serde_json::json!({})).await?;
+    let response = read_rpc_response(&mut reader, 2).await?;
+    let models = response
+        .pointer("/result/models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "model/list returned no models".to_owned())?;
+    let mut available_models = Vec::new();
+    let mut default_model = "default".to_owned();
+    for model in models {
+        if model
+            .get("hidden")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(id) = model.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let display_name = model
+            .get("displayName")
+            .and_then(Value::as_str)
+            .unwrap_or(id);
+        if model
+            .get("isDefault")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            default_model = id.to_owned();
+        }
+        let supported_reasoning_efforts = model
+            .get("supportedReasoningEfforts")
+            .and_then(Value::as_array)
+            .map(|efforts| {
+                efforts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter_map(|effort| match effort {
+                        "low" => Some(ReasoningEffort::Low),
+                        "medium" => Some(ReasoningEffort::Medium),
+                        "high" => Some(ReasoningEffort::High),
+                        "xhigh" => Some(ReasoningEffort::XHigh),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        available_models.push(RuntimeModelInfo {
+            id: id.to_owned(),
+            display_name: display_name.to_owned(),
+            supported_reasoning_efforts,
+        });
+    }
+    let _ = child.kill().await;
+    if available_models.is_empty() {
+        return Err("model/list returned no visible models".to_owned());
+    }
+    Ok(RuntimeModelCatalog {
+        default_model,
+        available_models,
+    })
 }
 
 async fn terminate_process_tree(child: &mut tokio::process::Child) {
@@ -731,6 +1160,7 @@ struct StreamState {
 
 const EVENT_OUTPUT_BYTE_LIMIT: usize = 2 * 1024;
 
+#[allow(dead_code)]
 fn render_codex_json_event(event: &Value) -> Option<Vec<u8>> {
     let kind = event.get("type")?.as_str()?;
     let text = match kind {
@@ -751,6 +1181,78 @@ fn render_codex_json_event(event: &Value) -> Option<Vec<u8>> {
     Some(format!("{text}\n").into_bytes())
 }
 
+fn normalize_codex_activity(event: &Value) -> Option<RuntimeActivity> {
+    let kind = event
+        .get("type")
+        .or_else(|| event.get("method"))
+        .and_then(Value::as_str)?;
+    let item = event.get("item").or_else(|| event.pointer("/params/item"));
+    match kind {
+        "thread.started" | "thread/started" => Some(RuntimeActivity::SessionStarted),
+        "turn.started" | "turn/started" => Some(RuntimeActivity::Analyzing {
+            description: "Codex is analyzing the task".to_owned(),
+        }),
+        "item.started" | "item/started" => {
+            let item = item?;
+            match item.get("type")?.as_str()? {
+                "command_execution" => Some(RuntimeActivity::CommandStarted {
+                    logical_command: item
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or("command")
+                        .to_owned(),
+                    raw_command: None,
+                    working_directory: item.get("cwd").and_then(Value::as_str).map(PathBuf::from),
+                }),
+                "agent_message" => Some(RuntimeActivity::AgentMessage {
+                    message: RuntimeText {
+                        content: bounded_event_text(
+                            item.get("text").and_then(Value::as_str).unwrap_or_default(),
+                        ),
+                        format: RuntimeTextFormat::Markdown,
+                    },
+                }),
+                _ => None,
+            }
+        }
+        "item.completed" | "item/completed" => {
+            let item = item?;
+            match item.get("type")?.as_str()? {
+                "command_execution" => Some(RuntimeActivity::CommandCompleted {
+                    logical_command: item
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or("command")
+                        .to_owned(),
+                    success: item.get("exit_code").and_then(Value::as_i64) == Some(0),
+                    exit_code: item
+                        .get("exit_code")
+                        .and_then(Value::as_i64)
+                        .and_then(|code| i32::try_from(code).ok()),
+                    working_directory: item.get("cwd").and_then(Value::as_str).map(PathBuf::from),
+                }),
+                "file_change" => {
+                    let change = item.get("changes").and_then(Value::as_array)?.first()?;
+                    let path = PathBuf::from(change.get("path").and_then(Value::as_str)?);
+                    let change_kind = match change
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("modified")
+                    {
+                        "add" | "added" => FileChangeKind::Added,
+                        "delete" | "deleted" => FileChangeKind::Deleted,
+                        _ => FileChangeKind::Modified,
+                    };
+                    Some(RuntimeActivity::FileChanged { path, change_kind })
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+#[allow(dead_code)]
 fn render_item_event(event: &Value) -> Option<String> {
     let item = event.get("item")?;
     match item.get("type")?.as_str()? {
@@ -886,11 +1388,15 @@ async fn read_stdout(
                 "turn.failed" => state.turn_failed = true,
                 _ => {}
             }
-            if let Some(rendered) = render_codex_json_event(&event) {
+            if let Some(activity) = normalize_codex_activity(&event) {
+                let _ = tx.send(RuntimeEvent::Activity(activity)).await;
+            } else if matches!(kind, "error" | "turn.failed") {
+                // Preserve provider diagnostics for `/logs raw` without
+                // making provider-formatted UI text part of normal activity.
                 let _ = tx
                     .send(RuntimeEvent::Output {
-                        stream: RuntimeOutputStream::Stdout,
-                        bytes: rendered,
+                        stream: RuntimeOutputStream::Stderr,
+                        bytes: format!("{line}\n").into_bytes(),
                     })
                     .await;
             }
@@ -1308,6 +1814,20 @@ mod tests {
             "› Codex is analyzing the task\n"
         );
         assert!(render_codex_json_event(&serde_json::json!({"type":"future.event"})).is_none());
+    }
+
+    #[test]
+    fn normalizes_structured_activity() {
+        assert!(matches!(
+            normalize_codex_activity(&serde_json::json!({"type":"thread.started"})),
+            Some(RuntimeActivity::SessionStarted)
+        ));
+        assert!(matches!(
+            normalize_codex_activity(
+                &serde_json::json!({"type":"item.started","item":{"type":"command_execution","command":"cargo test"}})
+            ),
+            Some(RuntimeActivity::CommandStarted { .. })
+        ));
     }
 
     #[test]

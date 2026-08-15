@@ -74,7 +74,6 @@ pub async fn run_event_loop<B: ratatui::backend::Backend>(
     let mut frame_interval = interval(Duration::from_millis(33)); // ~30 FPS frame clock (~33ms)
     // Draw initial frame
     terminal.draw(|frame| crate::render(frame, state))?;
-    let mut dirty = false;
 
     loop {
         state.poll_health_refresh().await;
@@ -82,31 +81,26 @@ pub async fn run_event_loop<B: ratatui::backend::Backend>(
 
         tokio::select! {
             _ = frame_interval.tick() => {
-                if state.has_active_execution() {
-                    dirty = true;
-                }
-                if dirty {
-                    terminal.draw(|frame| crate::render(frame, state))?;
-                    dirty = false;
-                }
+                // A 30 FPS frame clock keeps health probes, scheduler state,
+                // and asynchronous permission prompts visible even when no
+                // key event arrives. Rendering is bounded and avoids stale
+                // TUI state after background work completes.
+                terminal.draw(|frame| crate::render(frame, state))?;
             }
             maybe_event = reader.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) => {
                         let context = state.input_context();
-                        if should_dispatch_key(&key, context) {
-                            if crate::handle_key(state, key).await? {
-                                break;
-                            }
-                            dirty = true;
+                        if should_dispatch_key(&key, context)
+                            && crate::handle_key(state, key).await?
+                        {
+                            break;
                         }
                     }
                     Some(Ok(Event::Paste(pasted))) => {
                         state.handle_paste(&pasted);
-                        dirty = true;
                     }
                     Some(Ok(Event::Resize(_, _))) => {
-                        dirty = true;
                     }
                     Some(Ok(_)) => {}
                     Some(Err(error)) => {

@@ -6,19 +6,45 @@ pub enum RelayCommand {
     New,
     Tasks,
     Projects,
-    ProjectAdd { path: Option<PathBuf> },
+    ProjectAdd {
+        path: Option<PathBuf>,
+    },
     Runtimes,
-    RuntimeDetail { provider: String },
-    RuntimeUse { profile: String },
-    RuntimeTest { provider: String },
-    RuntimeProfile { profile: String },
+    RuntimeDetail {
+        provider: String,
+    },
+    RuntimeUse {
+        profile: String,
+    },
+    RuntimeModel {
+        model: String,
+    },
+    RuntimeReasoning {
+        effort: String,
+    },
+    RuntimeTest {
+        provider: String,
+    },
+    RuntimeProfile {
+        profile: String,
+    },
     Settings,
     Doctor,
     Help,
-    Run { task: String },
-    Cancel { task: String },
-    Diff { task: Option<String> },
-    Logs { task: Option<String> },
+    Run {
+        task: String,
+        model: Option<String>,
+        reasoning: Option<String>,
+    },
+    Cancel {
+        task: String,
+    },
+    Diff {
+        task: Option<String>,
+    },
+    Logs {
+        task: Option<String>,
+    },
     Quit,
 }
 
@@ -31,12 +57,14 @@ pub const COMMANDS: &[&str] = &[
     "/runtimes",
     "/runtime <provider>",
     "/runtime use <profile>",
+    "/runtime model <model>",
+    "/runtime reasoning <low|medium|high|xhigh>",
     "/runtime test <provider>",
     "/runtime profile <profile>",
     "/settings",
     "/doctor",
     "/help",
-    "/run <task>",
+    "/run <task> [--model=<id>] [--reasoning=<effort>]",
     "/cancel <task>",
     "/diff [task]",
     "/logs [task]",
@@ -67,6 +95,24 @@ pub fn parse_relay_command(input: &str) -> Result<RelayCommand, String> {
                 profile: argument[4..].trim().to_owned(),
             })
         }
+        "/runtime" if argument == "model" => Err("Missing argument for /runtime model".to_owned()),
+        "/runtime"
+            if argument.starts_with("model ") && argument[6..].trim().chars().count() > 0 =>
+        {
+            Ok(RelayCommand::RuntimeModel {
+                model: argument[6..].trim().to_owned(),
+            })
+        }
+        "/runtime" if argument == "reasoning" => {
+            Err("Missing argument for /runtime reasoning".to_owned())
+        }
+        "/runtime"
+            if argument.starts_with("reasoning ") && argument[10..].trim().chars().count() > 0 =>
+        {
+            Ok(RelayCommand::RuntimeReasoning {
+                effort: argument[10..].trim().to_owned(),
+            })
+        }
         "/runtime" if argument == "test" => Err("Missing argument for /runtime test".to_owned()),
         "/runtime" if argument.starts_with("test ") && argument[5..].trim().chars().count() > 0 => {
             Ok(RelayCommand::RuntimeTest {
@@ -89,9 +135,7 @@ pub fn parse_relay_command(input: &str) -> Result<RelayCommand, String> {
         "/settings" if argument.is_empty() => Ok(RelayCommand::Settings),
         "/doctor" if argument.is_empty() => Ok(RelayCommand::Doctor),
         "/help" if argument.is_empty() => Ok(RelayCommand::Help),
-        "/run" if !argument.is_empty() => Ok(RelayCommand::Run {
-            task: argument.to_owned(),
-        }),
+        "/run" if !argument.is_empty() => parse_run_command(argument),
         "/cancel" if !argument.is_empty() => Ok(RelayCommand::Cancel {
             task: argument.to_owned(),
         }),
@@ -114,6 +158,35 @@ pub fn parse_relay_command(input: &str) -> Result<RelayCommand, String> {
     }
 }
 
+fn parse_run_command(argument: &str) -> Result<RelayCommand, String> {
+    let mut task_parts = Vec::new();
+    let mut model = None;
+    let mut reasoning = None;
+    for token in argument.split_whitespace() {
+        if let Some(value) = token.strip_prefix("--model=") {
+            if value.is_empty() {
+                return Err("--model requires a value".to_owned());
+            }
+            model = Some(value.to_owned());
+        } else if let Some(value) = token.strip_prefix("--reasoning=") {
+            if value.is_empty() {
+                return Err("--reasoning requires a value".to_owned());
+            }
+            reasoning = Some(value.to_owned());
+        } else {
+            task_parts.push(token);
+        }
+    }
+    if task_parts.is_empty() {
+        return Err("/run requires a task selector".to_owned());
+    }
+    Ok(RelayCommand::Run {
+        task: task_parts.join(" "),
+        model,
+        reasoning,
+    })
+}
+
 #[allow(dead_code)]
 pub fn command_suggestions(input: &str) -> Vec<&'static str> {
     COMMANDS
@@ -131,7 +204,17 @@ mod tests {
         assert_eq!(
             parse_relay_command("/run abc"),
             Ok(RelayCommand::Run {
-                task: "abc".to_owned()
+                task: "abc".to_owned(),
+                model: None,
+                reasoning: None,
+            })
+        );
+        assert_eq!(
+            parse_relay_command("/run abc --model=custom --reasoning=medium"),
+            Ok(RelayCommand::Run {
+                task: "abc".to_owned(),
+                model: Some("custom".to_owned()),
+                reasoning: Some("medium".to_owned()),
             })
         );
         assert_eq!(
@@ -175,6 +258,18 @@ mod tests {
             parse_relay_command("/runtime use codex/implement"),
             Ok(RelayCommand::RuntimeUse {
                 profile: "codex/implement".to_owned()
+            })
+        );
+        assert_eq!(
+            parse_relay_command("/runtime model gpt-5"),
+            Ok(RelayCommand::RuntimeModel {
+                model: "gpt-5".to_owned()
+            })
+        );
+        assert_eq!(
+            parse_relay_command("/runtime reasoning high"),
+            Ok(RelayCommand::RuntimeReasoning {
+                effort: "high".to_owned()
             })
         );
         assert_eq!(

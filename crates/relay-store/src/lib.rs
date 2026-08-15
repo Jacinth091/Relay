@@ -171,6 +171,28 @@ impl SqliteStore {
         Ok(task)
     }
 
+    /// Append a bounded, structured event without exposing the SQL event table
+    /// to Core callers. Event payloads are caller-validated JSON strings.
+    pub async fn append_event(
+        &self,
+        task_id: Option<&str>,
+        execution_id: Option<&str>,
+        event_kind: &str,
+        event_json: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        insert_event(
+            &mut transaction,
+            task_id,
+            execution_id,
+            event_kind,
+            event_json,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub async fn update_task_state(
         &self,
         id: &str,

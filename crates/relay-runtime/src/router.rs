@@ -169,6 +169,7 @@ mod tests {
                 display_name: "Dummy".to_owned(),
                 description: "Dummy".to_owned(),
                 is_development_only: true,
+                machine_interface_verified: true,
             }
         }
         fn probe(

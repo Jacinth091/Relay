@@ -40,6 +40,9 @@ pub struct RuntimeDescriptor {
     pub display_name: String,
     pub description: String,
     pub is_development_only: bool,
+    /// True only when the adapter consumes a documented machine-readable
+    /// provider interface rather than scraping an interactive UI.
+    pub machine_interface_verified: bool,
 }
 
 /// Short descriptor for a profile offered by a provider.
@@ -76,6 +79,7 @@ pub struct RuntimeModelCatalog {
 pub struct RuntimeModelInfo {
     pub id: String,
     pub display_name: String,
+    pub supported_reasoning_efforts: Vec<crate::ReasoningEffort>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

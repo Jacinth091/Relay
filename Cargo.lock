@@ -1209,7 +1209,9 @@ dependencies = [
  "relay-runtime-antigravity",
  "relay-runtime-codex",
  "relay-runtime-fake",
+ "relay-store",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
 ]

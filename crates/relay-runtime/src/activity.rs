@@ -8,12 +8,18 @@ pub enum RuntimeActivity {
     SessionStarted,
     /// Agent is analyzing/thinking (no specific command).
     Analyzing { description: String },
+    FileRead {
+        path: PathBuf,
+        lines_read: Option<usize>,
+    },
     /// A command has started executing.
     CommandStarted {
         /// Logical command (e.g. "cargo test --workspace"), not raw shell wrapper
         logical_command: String,
         /// Full raw command for logs (may include shell wrappers)
         raw_command: Option<String>,
+        /// Trusted/provider-reported working directory for concise presentation.
+        working_directory: Option<PathBuf>,
     },
     /// Intermediate command output/progress.
     CommandProgress {
@@ -24,6 +30,8 @@ pub enum RuntimeActivity {
     CommandCompleted {
         logical_command: String,
         success: bool,
+        exit_code: Option<i32>,
+        working_directory: Option<PathBuf>,
     },
     /// A file has been changed by the agent.
     FileChanged {
@@ -37,11 +45,23 @@ pub enum RuntimeActivity {
     /// Verification step completed.
     VerificationCompleted { description: String, passed: bool },
     /// Agent produced a human-readable message.
-    AgentMessage { message: String },
+    AgentMessage { message: RuntimeText },
     /// Non-critical warning from the provider.
     Warning { message: String },
     /// Provider-specific diagnostic (for logs, not primary UX).
     ProviderDiagnostic { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeText {
+    pub content: String,
+    pub format: RuntimeTextFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeTextFormat {
+    Plain,
+    Markdown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

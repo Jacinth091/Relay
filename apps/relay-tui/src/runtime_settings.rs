@@ -11,6 +11,9 @@ pub struct RuntimeSettings {
     pub runtime: GlobalRuntimeConfig,
     #[serde(default)]
     pub projects: HashMap<String, String>,
+    /// Optional v2 project tuning, kept separate from the strict M2 project registry.
+    #[serde(default)]
+    pub project_tuning: HashMap<String, ProjectRuntimeSettings>,
     #[serde(default)]
     pub providers: HashMap<String, ProviderOverrideConfig>,
     #[serde(default)]
@@ -51,6 +54,13 @@ pub struct ProfileOverrideConfig {
     pub max_duration_secs: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProjectRuntimeSettings {
+    pub profile: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
 impl Default for RuntimeSettings {
     fn default() -> Self {
         let mut profile_overrides = HashMap::new();
@@ -75,6 +85,7 @@ impl Default for RuntimeSettings {
             version: 1,
             runtime: GlobalRuntimeConfig::default(),
             projects: HashMap::new(),
+            project_tuning: HashMap::new(),
             providers: HashMap::new(),
             profile_overrides,
         }
@@ -106,6 +117,11 @@ impl RuntimeSettings {
         let profile_id = override_profile
             .or_else(|| {
                 project_key
+                    .and_then(|k| self.project_tuning.get(k))
+                    .and_then(|settings| settings.profile.as_deref())
+            })
+            .or_else(|| {
+                project_key
                     .and_then(|k| self.projects.get(k))
                     .map(|s| s.as_str())
             })
@@ -116,6 +132,11 @@ impl RuntimeSettings {
 
         let raw_model = override_model
             .map(|s| s.to_owned())
+            .or_else(|| {
+                project_key
+                    .and_then(|k| self.project_tuning.get(k))
+                    .and_then(|settings| settings.model.clone())
+            })
             .or_else(|| profile_override.and_then(|p| p.model.clone()));
 
         let model = match raw_model.as_deref() {
@@ -125,8 +146,10 @@ impl RuntimeSettings {
 
         let reasoning_effort = if let Some(effort) = override_effort {
             RuntimeReasoningSelection::Explicit(effort)
-        } else if let Some(raw_effort) =
-            profile_override.and_then(|p| p.reasoning_effort.as_deref())
+        } else if let Some(raw_effort) = project_key
+            .and_then(|k| self.project_tuning.get(k))
+            .and_then(|settings| settings.reasoning_effort.as_deref())
+            .or_else(|| profile_override.and_then(|p| p.reasoning_effort.as_deref()))
         {
             match raw_effort {
                 "low" => RuntimeReasoningSelection::Explicit(ReasoningEffort::Low),
@@ -204,6 +227,25 @@ mod tests {
         assert_eq!(
             settings.resolve_profile_for_project("unknown", Some("antigravity")),
             "antigravity/implement"
+        );
+    }
+
+    #[test]
+    fn project_tuning_overrides_profile_defaults_without_changing_registry_shape() {
+        let mut settings = RuntimeSettings::default();
+        settings.project_tuning.insert(
+            "relay".to_owned(),
+            ProjectRuntimeSettings {
+                profile: Some("codex/implement".to_owned()),
+                model: Some("custom-model".to_owned()),
+                reasoning_effort: Some("medium".to_owned()),
+            },
+        );
+        let selection = settings.resolve_selection(Some("relay"), None, None, None);
+        assert_eq!(selection.model.as_option(), Some("custom-model"));
+        assert_eq!(
+            selection.reasoning_effort.as_option(),
+            Some(ReasoningEffort::Medium)
         );
     }
 }

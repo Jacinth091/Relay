@@ -62,6 +62,13 @@ pub struct RuntimeCapabilities {
     pub streaming_output: bool,
     pub cancellation: bool,
     pub deterministic_outcome: bool,
+    pub permission_support: RuntimePermissionSupport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimePermissionSupport {
+    PreapprovedOnly,
+    LiveApproval,
 }
 
 impl Default for RuntimeCapabilities {
@@ -70,6 +77,7 @@ impl Default for RuntimeCapabilities {
             streaming_output: true,
             cancellation: true,
             deterministic_outcome: true,
+            permission_support: RuntimePermissionSupport::PreapprovedOnly,
         }
     }
 }
@@ -94,6 +102,15 @@ pub struct RuntimeRequest {
     pub runtime_selection: RuntimeExecutionSelection,
 }
 
+/// Frozen capability ceiling attached to one approved execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RuntimePermissionEnvelope {
+    pub trusted_workspace: Option<PathBuf>,
+    pub workspace_write: bool,
+    pub network: bool,
+    pub additional_writable_roots: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeTaskIntent {
     pub title: String,
@@ -113,6 +130,7 @@ pub enum RuntimeOutputStream {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEvent {
+    Activity(RuntimeActivity),
     Output {
         stream: RuntimeOutputStream,
         bytes: Vec<u8>,
@@ -121,6 +139,62 @@ pub enum RuntimeEvent {
     InvalidOutput {
         reason: String,
     },
+    PermissionRequested(RuntimePermissionRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePermissionRequest {
+    pub request_id: String,
+    pub kind: RuntimePermissionKind,
+    pub reason: Option<String>,
+    pub command: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub requested: RuntimeRequestedPermissions,
+    #[serde(default)]
+    pub available_decisions: Vec<RuntimePermissionDecisionKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuntimePermissionKind {
+    CommandExecution,
+    FileChange,
+    Network,
+    Permissions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RuntimeRequestedPermissions {
+    pub workspace_write: bool,
+    pub network: bool,
+    pub paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeControl {
+    PermissionDecision {
+        request_id: String,
+        decision: RuntimePermissionDecision,
+    },
+    UserInputResponse {
+        request_id: String,
+        response: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuntimePermissionDecision {
+    AllowOnce,
+    AllowForRun,
+    Deny,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuntimePermissionDecisionKind {
+    AllowOnce,
+    AllowForRun,
+    Deny,
+    Cancel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +246,7 @@ impl RuntimeOutcomeKind {
 pub struct RuntimeSession {
     pub session_id: String,
     pub events: mpsc::Receiver<RuntimeEvent>,
+    pub control: Option<mpsc::Sender<RuntimeControl>>,
 }
 
 pub trait Runtime: Send + Sync + 'static {

@@ -114,6 +114,7 @@ pub fn parse_relay_command(input: &str) -> Result<RelayCommand, String> {
     }
 }
 
+#[allow(dead_code)]
 pub fn command_suggestions(input: &str) -> Vec<&'static str> {
     COMMANDS
         .iter()

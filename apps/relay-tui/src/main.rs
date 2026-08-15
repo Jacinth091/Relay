@@ -1,4 +1,5 @@
 mod command;
+mod command_completion;
 mod project_discovery;
 
 use std::{
@@ -10,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use command::{RelayCommand, command_suggestions, parse_relay_command};
+use command::{RelayCommand, parse_relay_command};
 use crossterm::{
     event::{DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyModifiers},
     execute,
@@ -307,16 +308,122 @@ fn render(frame: &mut Frame, state: &AppState) {
     let prompt = if state.command_mode {
         format!("> {}", state.command_input)
     } else {
-        "> /_  (/help for commands)".to_owned()
+        "> /_  (type / for commands)".to_owned()
     };
-    let suggestions = if state.command_mode {
-        command_suggestions(&state.command_input).join("  ")
-    } else {
-        String::new()
-    };
-    let footer_text = format!("────────────────────────────────────────\n{prompt} {suggestions}");
+    let footer_text = format!("────────────────────────────────────────\n{prompt}");
     let footer_widget = Paragraph::new(footer_text).style(style_muted());
     frame.render_widget(footer_widget, areas[2]);
+
+    if state.command_mode {
+        render_command_palette_overlay(frame, state, frame.area());
+    }
+}
+
+fn render_command_palette_overlay(frame: &mut Frame, state: &AppState, area: Rect) {
+    let suggestions = state.get_current_suggestions();
+    if suggestions.is_empty() {
+        return;
+    }
+
+    let max_visible = 6;
+    let visible_count = std::cmp::min(suggestions.len(), max_visible);
+    let popup_height = visible_count as u16 + 2;
+
+    if area.height <= 3 {
+        return;
+    }
+
+    let popup_y = area.height.saturating_sub(popup_height + 2);
+    let popup_rect = Rect {
+        x: area.x + 2,
+        y: popup_y,
+        width: area.width.saturating_sub(4).min(90),
+        height: popup_height,
+    };
+
+    frame.render_widget(ratatui::widgets::Clear, popup_rect);
+
+    let theme = Theme::default();
+    let selected_idx = state
+        .command_selected_index
+        .min(suggestions.len().saturating_sub(1));
+
+    let start_offset = if selected_idx >= max_visible {
+        selected_idx.saturating_sub(max_visible - 1)
+    } else {
+        0
+    };
+
+    let mut lines = Vec::new();
+    for (i, item) in suggestions
+        .iter()
+        .skip(start_offset)
+        .take(max_visible)
+        .enumerate()
+    {
+        let actual_idx = start_offset + i;
+        let is_selected = actual_idx == selected_idx;
+
+        let marker = if is_selected { "> " } else { "  " };
+        let mut spans = Vec::new();
+
+        if is_selected {
+            spans.push(ratatui::text::Span::styled(marker, theme.selection()));
+            spans.push(ratatui::text::Span::styled(
+                &item.display_primary,
+                theme.accent().add_modifier(ratatui::style::Modifier::BOLD),
+            ));
+            if let Some(sec) = &item.display_secondary {
+                spans.push(ratatui::text::Span::styled(
+                    format!(" ({sec})"),
+                    theme.muted(),
+                ));
+            }
+            let pad = 30_usize.saturating_sub(item.display_primary.len());
+            spans.push(ratatui::text::Span::raw(" ".repeat(pad)));
+            spans.push(ratatui::text::Span::styled(&item.description, theme.text()));
+            if let Some(reason) = &item.disabled_reason {
+                spans.push(ratatui::text::Span::styled(
+                    format!(" × {reason}"),
+                    theme.warning(),
+                ));
+            }
+            lines.push(ratatui::text::Line::from(spans).style(theme.selection()));
+        } else {
+            spans.push(ratatui::text::Span::styled(marker, theme.muted()));
+            spans.push(ratatui::text::Span::styled(
+                &item.display_primary,
+                theme.accent(),
+            ));
+            if let Some(sec) = &item.display_secondary {
+                spans.push(ratatui::text::Span::styled(
+                    format!(" ({sec})"),
+                    theme.muted(),
+                ));
+            }
+            let pad = 30_usize.saturating_sub(item.display_primary.len());
+            spans.push(ratatui::text::Span::raw(" ".repeat(pad)));
+            spans.push(ratatui::text::Span::styled(
+                &item.description,
+                theme.muted(),
+            ));
+            if let Some(reason) = &item.disabled_reason {
+                spans.push(ratatui::text::Span::styled(
+                    format!(" × {reason}"),
+                    theme.muted(),
+                ));
+            }
+            lines.push(ratatui::text::Line::from(spans));
+        }
+    }
+
+    let popup_block = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme.muted())
+            .title(" Commands "),
+    );
+    frame.render_widget(popup_block, popup_rect);
 }
 
 fn render_dashboard(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -720,23 +827,70 @@ fn render_result(frame: &mut Frame, state: &AppState, area: Rect) {
 
 async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn Error>> {
     if state.command_mode {
+        let suggs = state.get_current_suggestions();
+        let sugg_count = suggs.len();
+
         match key.code {
+            KeyCode::Up => {
+                if sugg_count > 0 {
+                    if state.command_selected_index == 0 {
+                        state.command_selected_index = sugg_count - 1;
+                    } else {
+                        state.command_selected_index -= 1;
+                    }
+                }
+                return Ok(false);
+            }
+            KeyCode::Down => {
+                if sugg_count > 0 {
+                    state.command_selected_index = (state.command_selected_index + 1) % sugg_count;
+                }
+                return Ok(false);
+            }
+            KeyCode::Tab => {
+                if !suggs.is_empty() {
+                    let idx = state.command_selected_index.min(sugg_count - 1);
+                    state.command_input = suggs[idx].completion.clone();
+                    state.command_selected_index = 0;
+                }
+                return Ok(false);
+            }
             KeyCode::Enter => {
-                let command = std::mem::take(&mut state.command_input);
-                state.command_mode = false;
-                return execute_relay_command(state, &command).await;
+                if !suggs.is_empty() {
+                    let idx = state.command_selected_index.min(sugg_count - 1);
+                    let sel = &suggs[idx];
+                    if sel.executable {
+                        let command = sel.completion.clone();
+                        state.command_mode = false;
+                        state.command_input.clear();
+                        state.command_selected_index = 0;
+                        return execute_relay_command(state, &command).await;
+                    } else {
+                        state.command_input = sel.completion.clone();
+                        state.command_selected_index = 0;
+                        return Ok(false);
+                    }
+                } else {
+                    let command = std::mem::take(&mut state.command_input);
+                    state.command_mode = false;
+                    state.command_selected_index = 0;
+                    return execute_relay_command(state, &command).await;
+                }
             }
             KeyCode::Esc => {
                 state.command_mode = false;
                 state.command_input.clear();
+                state.command_selected_index = 0;
                 return Ok(false);
             }
             KeyCode::Backspace => {
                 state.command_input.pop();
+                state.command_selected_index = 0;
                 return Ok(false);
             }
             KeyCode::Char(character) if !character.is_control() => {
                 state.command_input.push(character);
+                state.command_selected_index = 0;
                 return Ok(false);
             }
             _ => return Ok(false),
@@ -745,6 +899,7 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
     if key.code == KeyCode::Char('/') && command_mode_available(state.screen) {
         state.command_mode = true;
         state.command_input = "/".to_owned();
+        state.command_selected_index = 0;
         return Ok(false);
     }
     match state.screen {
@@ -1517,6 +1672,9 @@ struct AppState {
     health_refresh: Option<JoinHandle<HealthSnapshot>>,
     command_input: String,
     command_mode: bool,
+    command_selected_index: usize,
+    #[allow(dead_code)]
+    command_scroll_offset: usize,
     scheduler_events: Option<broadcast::Receiver<CoreExecutionEvent>>,
     scheduler_snapshot: SchedulerSnapshot,
     scheduler_driver:
@@ -1668,6 +1826,121 @@ impl AppState {
         }
     }
 
+    fn build_completion_context(&self) -> command_completion::CompletionContext {
+        let providers = vec![
+            command_completion::ProviderCompletion {
+                provider_id: "codex".to_owned(),
+                display_name: "Codex".to_owned(),
+                status_note: self.runtime_health.display_status().to_owned(),
+            },
+            command_completion::ProviderCompletion {
+                provider_id: "antigravity".to_owned(),
+                display_name: "Antigravity".to_owned(),
+                status_note: self.antigravity_health.display_status().to_owned(),
+            },
+        ];
+
+        let profiles = vec![
+            command_completion::ProfileCompletion {
+                profile_id: "codex/implement".to_owned(),
+                provider_id: "codex".to_owned(),
+                display_name: "Codex / Implement".to_owned(),
+                description: "Code generation and workspace edits".to_owned(),
+                available: true,
+                disabled_reason: None,
+            },
+            command_completion::ProfileCompletion {
+                profile_id: "codex/review".to_owned(),
+                provider_id: "codex".to_owned(),
+                display_name: "Codex / Review".to_owned(),
+                description: "Read-only inspection & review".to_owned(),
+                available: true,
+                disabled_reason: None,
+            },
+            command_completion::ProfileCompletion {
+                profile_id: "codex/deep".to_owned(),
+                provider_id: "codex".to_owned(),
+                display_name: "Codex / Deep".to_owned(),
+                description: "High reasoning effort agent turns".to_owned(),
+                available: true,
+                disabled_reason: None,
+            },
+            command_completion::ProfileCompletion {
+                profile_id: "antigravity/implement".to_owned(),
+                provider_id: "antigravity".to_owned(),
+                display_name: "Antigravity / Implement".to_owned(),
+                description: "Google Antigravity autonomous edits".to_owned(),
+                available: true,
+                disabled_reason: None,
+            },
+            command_completion::ProfileCompletion {
+                profile_id: "antigravity/review".to_owned(),
+                provider_id: "antigravity".to_owned(),
+                display_name: "Antigravity / Review".to_owned(),
+                description: "Read-only planning & inspection mode".to_owned(),
+                available: true,
+                disabled_reason: None,
+            },
+            command_completion::ProfileCompletion {
+                profile_id: "antigravity/deep".to_owned(),
+                provider_id: "antigravity".to_owned(),
+                display_name: "Antigravity / Deep".to_owned(),
+                description: "High effort agent turns".to_owned(),
+                available: true,
+                disabled_reason: None,
+            },
+        ];
+
+        let mut ready_tasks = Vec::new();
+        let mut cancellable_tasks = Vec::new();
+        let mut inspectable_tasks = Vec::new();
+
+        for task in &self.durable_tasks {
+            let id_str = task.id.to_string();
+            let short_id = if id_str.len() >= 8 {
+                id_str[..8].to_owned()
+            } else {
+                id_str.clone()
+            };
+
+            let item = command_completion::TaskCompletion {
+                id_str: id_str.clone(),
+                short_id,
+                project_key: task.project_key.to_string(),
+                title: task.handoff.title.clone(),
+                state: task.state,
+                eligible_for_run: task.state == TaskState::Ready,
+            };
+
+            if task.state == TaskState::Ready {
+                ready_tasks.push(item.clone());
+            }
+            if matches!(task.state, TaskState::Running | TaskState::Verifying)
+                || self
+                    .execution_views
+                    .get(&task.id)
+                    .map(|v| v.scheduler_status.is_some())
+                    .unwrap_or(false)
+            {
+                cancellable_tasks.push(item.clone());
+            }
+            inspectable_tasks.push(item);
+        }
+
+        command_completion::CompletionContext {
+            providers,
+            profiles,
+            ready_tasks,
+            cancellable_tasks,
+            inspectable_tasks,
+        }
+    }
+
+    fn get_current_suggestions(&self) -> Vec<command_completion::CommandSuggestion> {
+        let ctx = self.build_completion_context();
+        command_completion::compute_suggestions(&self.command_input, &ctx)
+    }
+
     fn cancel_task_selector(&mut self, selector: &str) {
         let matches = self
             .durable_tasks
@@ -1750,6 +2023,8 @@ impl AppState {
             health_refresh: None,
             command_input: String::new(),
             command_mode: false,
+            command_selected_index: 0,
+            command_scroll_offset: 0,
             scheduler_events,
             scheduler_snapshot: SchedulerSnapshot { tasks: Vec::new() },
             scheduler_driver: None,
@@ -2787,6 +3062,67 @@ mod tests {
         assert_eq!(state.screen, Screen::NewTask);
         assert!(state.relay.reviewed_task().is_none());
         assert!(state.task_candidate.is_none());
+    }
+
+    #[tokio::test]
+    async fn command_palette_navigation_and_autocomplete() {
+        let mut state = app_state_with_eligible_project_with_store().await;
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert!(state.command_mode);
+        assert_eq!(state.command_input, "/");
+
+        let suggs = state.get_current_suggestions();
+        assert!(!suggs.is_empty());
+
+        // Press Down to move selection
+        handle_key(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(state.command_selected_index, 1);
+
+        // Press Tab to autocomplete selected item
+        handle_key(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(state.command_input, suggs[1].completion);
+
+        // Press Esc to close palette
+        handle_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(!state.command_mode);
+        assert!(state.command_input.is_empty());
+    }
+
+    #[tokio::test]
+    async fn command_palette_contextual_profile_and_task_suggestions() {
+        let mut state = app_state_with_eligible_project_with_store().await;
+        state.start_paste_task();
+        state.paste_text = task_json();
+        state.submit_paste_task();
+        state.confirm_task_import().await;
+
+        // Contextual runtime profile completion
+        state.command_mode = true;
+        state.command_input = "/runtime use ant".to_owned();
+        let suggs = state.get_current_suggestions();
+        assert!(!suggs.is_empty());
+        assert!(
+            suggs
+                .iter()
+                .any(|s| s.completion == "/runtime use antigravity/implement")
+        );
+
+        // Contextual task completion for /run
+        state.command_input = "/run ".to_owned();
+        let task_suggs = state.get_current_suggestions();
+        assert!(!task_suggs.is_empty());
+        assert!(task_suggs[0].completion.starts_with("/run "));
     }
 
     #[tokio::test]

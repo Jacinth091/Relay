@@ -94,6 +94,8 @@ fn app_execution_limits() -> ExecutionLimits {
 async fn probe_version(executable: &str, args: &[&str]) -> Result<String, String> {
     let output = timeout(Duration::from_secs(3), {
         let mut command = TokioCommand::new(executable);
+        #[cfg(windows)]
+        command.creation_flags(0x08000000);
         command.args(args).kill_on_drop(true).output()
     })
     .await
@@ -134,6 +136,8 @@ async fn collect_health(active_provider: String, full_probe: bool) -> HealthSnap
         Ok(version) => {
             let auth = timeout(Duration::from_secs(3), {
                 let mut command = TokioCommand::new("gh");
+                #[cfg(windows)]
+                command.creation_flags(0x08000000);
                 command
                     .args(["auth", "status", "--active", "--hostname", "github.com"])
                     .kill_on_drop(true)

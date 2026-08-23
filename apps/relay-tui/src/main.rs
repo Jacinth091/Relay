@@ -1,3 +1,5 @@
+mod bootstrap;
+mod cli;
 mod command;
 mod command_completion;
 mod commands;
@@ -21,7 +23,7 @@ pub(crate) use ui::render;
 
 use std::{
     error::Error,
-    io::{self, Stdout},
+    io::{self, BufRead, Stdout},
 };
 
 use crossterm::{
@@ -30,14 +32,20 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
-use relay_core::{
-    Relay, SqliteStore, StoredTask, default_config_path, default_database_path, list_stored_tasks,
-};
+use relay_core::{Relay, default_config_path, default_database_path};
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let command = match cli::parse_cli(std::env::args_os()) {
+        Ok(command) => command,
+        Err(error) => error.exit(),
+    };
+    if let cli::CliCommand::ServeMcp = command {
+        return serve_mcp().await;
+    }
+
     let config_path = default_config_path();
     let (relay, registry_writable, feedback) = match Relay::load_from_config_path(&config_path) {
         Ok(relay) => (relay, true, format!("Config: {}", config_path.display())),
@@ -51,7 +59,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ),
     };
     let database_path = default_database_path();
-    let (store, durable_tasks, database_feedback) = open_store(&database_path).await;
+    let (store, durable_tasks, database_feedback) = bootstrap::open_store(&database_path).await;
     let mut state = AppState::new_with_store(
         relay,
         config_path,
@@ -73,31 +81,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn open_store(path: &std::path::Path) -> (Option<SqliteStore>, Vec<StoredTask>, String) {
-    match SqliteStore::open(path).await {
-        Ok(store) => match list_stored_tasks(&store).await {
-            Ok(tasks) => {
-                let feedback = format!("Database: {}", path.display());
-                (Some(store), tasks, feedback)
-            }
-            Err(error) => (
-                None,
-                Vec::new(),
-                format!(
-                    "Database error at {}: {error}\nTask import is disabled until the database is fixed.",
-                    path.display()
-                ),
-            ),
-        },
-        Err(error) => (
-            None,
-            Vec::new(),
-            format!(
-                "Database error at {}: {error}\nTask import is disabled until the database is fixed.",
-                path.display()
-            ),
-        ),
+async fn serve_mcp() -> Result<(), Box<dyn Error>> {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
+
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
     }
+    Ok(())
 }
 
 fn initialize_terminal() -> Result<Tui, Box<dyn Error>> {

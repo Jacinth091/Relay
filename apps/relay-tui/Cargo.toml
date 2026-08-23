@@ -11,6 +11,7 @@ name = "relay"
 path = "src/main.rs"
 
 [dependencies]
+clap.workspace = true
 crossterm = { version = "0.28.1", features = ["event-stream"] }
 dirs = "6.0.0"
 futures = "0.3"
@@ -25,3 +26,5 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.43.0", features = ["macros", "process", "rt", "sync", "time"] }
 toml = "0.8"
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -676,7 +676,7 @@ Start here:
 - [`ACKNOWLEDGMENTS.md`](ACKNOWLEDGMENTS.md) — open-source inspirations and attribution boundary.
 - [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) — notices for any future copied/vendored third-party material.
 - [`AGENTS.md`](AGENTS.md)
-- [`docs/adr/`](docs/adr/) — architecture decision records, including ADR-0015 for canonical local state and optional external bindings.
+- [`docs/adr/`](docs/adr/) — architecture decision records, including ADR-0015 for canonical local state and optional external bindings, ADR-0016 for MCP-first submission layering, and ADR-0017 for Relay identity as a deterministic handoff engine.
 
 ---
 

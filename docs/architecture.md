@@ -10,6 +10,41 @@ GitHub is an integration option, not a second Relay implementation and not the c
 
 ---
 
+## What Relay Is / Is Not
+
+"Orchestrator" is an overloaded word, so this is stated explicitly.
+
+There are two activities people call orchestration:
+
+**Intent orchestration** — deciding what should be done: planning, reasoning, strategy selection. Relay does **not** do this. It is reserved for the human and the planner surface (AGENTS.md invariants 3 and 7; "Relay should never infer that a conversation has gone on long enough and silently begin implementation").
+
+**Execution orchestration** — deterministic lifecycle management: validate, route, persist, spawn a runtime process, stream events, apply bounded repair, escalate with structured packets. This **is** Relay's job. It is a state machine, not a brain.
+
+Relay's identity in one sentence:
+
+> **Relay is the border checkpoint between conversation and execution — it stamps, routes, and logs; it never decides where anyone is going.**
+
+This also settles whether Relay is "an MCP server" or similar. Transport and presentation surfaces are doors around one core:
+
+```text
+TUI        = presentation door
+MCP server = submission door
+GitHub     = ingress door (optional)
+paste/file = ingress door (universal fallback)
+```
+
+None of these is what Relay *is*. If a protocol disappears, its door is replaced; the engine survives. A new surface passes the identity test only by answering three questions:
+
+| Question | Answer decides |
+|---|---|
+| Is it deterministic policy, lifecycle, persistence, validation? | belongs in Relay Core |
+| Is it moving data to/from an external host or provider? | belongs in an edge crate |
+| Does it decide intent or strategy? | does not belong in Relay at all |
+
+Scope discipline follows from README's One Rule: features widen the *data* available to core (capabilities, metadata) rather than widening core's *authority*.
+
+---
+
 ## Layer Model
 
 ```text

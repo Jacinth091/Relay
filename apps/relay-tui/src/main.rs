@@ -977,12 +977,12 @@ fn render_execution(frame: &mut Frame, state: &AppState, area: Rect) {
             permission_popup = Some(request.clone());
         }
 
-        format!("Task: {id}\nProject: {}\nRuntime: {}\nModel: {}\nReasoning: {}\nScheduler: {}\nPhase: {}\nRepair: {}\nElapsed: {}s\n{}\n\nOutput:\n{}\n\nTry:\n  /cancel\n  /diff\n  /logs\n  /tasks",
+        format!("Task: {id}\nProject: {}\nRuntime: {}\nModel: {}\nReasoning: {}\nHandoff status: {}\nPhase: {}\nRepair: {}\nElapsed: {}s\n{}\n\nOutput:\n{}\n\nTry:\n  /cancel\n  /diff\n  /logs\n  /tasks",
             task.map(|task| task.project_key.as_str()).unwrap_or("unknown"),
             view.frozen_profile.as_deref().map(|p| state.runtime_label_for_profile(p)).unwrap_or_else(|| state.runtime_label()),
             view.frozen_model.as_deref().unwrap_or("provider default"),
             view.frozen_reasoning.as_deref().unwrap_or("profile default"),
-            view.scheduler_status.as_ref().map(scheduler_status_text).unwrap_or("not scheduled"),
+            view.scheduler_status.as_ref().map(scheduler_status_text).unwrap_or("not queued"),
             view.durable_state.map(|state| state.as_str()).unwrap_or("state pending"), view.repair_attempt,
             view.started_at.map(|started| started.elapsed().as_secs()).unwrap_or(0),
             view.persistence_error.as_ref().map(|error| format!("STATE UNCERTAIN / DURABILITY FAILURE\n{error}")).unwrap_or_else(|| if view.cancellation_requested { "Cancellation requested...".to_owned() } else { String::new() }),
@@ -1485,7 +1485,7 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
                         }
                     } else {
                         state.feedback =
-                            "No active scheduler; permission decision was not delivered."
+                            "No active execution; permission decision was not delivered."
                                 .to_owned();
                         state.pending_permissions.push((task_id, request));
                     }
@@ -2063,6 +2063,53 @@ fn activity_home(state: &AppState) -> String {
             state.feedback
         );
     }
+
+    let mut lines = vec![format!(
+        "Relay                                      {}",
+        state.runtime_health.display_status()
+    )];
+
+    // Escalation inbox: work waiting on a human decision.
+    let escalated: Vec<&StoredTask> = state
+        .durable_tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.state,
+                TaskState::NeedsClarification | TaskState::NeedsDecision
+            )
+        })
+        .collect();
+    lines.push("\nESCALATION INBOX".to_owned());
+    if escalated.is_empty() {
+        lines.push("  No escalations waiting.".to_owned());
+    } else {
+        for task in &escalated {
+            let kind = if task.state == TaskState::NeedsClarification {
+                "CLARIFICATION"
+            } else {
+                "DECISION"
+            };
+            lines.push(format!(
+                "  ! {kind}  {}  {}",
+                task.project_key, task.handoff.title
+            ));
+            lines.push(format!("      {} — packet visible via /tasks", task.id));
+        }
+    }
+
+    // Distribution: where approved work went.
+    lines.push("\nDISTRIBUTION".to_owned());
+    let distribution = distribution_rows(state);
+    if distribution.is_empty() {
+        lines.push("  No approved work yet.".to_owned());
+    } else {
+        for row in distribution {
+            lines.push(format!("  {row}"));
+        }
+    }
+
+    // Queue summary (de-emphasized; below escalations and distribution).
     let active = state
         .scheduler_snapshot
         .tasks
@@ -2080,20 +2127,7 @@ fn activity_home(state: &AppState) -> String {
             )
         })
         .count();
-    let attention = state
-        .durable_tasks
-        .iter()
-        .filter(|task| {
-            matches!(
-                task.state,
-                TaskState::NeedsClarification | TaskState::NeedsDecision
-            )
-        })
-        .count();
-    let mut lines = vec![format!(
-        "Relay                                      {}",
-        state.runtime_health.display_status()
-    )];
+    let attention = escalated.len();
     if active + waiting + attention == 0 {
         lines.push("\nNo active tasks.".to_owned());
     } else {
@@ -2126,13 +2160,62 @@ fn activity_home(state: &AppState) -> String {
     lines.join("\n")
 }
 
+fn distribution_rows(state: &AppState) -> Vec<String> {
+    let profile_for_task = |task_id: TaskId| -> String {
+        state
+            .execution_records
+            .get(&task_id)
+            .map(|record| record.runtime_profile.clone())
+            .unwrap_or_else(|| state.active_profile_id.clone())
+    };
+
+    let mut counts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for snapshot in state
+        .scheduler_snapshot
+        .tasks
+        .iter()
+        .filter(|snapshot| matches!(snapshot.status, SchedulerTaskStatus::Running))
+    {
+        counts
+            .entry(profile_for_task(snapshot.task_id))
+            .or_default()
+            .0 += 1;
+    }
+    for task in state
+        .durable_tasks
+        .iter()
+        .filter(|task| matches!(task.state, TaskState::Done))
+    {
+        counts.entry(profile_for_task(task.id)).or_default().1 += 1;
+    }
+
+    counts
+        .into_iter()
+        .filter(|(_, (running, completed))| running + completed > 0)
+        .map(|(profile, (running, completed))| {
+            format!(
+                "{} ({profile}): {running} running · {completed} completed",
+                provider_label_for_profile(&profile)
+            )
+        })
+        .collect()
+}
+
+fn provider_label_for_profile(profile: &str) -> String {
+    match profile.split('/').next().unwrap_or(profile) {
+        "codex" => "Codex".to_owned(),
+        "antigravity" => "Antigravity".to_owned(),
+        other => other.to_ascii_uppercase(),
+    }
+}
+
 fn scheduler_status_text(status: &SchedulerTaskStatus) -> &'static str {
     match status {
         SchedulerTaskStatus::Running => "RUNNING",
         SchedulerTaskStatus::WaitingPermission => "WAITING FOR PERMISSION",
-        SchedulerTaskStatus::QueuedReady => "QUEUED / ready for scheduler",
-        SchedulerTaskStatus::QueuedGlobal => "WAITING — global execution slot",
-        SchedulerTaskStatus::QueuedProject => "WAITING — project execution slot",
+        SchedulerTaskStatus::QueuedReady => "QUEUED",
+        SchedulerTaskStatus::QueuedGlobal => "WAITING (global)",
+        SchedulerTaskStatus::QueuedProject => "WAITING (project)",
     }
 }
 
@@ -3240,7 +3323,7 @@ impl AppState {
         }
         if self.scheduler_rebind_pending {
             self.feedback =
-                "Scheduler refresh pending; new Run approvals resume after active work is idle."
+                "Execution refresh pending; new Run approvals resume after active work is idle."
                     .to_owned();
             return;
         }
@@ -3349,7 +3432,7 @@ impl AppState {
                     .entry(task.id)
                     .or_default()
                     .scheduler_status = Some(SchedulerTaskStatus::QueuedReady);
-                self.feedback = "Run approved. Queued for the scheduler.".to_owned();
+                self.feedback = "Run approved. Queued for execution.".to_owned();
                 self.screen = Screen::Execution;
                 self.ensure_scheduler_driver(scheduler).await;
             }
@@ -3490,8 +3573,8 @@ impl AppState {
                     self.last_reports.insert(report.task_id, report);
                 }
             }
-            Ok(Err(error)) => self.feedback = format!("Scheduler driver failed: {error}"),
-            Err(error) => self.feedback = format!("Scheduler driver stopped: {error}"),
+            Ok(Err(error)) => self.feedback = format!("Execution driver failed: {error}"),
+            Err(error) => self.feedback = format!("Execution driver stopped: {error}"),
         }
         self.refresh_durable_tasks().await;
     }
@@ -4706,7 +4789,7 @@ mod tests {
 
         assert!(state.scheduler_rebind_pending);
         state.submit_selected_task().await;
-        assert!(state.feedback.contains("Scheduler refresh pending"));
+        assert!(state.feedback.contains("Execution refresh pending"));
         assert!(!state.execution_views.contains_key(&task_id));
     }
 
@@ -5051,6 +5134,120 @@ mod tests {
         assert!(
             rendered_text.contains("Verification: PASS"),
             "Expected Verification line, got:\n{rendered_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_escalation_inbox_lists_needs_decision_and_not_ready_tasks() {
+        let mut state = app_state_with_project_with_store().await;
+        state.start_paste_task();
+        state.paste_text = task_json();
+        state.submit_paste_task();
+        state.confirm_task_import().await;
+
+        // A READY task must not appear in the escalation inbox.
+        let ready_body = activity_home(&state);
+        assert!(ready_body.contains("ESCALATION INBOX"));
+        assert!(ready_body.contains("No escalations waiting."));
+        assert!(!ready_body.contains("DECISION"));
+
+        // Once escalated, the task is listed as a DECISION packet.
+        let task_id = state.selected_task.unwrap();
+        if let Some(task) = state.durable_tasks.iter_mut().find(|t| t.id == task_id) {
+            task.state = TaskState::NeedsDecision;
+        }
+        let escalated_body = activity_home(&state);
+        assert!(escalated_body.contains("ESCALATION INBOX"));
+        assert!(escalated_body.contains("! DECISION"));
+        assert!(escalated_body.contains("Implement local ingress"));
+        assert!(escalated_body.contains("packet visible via /tasks"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_distribution_counts_running_executions() {
+        let mut state = app_state_with_project_with_store().await;
+        state.start_paste_task();
+        state.paste_text = task_json();
+        state.submit_paste_task();
+        state.confirm_task_import().await;
+        let task_id = state.selected_task.unwrap();
+
+        assert!(activity_home(&state).contains("No approved work yet."));
+
+        state.scheduler_snapshot = SchedulerSnapshot {
+            tasks: vec![relay_core::SchedulerTaskSnapshot {
+                task_id,
+                project_key: ProjectKey::parse("relay").unwrap(),
+                status: SchedulerTaskStatus::Running,
+            }],
+        };
+        state.execution_records.insert(
+            task_id,
+            relay_store::ExecutionRecord {
+                id: "execution-1".to_owned(),
+                task_id: task_id.to_string(),
+                runtime_profile: "codex/implement".to_owned(),
+                phase: "implement".to_owned(),
+                repair_attempt_count: 0,
+                started_at: "2026-01-01T00:00:00Z".to_owned(),
+                ended_at: None,
+                exit_outcome: None,
+                failure_category: None,
+                repository_snapshot_json: None,
+                runtime_metadata_json: None,
+            },
+        );
+
+        let body = activity_home(&state);
+        assert!(body.contains("DISTRIBUTION"));
+        assert!(
+            body.contains("Codex (codex/implement): 1 running · 0 completed"),
+            "expected distribution row, got:\n{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_view_uses_handoff_status_terminology() {
+        let mut state = app_state_with_project_with_store().await;
+        state.start_paste_task();
+        state.paste_text = task_json();
+        state.submit_paste_task();
+        state.confirm_task_import().await;
+        let task_id = state.selected_task.unwrap();
+        state
+            .execution_views
+            .entry(task_id)
+            .or_default()
+            .scheduler_status = Some(SchedulerTaskStatus::QueuedReady);
+        state.selected_task = Some(task_id);
+
+        let backend = ratatui::backend::TestBackend::new(80, 25);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_execution(frame, &state, frame.area());
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered_text: String = (0..buffer.area.height)
+            .flat_map(|y| {
+                let mut line = String::new();
+                for x in 0..buffer.area.width {
+                    line.push_str(buffer[(x, y)].symbol());
+                }
+                line.push('\n');
+                line.chars().collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert!(
+            rendered_text.contains("Handoff status: QUEUED"),
+            "expected handoff status label, got:\n{rendered_text}"
+        );
+        assert!(
+            !rendered_text.contains("Scheduler:"),
+            "execution view must not use scheduler terminology:\n{rendered_text}"
         );
     }
 

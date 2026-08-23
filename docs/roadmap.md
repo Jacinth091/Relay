@@ -34,9 +34,13 @@ grants, Diff/Logs screens, Doctor view.
 
 Not started, despite appearing in older plans:
 
-- GitHub ingress / `gh` adapter: **planned, not started**. GitHub currently
-  appears only as expected-remote metadata in repository safety checks.
-- Relay Direct / MCP submission transport: **planned, not started**.
+- GitHub ingress / `gh` adapter: **descoped from v0.1 by
+  [ADR-0016](adr/0016-mcp-first-submission-and-v0-1-local-descope.md)**. GitHub
+  remains an optional future compatibility path whose issue-writer must be
+  host-agnostic. It currently appears only as expected-remote metadata in
+  repository safety checks.
+- Relay Direct / MCP submission transport: **next up — M9**. See
+  [docs/M9_PACK](M9_PACK/RELAY_M9_MCP_DIRECT_IMPLEMENTATION_PACK/00-IMPLEMENTATION-SEQUENCE.md).
 - Executable planner-adapter conformance harness: **planned, not started**.
   The conformance cases exist only as documentation
   ([docs/planner-adapter-conformance.md](planner-adapter-conformance.md)).
@@ -61,8 +65,10 @@ Must include:
 - task protocol — met;
 - local JSON/Markdown file and paste ingress — met;
 - durable state — met;
-- GitHub ingress and optional GitHub binding — **unmet: planned, not started**;
-  see the pending ADR question in [docs/status-2026-08.md](status-2026-08.md);
+- GitHub ingress and optional GitHub binding — **descoped by
+  [ADR-0016](adr/0016-mcp-first-submission-and-v0-1-local-descope.md)**; v0.1
+  ships with local file/paste as the only ingress; automation arrives via the
+  M9 Relay Direct/MCP transport instead;
 - Codex runtime — met;
 - live execution — met;
 - bounded automatic repair — met;
@@ -72,8 +78,8 @@ Must include:
 - Resolution Packets — met;
 - no automatic push — met.
 
-The unmet bullet is flagged, not descoped. v0.1 either gains the GitHub leg or
-the descope is made explicit by an ADR.
+The GitHub bullet is descoped by ADR-0016: v0.1 ships local-ingress-only, and
+the first automatic submission transport is Relay Direct/MCP (M9).
 
 ## v0.2 — Daily Driver
 

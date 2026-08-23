@@ -1,0 +1,32 @@
+{
+  "protocol_version": 1,
+  "project": "relay",
+  "title": "Implement M9 Relay Direct MCP submission server",
+  "stack": "chatgpt-codex",
+  "task": {
+    "goal": "Implement the Relay Direct (MCP) submission transport per docs/M9_PACK/RELAY_M9_MCP_DIRECT_IMPLEMENTATION_PACK/00-IMPLEMENTATION-SEQUENCE.md and ADR-0016, in the documented phase order.",
+    "requirements": [
+      "Phase 01: add clap subcommand routing so `relay serve-mcp` starts a headless stdio process while default (no-argument) startup keeps the existing TUI behavior unchanged; no raw mode or terminal initialization on the MCP path; clean exit code 0 on stdin EOF.",
+      "Phase 02: harden crates/relay-store for two concurrent processes: WAL journal mode, busy timeout, bounded retry on SQLITE_BUSY/SQLITE_LOCKED, plus integration tests proving interleaved writes from two store instances against one database file succeed without corruption or hangs.",
+      "Phase 03: implement the MCP stdio surface: initialize handshake, tools/list, and a submit_handoff tool that validates one canonical HandoffTask v1 payload through the same protocol path as local ingress, resolves the project against the trusted registry, rejects unsupported extensions, persists via the existing confirm/import path assigning a Relay-owned TaskId, and returns it only after durable confirmation; every failure maps to a structured error and fails closed.",
+      "Phase 04: add integration tests that spawn the real binary for handshake, successful submission, negative conformance cases, and clean lifecycle; write host recipe documents (Claude Code, OpenCode, Codex CLI) as instructions only with no host-specific Rust code; update submission-and-bindings, roadmap, and first-run-setup docs.",
+      "Respect ADR-0016 layering: MCP is the primary automation transport; no GitHub ingress work; no headless execution; submitted tasks land in Ready state and require explicit Run approval in the TUI."
+    ],
+    "constraints": [
+      "Do not push automatically.",
+      "Relay Core stays provider-agnostic and deterministic; no LLM reasoning in core.",
+      "No host-specific behavior enters Rust code; planner host integration is documentation only.",
+      "If an MCP SDK crate is adopted instead of a hand-rolled protocol layer, record its license and required notices in THIRD_PARTY_NOTICES.md.",
+      "Keep M6 scheduler semantics frozen; the MCP server must not construct an ExecutionScheduler or enqueue execution.",
+      "Implement phases in order; do not begin Phase 03 before Phase 02 concurrency tests pass."
+    ],
+    "verification": [
+      "cargo fmt --check passes.",
+      "cargo clippy --workspace --all-targets --all-features reports no warnings.",
+      "cargo test --workspace passes, including new store-concurrency and MCP end-to-end integration tests.",
+      "`relay serve-mcp` exits cleanly when stdin closes and never touches the terminal state.",
+      "A manual smoke test completes one real submission from a local planner host into Relay review."
+    ]
+  },
+  "ambiguity_policy": "needs_clarification"
+}

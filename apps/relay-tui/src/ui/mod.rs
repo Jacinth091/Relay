@@ -16,34 +16,30 @@ pub(crate) use tasks::{
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
+    style::Style,
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
+use relay_runtime_antigravity::AntigravityRuntimeHealth;
+use relay_runtime_codex::CodexRuntimeHealth;
 
+use crate::input::command_mode_available;
 use crate::state::{AppState, Screen};
 use crate::theme::*;
+use relay_core::TaskState;
 
 pub(crate) fn render(frame: &mut Frame, state: &AppState) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // Header
+            Constraint::Length(1), // Top bar
             Constraint::Min(3),    // Main content area
-            Constraint::Length(2), // Command footer
+            Constraint::Length(1), // Command prompt
+            Constraint::Length(1), // Key bar
         ])
         .split(frame.area());
 
-    let runtime_status_marker =
-        if state.runtime_health.is_ready() || state.antigravity_health.is_ready() {
-            marker_active()
-        } else {
-            marker_waiting()
-        };
-    let header_text = format!(
-        "Relay                                  {} {} {}",
-        state.active_runtime_provider, runtime_status_marker, state.active_profile_id
-    );
-    let header_widget = Paragraph::new(header_text).style(style_header());
-    frame.render_widget(header_widget, areas[0]);
+    render_top_bar(frame, state, areas[0]);
 
     match state.screen {
         Screen::Dashboard => render_dashboard(frame, state, areas[1]),
@@ -65,18 +61,186 @@ pub(crate) fn render(frame: &mut Frame, state: &AppState) {
         Screen::Doctor => render_doctor(frame, state, areas[1]),
     }
 
+    render_prompt_line(frame, state, areas[2]);
+    render_key_bar(frame, state, areas[3]);
+
+    if state.command_mode {
+        render_command_palette_overlay(frame, state, frame.area());
+    }
+}
+
+fn screen_title(screen: Screen) -> &'static str {
+    match screen {
+        Screen::Dashboard => "dashboard",
+        Screen::Tasks => "tasks",
+        Screen::Projects => "projects",
+        Screen::AddProject => "add project",
+        Screen::NewTask => "new handoff",
+        Screen::ImportFile => "import file",
+        Screen::PasteTask => "paste task",
+        Screen::TaskPreview => "preview",
+        Screen::TaskReview => "review",
+        Screen::Execution => "execution",
+        Screen::Result => "result",
+        Screen::Runtimes => "runtimes",
+        Screen::RuntimeDetail => "runtime detail",
+        Screen::Diff => "diff",
+        Screen::Logs => "logs",
+        Screen::Settings => "settings",
+        Screen::Doctor => "doctor",
+    }
+}
+
+fn active_provider_health(state: &AppState) -> (&'static str, Style) {
+    let theme = Theme::default();
+    let checking = matches!(state.runtime_health, CodexRuntimeHealth::Checking)
+        || matches!(state.antigravity_health, AntigravityRuntimeHealth::Checking);
+    if state.runtime_health.is_ready() || state.antigravity_health.is_ready() {
+        (marker_active(), theme.success())
+    } else if checking {
+        ("…", theme.muted())
+    } else {
+        (marker_waiting(), theme.error())
+    }
+}
+
+fn render_top_bar(frame: &mut Frame, state: &AppState, area: Rect) {
+    let theme = Theme::default();
+    let title = screen_title(state.screen);
+    let (marker, marker_style) = active_provider_health(state);
+    let pad = (area.width as usize).saturating_sub(title.len() + marker.chars().count() + 10);
+    let line = Line::from(vec![
+        Span::styled("relay", theme.muted()),
+        Span::styled(" · ", theme.muted()),
+        Span::styled(title, theme.accent()),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(format!("{} ", state.active_runtime_provider), theme.muted()),
+        Span::styled(marker, marker_style),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn render_prompt_line(frame: &mut Frame, state: &AppState, area: Rect) {
+    let theme = Theme::default();
     let prompt = if state.command_mode {
         format!("> {}", state.command_input)
     } else {
         "> /_  (type / for commands)".to_owned()
     };
-    let footer_text = format!("────────────────────────────────────────\n{prompt}");
-    let footer_widget = Paragraph::new(footer_text).style(style_muted());
-    frame.render_widget(footer_widget, areas[2]);
+    let style = if state.command_mode {
+        theme.text()
+    } else {
+        theme.muted()
+    };
+    frame.render_widget(Paragraph::new(prompt).style(style), area);
+}
 
+/// Key hints valid for the current screen and state.
+///
+/// Each table mirrors the match arms in `input.rs` so the bottom bar and the
+/// actual key handling cannot drift apart. Returns `(key, label)` pairs.
+pub(crate) fn key_hints(state: &AppState) -> Vec<(String, String)> {
     if state.command_mode {
-        render_command_palette_overlay(frame, state, frame.area());
+        return vec![
+            ("tab".to_owned(), "complete".to_owned()),
+            ("enter".to_owned(), "run".to_owned()),
+            ("esc".to_owned(), "close".to_owned()),
+        ];
     }
+
+    let mut hints: Vec<(String, String)> = match state.screen {
+        Screen::Dashboard => vec![
+            ("n", "new handoff"),
+            ("t", "tasks"),
+            ("p", "projects"),
+            ("a", "add project"),
+            ("q", "quit"),
+        ],
+        Screen::Tasks => vec![("enter", "open"), ("esc", "dashboard"), ("q", "quit")],
+        Screen::Projects => vec![
+            ("r", "re-check repos"),
+            ("a", "add project"),
+            ("esc", "dashboard"),
+            ("q", "quit"),
+        ],
+        Screen::AddProject => vec![("tab", "next field"), ("enter", "save"), ("esc", "cancel")],
+        Screen::NewTask => vec![
+            ("v", "paste task"),
+            ("f", "import file"),
+            ("enter", "select"),
+            ("esc", "dashboard"),
+            ("q", "quit"),
+        ],
+        Screen::ImportFile => vec![("enter", "import"), ("esc", "back")],
+        Screen::PasteTask => vec![
+            ("ctrl+enter", "newline"),
+            ("enter", "validate"),
+            ("esc", "back"),
+        ],
+        Screen::TaskPreview => vec![("i", "import"), ("c", "cancel"), ("q", "quit")],
+        Screen::TaskReview => task_review_hints(state),
+        Screen::Execution => execution_hints(state),
+        Screen::Result => vec![("t", "tasks"), ("d", "dashboard"), ("n", "new handoff")],
+        Screen::Diff | Screen::Logs => vec![("esc", "dashboard")],
+        Screen::Runtimes | Screen::Settings | Screen::Doctor => {
+            vec![("r", "re-check"), ("esc", "dashboard")]
+        }
+        Screen::RuntimeDetail => {
+            if state.runtime_detail_submenu.is_some() {
+                vec![("enter", "choose"), ("esc", "close")]
+            } else {
+                vec![("enter", "select"), ("r", "re-check"), ("esc", "dashboard")]
+            }
+        }
+    }
+    .into_iter()
+    .map(|(key, label)| (key.to_owned(), label.to_owned()))
+    .collect();
+
+    if command_mode_available(state.screen) {
+        hints.push(("/".to_owned(), "commands".to_owned()));
+    }
+    hints
+}
+
+/// Mirrors the `Screen::TaskReview` arms in `input.rs`, including submenu state.
+fn task_review_hints(state: &AppState) -> Vec<(&'static str, &'static str)> {
+    if state.task_review_submenu.is_some() {
+        return vec![("enter", "choose"), ("esc", "back")];
+    }
+    let eligible = state.selected_stored_task().is_some_and(|task| {
+        task.state == TaskState::Ready && state.ui_preflight(task) == "eligible"
+    });
+    if eligible {
+        vec![("r", "run"), ("enter", "select"), ("b", "back")]
+    } else {
+        vec![("enter", "open"), ("b", "back")]
+    }
+}
+
+/// Mirrors the `Screen::Execution` arms in `input.rs`: permission decisions
+/// take priority, then cancel confirmation, then navigation.
+fn execution_hints(state: &AppState) -> Vec<(&'static str, &'static str)> {
+    if !state.pending_permissions.is_empty() {
+        return vec![("y", "allow once"), ("s", "allow this run"), ("n", "deny")];
+    }
+    if state.cancel_confirmation.is_some() {
+        return vec![("y", "confirm cancel"), ("n", "keep running")];
+    }
+    vec![("c", "cancel"), ("b", "tasks")]
+}
+
+fn render_key_bar(frame: &mut Frame, state: &AppState, area: Rect) {
+    let theme = Theme::default();
+    let mut spans = Vec::new();
+    for (i, (key, label)) in key_hints(state).iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ", theme.muted()));
+        }
+        spans.push(Span::styled(key.clone(), theme.accent()));
+        spans.push(Span::styled(format!(" {label}"), theme.muted()));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_command_palette_overlay(frame: &mut Frame, state: &AppState, area: Rect) {

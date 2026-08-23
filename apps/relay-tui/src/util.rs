@@ -105,11 +105,11 @@ pub(crate) fn dashboard_status(state: &AppState) -> String {
     format!("{projects}\n{tasks}\n\n{}", execution.join("\n"))
 }
 
+#[cfg(test)]
 pub(crate) fn activity_home(state: &AppState) -> String {
     if state.relay.configured_project_count() == 0 {
         return format!(
-            "Relay                                      {}\n\nWelcome to Relay.\n\nNo projects are configured yet.\nRelay needs a trusted local Git repository before it can run implementation tasks.\n\nTry:\n  /project add\n  /help\n\n{}",
-            state.runtime_health.display_status(),
+            "Welcome to Relay.\n\nNo projects are configured yet.\nRelay needs a trusted local Git repository before it can run implementation tasks.\n\n{}",
             state.feedback
         );
     }
@@ -120,16 +120,7 @@ pub(crate) fn activity_home(state: &AppState) -> String {
     )];
 
     // Escalation inbox: work waiting on a human decision.
-    let escalated: Vec<&StoredTask> = state
-        .durable_tasks
-        .iter()
-        .filter(|task| {
-            matches!(
-                task.state,
-                TaskState::NeedsClarification | TaskState::NeedsDecision
-            )
-        })
-        .collect();
+    let escalated = escalated_tasks(state);
     lines.push("\nESCALATION INBOX".to_owned());
     if escalated.is_empty() {
         lines.push("  No escalations waiting.".to_owned());
@@ -208,6 +199,20 @@ pub(crate) fn activity_home(state: &AppState) -> String {
     }
     lines.push(format!("\n{}", state.feedback));
     lines.join("\n")
+}
+
+/// Tasks waiting on a human decision: the escalation inbox.
+pub(crate) fn escalated_tasks(state: &AppState) -> Vec<&StoredTask> {
+    state
+        .durable_tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.state,
+                TaskState::NeedsClarification | TaskState::NeedsDecision
+            )
+        })
+        .collect()
 }
 
 pub(crate) fn distribution_rows(state: &AppState) -> Vec<String> {

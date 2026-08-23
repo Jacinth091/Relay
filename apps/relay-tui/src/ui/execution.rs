@@ -73,7 +73,7 @@ pub(crate) fn render_execution(frame: &mut Frame, state: &AppState, area: Rect) 
             permission_popup = Some(request.clone());
         }
 
-        format!("Task: {id}\nProject: {}\nRuntime: {}\nModel: {}\nReasoning: {}\nHandoff status: {}\nPhase: {}\nRepair: {}\nElapsed: {}s\n{}\n\nOutput:\n{}\n\nTry:\n  /cancel\n  /diff\n  /logs\n  /tasks",
+        format!("Task: {id}\nProject: {}\nRuntime: {}\nModel: {}\nReasoning: {}\nHandoff status: {}\nPhase: {}\nRepair: {}\nElapsed: {}s\n{}\n\nOutput:\n{}",
             task.map(|task| task.project_key.as_str()).unwrap_or("unknown"),
             view.frozen_profile.as_deref().map(|p| state.runtime_label_for_profile(p)).unwrap_or_else(|| state.runtime_label()),
             view.frozen_model.as_deref().unwrap_or("provider default"),
@@ -124,9 +124,7 @@ pub(crate) fn render_execution(frame: &mut Frame, state: &AppState, area: Rect) 
             .reason
             .as_deref()
             .unwrap_or("provider approval required");
-        let popup_text = format!(
-            "Kind: {kind}\n{command}{cwd}{paths}Reason: {reason}\n──────────────\n[Y] Allow once  [S] Allow for session  [N] Deny"
-        );
+        let popup_text = format!("Kind: {kind}\n{command}{cwd}{paths}Reason: {reason}");
 
         let popup_width = popup_text
             .lines()
@@ -187,7 +185,7 @@ pub(crate) fn render_result(frame: &mut Frame, state: &AppState, area: Rect) {
         let repairs = state.execution_views.get(&task.id).map(|v| v.repair_attempt).unwrap_or(0);
         let summary = report.and_then(|r| r.outcome_summary.as_deref()).unwrap_or("No confirmed execution report.");
 
-        format!("Task: {task_id}\nProject: {project}\nRuntime: {runtime}\nModel: {model}\nReasoning: {reasoning}\nState: {task_state}\nOutcome: {outcome}\nVerification: {verification}\nRepairs: {repairs}\nRepository: {repository}\n\nSummary:\n{summary}\n\nTry:\n  /diff\n  /logs\n  /tasks\n  /new")
+        format!("Task: {task_id}\nProject: {project}\nRuntime: {runtime}\nModel: {model}\nReasoning: {reasoning}\nState: {task_state}\nOutcome: {outcome}\nVerification: {verification}\nRepairs: {repairs}\nRepository: {repository}\n\nSummary:\n{summary}")
     }).unwrap_or_else(|| "No durable task selected.".to_owned());
     let scroll = state.result_scroll.min(visible_scroll(&body, area.height));
     frame.render_widget(

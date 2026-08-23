@@ -26,7 +26,7 @@ pub(crate) fn render_new_task(frame: &mut Frame, state: &AppState, area: Rect) {
         "  Import task file"
     };
     let body = format!(
-        "New Task\n\nImport a user-approved Relay handoff.\n\n{}\n{}\n\nUse Up/Down to navigate, Enter to select, Esc to cancel.\n\n{}",
+        "New Task\n\nImport a user-approved Relay handoff.\n\n{}\n{}\n\n{}",
         option_paste, option_file, state.feedback
     );
     frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), area);
@@ -122,14 +122,14 @@ pub(crate) fn render_task_review(frame: &mut Frame, state: &AppState, area: Rect
                 task.state,
                 TaskState::Done | TaskState::Failed | TaskState::Cancelled
             ) {
-                action = "\n\n[Enter] View result  [B] Back".to_owned();
+                action = "\n\nView result from here.".to_owned();
             } else if matches!(
                 task.state,
                 TaskState::NeedsClarification | TaskState::NeedsDecision
             ) {
-                action = "\n\nATTENTION REQUIRED: external resolution is required.\n[B] Back".to_owned();
+                action = "\n\nATTENTION REQUIRED: external resolution is required.".to_owned();
             } else {
-                action = "\n\n[B] Back".to_owned();
+                action = String::new();
             };
             let requested_stack = task.handoff.stack.as_deref().unwrap_or("not requested");
             let effective_stack = state

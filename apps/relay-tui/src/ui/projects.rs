@@ -16,7 +16,7 @@ pub(crate) fn render_add_project(frame: &mut Frame, state: &AppState, area: Rect
     let form = &state.add_project;
     if let Some(discovered) = &state.discovered_project {
         let body = format!(
-            "Add Project\n\nDetected repository\n\nGit root   {}\nOrigin     {}\n\nWill register\nKey        {}\nPath       {}\nRemote     {}\nGitHub     {}/{}\nStack      {}\n\n✓ Git worktree detected\n{}\n\nPress Enter to add this repository. Tab/arrow keys edit details. Esc cancels.",
+            "Add Project\n\nDetected repository\n\nGit root   {}\nOrigin     {}\n\nWill register\nKey        {}\nPath       {}\nRemote     {}\nGitHub     {}/{}\nStack      {}\n\n✓ Git worktree detected\n{}",
             discovered.repository_root.display(),
             discovered.remote.as_deref().unwrap_or("not configured"),
             form.key,

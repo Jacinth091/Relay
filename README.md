@@ -650,6 +650,7 @@ Start here:
 - [`docs/provider-support.md`](docs/provider-support.md) — planner-host support and installation matrix.
 - [`docs/planner-adapter-conformance.md`](docs/planner-adapter-conformance.md) — shared behavioral contract for every adapter.
 - [`docs/technology-stack.md`](docs/technology-stack.md)
+- [`docs/cli.md`](docs/cli.md) — binary commands, environment variables, and TUI command palette reference.
 - [`docs/task-protocol.md`](docs/task-protocol.md)
 - [`docs/local-ingress.md`](docs/local-ingress.md) — local file and paste formats.
 - [`docs/installation.md`](docs/installation.md) — proposed future installation experience.

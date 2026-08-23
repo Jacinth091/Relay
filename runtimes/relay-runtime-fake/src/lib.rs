@@ -119,6 +119,7 @@ impl Runtime for FakeRuntime {
             streaming_output: true,
             cancellation: true,
             deterministic_outcome: true,
+            permission_support: relay_runtime::RuntimePermissionSupport::PreapprovedOnly,
         }
     }
 
@@ -157,6 +158,7 @@ impl Runtime for FakeRuntime {
             Ok(RuntimeSession {
                 session_id,
                 events: rx,
+                control: None,
             })
         })
     }

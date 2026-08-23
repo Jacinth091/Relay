@@ -50,6 +50,7 @@ pub struct NewExecutionRecord {
     pub runtime_profile: String,
     pub phase: String,
     pub repository_snapshot_json: Option<String>,
+    pub runtime_metadata_json: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +65,7 @@ pub struct ExecutionRecord {
     pub exit_outcome: Option<String>,
     pub failure_category: Option<String>,
     pub repository_snapshot_json: Option<String>,
+    pub runtime_metadata_json: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +171,28 @@ impl SqliteStore {
         Ok(task)
     }
 
+    /// Append a bounded, structured event without exposing the SQL event table
+    /// to Core callers. Event payloads are caller-validated JSON strings.
+    pub async fn append_event(
+        &self,
+        task_id: Option<&str>,
+        execution_id: Option<&str>,
+        event_kind: &str,
+        event_json: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        insert_event(
+            &mut transaction,
+            task_id,
+            execution_id,
+            event_kind,
+            event_json,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub async fn update_task_state(
         &self,
         id: &str,
@@ -257,9 +281,10 @@ impl SqliteStore {
                 task_id,
                 runtime_profile,
                 phase,
-                repository_snapshot_json
+                repository_snapshot_json,
+                runtime_metadata_json
             )
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             "#,
         )
         .bind(&execution.id)
@@ -267,6 +292,7 @@ impl SqliteStore {
         .bind(&execution.runtime_profile)
         .bind(&execution.phase)
         .bind(execution.repository_snapshot_json.as_deref())
+        .bind(execution.runtime_metadata_json.as_deref())
         .execute(&mut *transaction)
         .await?;
 
@@ -313,7 +339,8 @@ impl SqliteStore {
                 ended_at,
                 exit_outcome,
                 failure_category,
-                repository_snapshot_json
+                repository_snapshot_json,
+                runtime_metadata_json
             FROM executions
             WHERE task_id = ?1
             ORDER BY started_at, id
@@ -770,7 +797,8 @@ async fn fetch_execution<'a>(
             ended_at,
             exit_outcome,
             failure_category,
-            repository_snapshot_json
+            repository_snapshot_json,
+            runtime_metadata_json
         FROM executions
         WHERE id = ?1
         "#,
@@ -838,6 +866,7 @@ fn row_to_execution_record(row: sqlx::sqlite::SqliteRow) -> Result<ExecutionReco
         exit_outcome: row.try_get("exit_outcome")?,
         failure_category: row.try_get("failure_category")?,
         repository_snapshot_json: row.try_get("repository_snapshot_json")?,
+        runtime_metadata_json: row.try_get("runtime_metadata_json")?,
     })
 }
 
@@ -1358,6 +1387,7 @@ mod tests {
             runtime_profile: "fake/default".to_owned(),
             phase: "running".to_owned(),
             repository_snapshot_json: Some(r#"{"eligibility":"eligible"}"#.to_owned()),
+            runtime_metadata_json: None,
         }
     }
 

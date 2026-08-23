@@ -297,6 +297,7 @@ mod tests {
         let mut relay = relay_with_project("relay");
 
         for title in ["First task", "Second task"] {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             let json = TASK_JSON.replace("Persist imported task", title);
             let candidate = relay.preview_local_paste(&json).unwrap();
             let imported = relay.confirm_task_import(candidate).clone();

@@ -9,9 +9,9 @@ use std::{
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use relay_core::{
-    BranchState, CoreExecutionEvent, ExecutionReport, ProjectKey, ProjectRegistry, RegisterProject,
-    Relay, RepositoryEligibility, RepositoryInspection, SchedulerSnapshot, SchedulerTaskStatus,
-    SqliteStore, TaskState, list_stored_tasks,
+    BranchState, CoreExecutionEvent, ExecutionLimits, ExecutionReport, ProjectKey, ProjectRegistry,
+    RegisterProject, Relay, RepositoryEligibility, RepositoryInspection, SchedulerSnapshot,
+    SchedulerTaskStatus, SqliteStore, TaskState, list_stored_tasks,
 };
 use relay_runtime_antigravity::AntigravityRuntimeHealth;
 use relay_runtime_codex::CodexRuntimeHealth;
@@ -1082,4 +1082,163 @@ fn unique_temp_path(name: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!("relay-tui-{name}-{nanos}"))
+}
+
+// --- Settings form -------------------------------------------------------
+
+use crate::runtime_settings::RuntimeSettings;
+use crate::state::SettingsField;
+use crate::ui::key_hints;
+
+fn settings_test_state() -> AppState {
+    let mut state = AppState::new(
+        Relay::new(),
+        unique_temp_path("settings-config").join("relay.toml"),
+        true,
+        "ready".to_owned(),
+    );
+    // Route persistence at a temp path so tests never touch real user config.
+    state.runtime_config_path = unique_temp_path("settings-save").join("runtimes.toml");
+    state.screen = Screen::Settings;
+    state
+}
+
+async fn settings_key(state: &mut AppState, code: KeyCode) {
+    let quit = handle_key(state, KeyEvent::new(code, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(!quit);
+}
+
+#[tokio::test]
+async fn settings_selection_and_edit_updates_pending_buffer() {
+    let mut state = settings_test_state();
+    assert_eq!(state.settings_form.selected, SettingsField::MaxParallel);
+    assert!(state.settings_form.buffer.is_empty());
+
+    settings_key(&mut state, KeyCode::Down).await;
+    assert_eq!(
+        state.settings_form.selected,
+        SettingsField::PerProjectMaxParallel
+    );
+    settings_key(&mut state, KeyCode::Up).await;
+    settings_key(&mut state, KeyCode::Up).await;
+    assert_eq!(
+        state.settings_form.selected,
+        SettingsField::MaxDurationMinutes
+    );
+
+    // Enter begins editing prefilled with the current value.
+    settings_key(&mut state, KeyCode::Enter).await;
+    assert!(state.settings_form.editing);
+    assert_eq!(state.settings_form.buffer, "0");
+
+    settings_key(&mut state, KeyCode::Char('9')).await;
+    settings_key(&mut state, KeyCode::Char('0')).await;
+    assert_eq!(state.settings_form.buffer, "090");
+
+    settings_key(&mut state, KeyCode::Backspace).await;
+    assert_eq!(state.settings_form.buffer, "09");
+
+    // Esc exits edit mode without leaving the screen or committing.
+    settings_key(&mut state, KeyCode::Esc).await;
+    assert!(!state.settings_form.editing);
+    assert!(state.settings_form.buffer.is_empty());
+    assert_eq!(state.screen, Screen::Settings);
+}
+
+#[tokio::test]
+async fn settings_digit_press_begins_edit_with_that_digit() {
+    let mut state = settings_test_state();
+    settings_key(&mut state, KeyCode::Down).await;
+    settings_key(&mut state, KeyCode::Char('3')).await;
+    assert!(state.settings_form.editing);
+    assert_eq!(state.settings_form.buffer, "3");
+
+    // Esc leaves the screen only after a second press (edit mode first).
+    settings_key(&mut state, KeyCode::Esc).await;
+    assert_eq!(state.screen, Screen::Settings);
+    settings_key(&mut state, KeyCode::Esc).await;
+    assert_eq!(state.screen, Screen::Dashboard);
+}
+
+#[tokio::test]
+async fn settings_invalid_input_is_rejected_without_saving() {
+    let mut state = settings_test_state();
+
+    // Non-positive value on global parallelism.
+    settings_key(&mut state, KeyCode::Char('0')).await;
+    settings_key(&mut state, KeyCode::Enter).await;
+    let error = state.settings_form.error.clone().unwrap_or_default();
+    assert!(error.contains("positive integer"), "got: {error}");
+    assert_eq!(
+        state.execution_limits.max_parallel,
+        ExecutionLimits::default().max_parallel
+    );
+
+    // Per-project above the current global limit.
+    settings_key(&mut state, KeyCode::Esc).await;
+    settings_key(&mut state, KeyCode::Down).await;
+    settings_key(&mut state, KeyCode::Char('9')).await;
+    settings_key(&mut state, KeyCode::Enter).await;
+    let error = state.settings_form.error.clone().unwrap_or_default();
+    assert!(
+        error.contains("cannot exceed global parallelism"),
+        "got: {error}"
+    );
+
+    // Nothing was persisted for either rejected attempt.
+    assert!(!state.runtime_config_path.exists());
+    assert_eq!(
+        state.execution_limits.per_project_max_parallel,
+        ExecutionLimits::default().per_project_max_parallel
+    );
+}
+
+#[tokio::test]
+async fn settings_valid_save_persists_through_runtime_settings_toml() {
+    let mut state = settings_test_state();
+
+    settings_key(&mut state, KeyCode::Char('4')).await;
+    settings_key(&mut state, KeyCode::Enter).await;
+    assert!(!state.settings_form.editing);
+    assert!(state.settings_form.saved);
+    assert!(state.settings_form.error.is_none());
+    assert_eq!(state.execution_limits.max_parallel, 4);
+
+    // Duration: select via wrap-around previous, then type a fresh value.
+    settings_key(&mut state, KeyCode::Up).await;
+    assert_eq!(
+        state.settings_form.selected,
+        SettingsField::MaxDurationMinutes
+    );
+    settings_key(&mut state, KeyCode::Char('9')).await;
+    settings_key(&mut state, KeyCode::Char('0')).await;
+    settings_key(&mut state, KeyCode::Enter).await;
+    assert_eq!(
+        state.execution_limits.max_duration,
+        Duration::from_secs(5_400)
+    );
+
+    let persisted = RuntimeSettings::load_from_path(&state.runtime_config_path).unwrap();
+    assert_eq!(persisted.execution.max_parallel, Some(4));
+    assert_eq!(persisted.execution.max_duration_secs, Some(5_400));
+}
+
+#[test]
+fn settings_key_bar_shows_edit_mode_hints_only_while_editing() {
+    let mut state = settings_test_state();
+    let browse = key_hints(&state);
+    assert!(browse.iter().any(|(key, _)| key == "0-9"));
+    assert!(!browse.iter().any(|(_key, label)| label == "save"));
+
+    state.begin_settings_edit(None);
+    let editing = key_hints(&state);
+    assert!(
+        editing
+            .iter()
+            .any(|(key, label)| key == "enter" && label == "save")
+    );
+    assert!(editing.iter().any(|(_, label)| label == "cancel edit"));
+    assert!(!editing.iter().any(|(key, _)| key == "0-9"));
 }

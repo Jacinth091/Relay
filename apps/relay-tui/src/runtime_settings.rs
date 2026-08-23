@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeSettings {
@@ -18,6 +19,36 @@ pub struct RuntimeSettings {
     pub providers: HashMap<String, ProviderOverrideConfig>,
     #[serde(default)]
     pub profile_overrides: HashMap<String, ProfileOverrideConfig>,
+    /// Execution limits edited on the Settings screen; absent values keep core defaults.
+    #[serde(default)]
+    pub execution: ExecutionSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExecutionSettings {
+    pub max_parallel: Option<usize>,
+    pub per_project_max_parallel: Option<usize>,
+    pub max_repair_attempts: Option<u32>,
+    pub max_duration_secs: Option<u64>,
+}
+
+impl ExecutionSettings {
+    /// Overlays any persisted limit onto `limits`, leaving unset fields untouched.
+    #[cfg_attr(test, allow(dead_code))]
+    pub fn apply_to_limits(&self, limits: &mut relay_core::ExecutionLimits) {
+        if let Some(value) = self.max_parallel {
+            limits.max_parallel = value;
+        }
+        if let Some(value) = self.per_project_max_parallel {
+            limits.per_project_max_parallel = value;
+        }
+        if let Some(value) = self.max_repair_attempts {
+            limits.max_repair_attempts = value;
+        }
+        if let Some(secs) = self.max_duration_secs {
+            limits.max_duration = Duration::from_secs(secs);
+        }
+    }
 }
 
 fn default_version() -> u32 {
@@ -88,6 +119,7 @@ impl Default for RuntimeSettings {
             project_tuning: HashMap::new(),
             providers: HashMap::new(),
             profile_overrides,
+            execution: ExecutionSettings::default(),
         }
     }
 }

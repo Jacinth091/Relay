@@ -551,7 +551,7 @@ pub(crate) async fn handle_key(
             }
             _ => Ok(false),
         },
-        Screen::Runtimes | Screen::Settings | Screen::Doctor => match key.code {
+        Screen::Runtimes | Screen::Doctor => match key.code {
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 state.begin_health_refresh(true);
                 Ok(false)
@@ -562,6 +562,54 @@ pub(crate) async fn handle_key(
             }
             _ => Ok(false),
         },
+        Screen::Settings => {
+            let editing = state.settings_form.editing;
+            match key.code {
+                KeyCode::Esc => {
+                    if editing {
+                        state.cancel_settings_edit();
+                    } else {
+                        state.screen = Screen::Dashboard;
+                    }
+                    Ok(false)
+                }
+                // Browse mode: select a field, then start editing it.
+                KeyCode::Up if !editing => {
+                    state.settings_form.select_previous();
+                    Ok(false)
+                }
+                KeyCode::Down if !editing => {
+                    state.settings_form.select_next();
+                    Ok(false)
+                }
+                KeyCode::Enter | KeyCode::Left | KeyCode::Right if !editing => {
+                    state.begin_settings_edit(None);
+                    Ok(false)
+                }
+                KeyCode::Char(digit) if digit.is_ascii_digit() && !editing => {
+                    state.begin_settings_edit(Some(digit));
+                    Ok(false)
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') if !editing => {
+                    state.begin_health_refresh(true);
+                    Ok(false)
+                }
+                // Edit mode: digits and backspace shape the buffer; Enter commits.
+                KeyCode::Enter if editing => {
+                    state.commit_settings_edit();
+                    Ok(false)
+                }
+                KeyCode::Backspace if editing => {
+                    state.settings_form.buffer.pop();
+                    Ok(false)
+                }
+                KeyCode::Char(digit) if digit.is_ascii_digit() && editing => {
+                    state.settings_form.buffer.push(digit);
+                    Ok(false)
+                }
+                _ => Ok(false),
+            }
+        }
         Screen::RuntimeDetail => match key.code {
             KeyCode::Esc => {
                 if state.runtime_detail_submenu.is_some() {

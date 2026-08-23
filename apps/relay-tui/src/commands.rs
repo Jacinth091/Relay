@@ -5,7 +5,6 @@ use tokio::process::Command as TokioCommand;
 use command::{RelayCommand, parse_relay_command};
 
 use crate::command;
-use crate::runtime_settings;
 use crate::state::{AppState, Screen, build_runtime_router};
 
 pub(crate) async fn execute_relay_command(
@@ -83,7 +82,7 @@ pub(crate) async fn execute_relay_command(
             state.one_run_reasoning_override = None;
             match state
                 .runtime_settings
-                .save_to_path(&runtime_settings::RuntimeSettings::default_path())
+                .save_to_path(&state.runtime_config_path)
             {
                 Ok(()) => {
                     state.feedback = format!("Active runtime profile: {}", state.active_profile_id)
@@ -123,7 +122,7 @@ pub(crate) async fn execute_relay_command(
             state.active_model = relay_core::RuntimeModelSelection::Explicit(model.clone());
             state.feedback = match state
                 .runtime_settings
-                .save_to_path(&runtime_settings::RuntimeSettings::default_path())
+                .save_to_path(&state.runtime_config_path)
             {
                 Ok(()) => format!("Model selected for {}: {model}", state.active_profile_id),
                 Err(error) => {
@@ -180,7 +179,7 @@ pub(crate) async fn execute_relay_command(
             state.active_reasoning_effort = relay_core::RuntimeReasoningSelection::Explicit(parsed);
             state.feedback = match state
                 .runtime_settings
-                .save_to_path(&runtime_settings::RuntimeSettings::default_path())
+                .save_to_path(&state.runtime_config_path)
             {
                 Ok(()) => format!(
                     "Reasoning selected for {}: {effort}",

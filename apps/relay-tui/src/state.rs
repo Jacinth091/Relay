@@ -5,10 +5,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use relay_core::{
-    CoreExecutionEvent, ExecutionReport, ExecutionScheduler, GitHubRepositoryMetadata, ProjectKey,
-    RegisterProject, Relay, RepositoryInspection, SchedulerSnapshot, SchedulerTaskStatus,
-    SqliteStore, StoredTask, TaskId, TaskImportCandidate, TaskState, TrustedProject,
-    inspect_trusted_project_repository, list_stored_tasks,
+    CoreExecutionEvent, ExecutionLimits, ExecutionReport, ExecutionScheduler,
+    ExecutionSchedulerError, GitHubRepositoryMetadata, ProjectKey, RegisterProject, Relay,
+    RepositoryInspection, SchedulerSnapshot, SchedulerTaskStatus, SqliteStore, StoredTask, TaskId,
+    TaskImportCandidate, TaskState, TrustedProject, inspect_trusted_project_repository,
+    list_stored_tasks,
 };
 #[cfg(not(test))]
 use relay_runtime::RuntimeIntegration;
@@ -262,6 +263,12 @@ pub(crate) struct AppState {
     pub(crate) task_review_menu_index: usize,
     pub(crate) task_review_submenu: Option<TaskReviewSubmenu>,
     pub(crate) cached_codex_account: Option<String>,
+    /// Path the runtime-settings TOML is saved to; defaults to
+    /// `RuntimeSettings::default_path()` and is overridden by tests.
+    pub(crate) runtime_config_path: PathBuf,
+    /// Execution limits currently shown/applied by this process.
+    pub(crate) execution_limits: ExecutionLimits,
+    pub(crate) settings_form: SettingsForm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -750,6 +757,9 @@ impl AppState {
             task_review_menu_index: 0,
             task_review_submenu: None,
             cached_codex_account: None,
+            runtime_config_path: runtime_settings::RuntimeSettings::default_path(),
+            execution_limits: app_execution_limits(),
+            settings_form: SettingsForm::default(),
         }
     }
 
@@ -1219,12 +1229,116 @@ impl AppState {
                 router.set_default_profile(self.active_profile_id.clone());
                 router
             }),
-            app_execution_limits(),
+            self.execution_limits.clone(),
         ));
         self.scheduler_events = Some(scheduler.subscribe());
         self.scheduler = Some(scheduler);
         self.scheduler_snapshot = SchedulerSnapshot { tasks: Vec::new() };
         self.scheduler_rebind_pending = false;
+    }
+
+    pub(crate) fn settings_field_value(&self, field: SettingsField) -> String {
+        let limits = &self.execution_limits;
+        match field {
+            SettingsField::MaxParallel => limits.max_parallel.to_string(),
+            SettingsField::PerProjectMaxParallel => limits.per_project_max_parallel.to_string(),
+            SettingsField::MaxRepairAttempts => limits.max_repair_attempts.to_string(),
+            SettingsField::MaxDurationMinutes => (limits.max_duration.as_secs() / 60).to_string(),
+        }
+    }
+
+    /// Starts editing the selected field. `initial_digit` seeds the buffer when
+    /// the user starts editing by typing a digit directly.
+    pub(crate) fn begin_settings_edit(&mut self, initial_digit: Option<char>) {
+        let field = self.settings_form.selected;
+        self.settings_form.editing = true;
+        self.settings_form.error = None;
+        self.settings_form.saved = false;
+        self.settings_form.buffer = match initial_digit {
+            Some(digit) => digit.to_string(),
+            None => self.settings_field_value(field),
+        };
+    }
+
+    pub(crate) fn cancel_settings_edit(&mut self) {
+        self.settings_form.editing = false;
+        self.settings_form.buffer.clear();
+        self.settings_form.error = None;
+    }
+
+    /// Commits the edit buffer for the selected field: validates against
+    /// relay-core's execution-limit rules, persists through the runtime
+    /// settings TOML path, and only then adopts the new value in memory.
+    pub(crate) fn commit_settings_edit(&mut self) {
+        let field = self.settings_form.selected;
+        let raw = self.settings_form.buffer.trim().to_owned();
+        let value = match raw.parse::<u64>() {
+            Ok(value) if value > 0 => value,
+            _ => {
+                self.settings_form.error =
+                    Some(format!("{} must be a positive integer.", field.label()));
+                return;
+            }
+        };
+
+        let mut limits = self.execution_limits.clone();
+        match field {
+            SettingsField::MaxParallel => limits.max_parallel = value as usize,
+            SettingsField::PerProjectMaxParallel => {
+                limits.per_project_max_parallel = value as usize
+            }
+            SettingsField::MaxRepairAttempts => {
+                if value > u32::MAX as u64 {
+                    self.settings_form.error = Some("max_repair_attempts is too large.".to_owned());
+                    return;
+                }
+                limits.max_repair_attempts = value as u32;
+            }
+            SettingsField::MaxDurationMinutes => {
+                let max_minutes = crate::util::CODEX_MAX_DURATION_SECS / 60;
+                if value * 60 > crate::util::CODEX_MAX_DURATION_SECS {
+                    self.settings_form.error = Some(format!(
+                        "max_duration must be between 1 and {max_minutes} minutes"
+                    ));
+                    return;
+                }
+                limits.max_duration = Duration::from_secs(value * 60);
+            }
+        }
+
+        if let Err(error) = validate_execution_limits(&limits) {
+            self.settings_form.error = Some(error);
+            return;
+        }
+        if limits.per_project_max_parallel > limits.max_parallel {
+            self.settings_form.error = Some(format!(
+                "Per-project parallelism cannot exceed global parallelism ({}).",
+                limits.max_parallel
+            ));
+            return;
+        }
+
+        self.runtime_settings.execution = runtime_settings::ExecutionSettings {
+            max_parallel: Some(limits.max_parallel),
+            per_project_max_parallel: Some(limits.per_project_max_parallel),
+            max_repair_attempts: Some(limits.max_repair_attempts),
+            max_duration_secs: Some(limits.max_duration.as_secs()),
+        };
+        match self
+            .runtime_settings
+            .save_to_path(&self.runtime_config_path)
+        {
+            Ok(()) => {
+                self.execution_limits = limits;
+                self.settings_form.editing = false;
+                self.settings_form.buffer.clear();
+                self.settings_form.error = None;
+                self.settings_form.saved = true;
+            }
+            Err(error) => {
+                self.settings_form.error = Some(format!("Save failed: {error}"));
+            }
+        }
     }
 
     pub(crate) async fn reap_finished_scheduler_driver(&mut self) {
@@ -1785,6 +1899,68 @@ pub(crate) enum Screen {
     Doctor,
 }
 
+/// Editable rows of the Settings form, in display order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum SettingsField {
+    #[default]
+    MaxParallel,
+    PerProjectMaxParallel,
+    MaxRepairAttempts,
+    MaxDurationMinutes,
+}
+
+pub(crate) const SETTINGS_FIELDS: [SettingsField; 4] = [
+    SettingsField::MaxParallel,
+    SettingsField::PerProjectMaxParallel,
+    SettingsField::MaxRepairAttempts,
+    SettingsField::MaxDurationMinutes,
+];
+
+impl SettingsField {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::MaxParallel => "Global parallelism",
+            Self::PerProjectMaxParallel => "Per-project parallelism",
+            Self::MaxRepairAttempts => "Repair attempts",
+            Self::MaxDurationMinutes => "Maximum execution (minutes)",
+        }
+    }
+
+    fn next(self) -> Self {
+        let index = SETTINGS_FIELDS.iter().position(|f| *f == self).unwrap_or(0);
+        SETTINGS_FIELDS[(index + 1) % SETTINGS_FIELDS.len()]
+    }
+
+    fn previous(self) -> Self {
+        let index = SETTINGS_FIELDS.iter().position(|f| *f == self).unwrap_or(0);
+        let previous = (index + SETTINGS_FIELDS.len() - 1) % SETTINGS_FIELDS.len();
+        SETTINGS_FIELDS[previous]
+    }
+}
+
+/// Interactive state for the Settings screen. Values under edit live in
+/// `buffer`; committed values live in `AppState::execution_limits`.
+#[derive(Debug, Default)]
+pub(crate) struct SettingsForm {
+    pub(crate) selected: SettingsField,
+    pub(crate) editing: bool,
+    pub(crate) buffer: String,
+    pub(crate) error: Option<String>,
+    pub(crate) saved: bool,
+}
+
+impl SettingsForm {
+    pub(crate) fn select_previous(&mut self) {
+        self.selected = self.selected.previous();
+        self.saved = false;
+    }
+
+    pub(crate) fn select_next(&mut self) {
+        self.selected = self.selected.next();
+        self.saved = false;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AddProjectField {
     Key,
@@ -1860,6 +2036,23 @@ impl Default for AddProjectForm {
             github_repo: String::new(),
         }
     }
+}
+
+/// Validates candidate limits through relay-core's own rules so the form
+/// surfaces exactly the engine's rejection reasons.
+fn validate_execution_limits(limits: &ExecutionLimits) -> Result<(), String> {
+    ExecutionLimits::new(
+        limits.max_parallel,
+        limits.per_project_max_parallel,
+        limits.max_repair_attempts,
+        limits.max_duration,
+        limits.output_byte_limit,
+    )
+    .map(|_| ())
+    .map_err(|error| match error {
+        ExecutionSchedulerError::InvalidLimit { name } => format!("{name} must be positive"),
+        other => other.to_string(),
+    })
 }
 
 fn non_empty_field(value: &str) -> Option<String> {

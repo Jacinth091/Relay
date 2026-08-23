@@ -1,12 +1,16 @@
 use ratatui::{
     Frame,
     layout::Rect,
-    widgets::{Paragraph, Wrap},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 
 use relay_runtime_codex::{CodexRuntime, CodexRuntimeHealth};
 
-use crate::state::{AppState, RuntimeDetailSubmenu, git_health_marker};
+use crate::state::{
+    AppState, RuntimeDetailSubmenu, SETTINGS_FIELDS, SettingsField, git_health_marker,
+};
+use crate::theme::Theme;
 use crate::util::app_execution_limits;
 
 pub(crate) fn render_runtimes(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -178,20 +182,95 @@ pub(crate) fn render_runtime_detail(frame: &mut Frame, state: &AppState, area: R
 }
 
 pub(crate) fn render_settings(frame: &mut Frame, state: &AppState, area: Rect) {
-    let limits = app_execution_limits();
-    let body = format!(
-        "Settings\n\nExecution\n  Global parallelism: {}\n  Per-project parallelism: {}\n  Repair attempts: {}\n  Maximum execution: {} minutes\n\nSafety\n  Explicit Run approval: On\n  Automatic commit: Off\n  Automatic push: Off\n\nStorage\n  Config: {}\n  SQLite: {}\n\nRuntime\n  Provider: {}\n  Profile: {}\n  Status: {}",
-        limits.max_parallel,
-        limits.per_project_max_parallel,
-        limits.max_repair_attempts,
-        limits.max_duration.as_secs() / 60,
-        state.config_path.display(),
-        state.database_path.display(),
-        state.active_runtime_provider,
-        state.active_profile_id,
-        state.runtime_health.display_status()
+    let theme = Theme::default();
+    let form = &state.settings_form;
+
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled("Execution", theme.header()))];
+
+    for field in SETTINGS_FIELDS {
+        settings_field_line(&mut lines, state, field);
+    }
+
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled("Safety", theme.header())));
+    for entry in [
+        "Explicit Run approval: On",
+        "Automatic commit: Off",
+        "Automatic push: Off",
+    ] {
+        lines.push(Line::from(Span::styled(
+            format!("  {entry}"),
+            theme.muted(),
+        )));
+    }
+
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled("Storage", theme.header())));
+    lines.push(Line::from(Span::styled(
+        format!("  Config: {}", state.config_path.display()),
+        theme.muted(),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("  SQLite: {}", state.database_path.display()),
+        theme.muted(),
+    )));
+
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled("Runtime", theme.header())));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  Provider: {} · Profile: {} · Status: {}",
+            state.active_runtime_provider,
+            state.active_profile_id,
+            state.runtime_health.display_status()
+        ),
+        theme.muted(),
+    )));
+
+    // Reserved status line at the panel bottom: inline error (theme error
+    // color) or muted "saved" feedback; blank when neither applies.
+    lines.push(match (&form.error, form.saved) {
+        (Some(error), _) => Line::from(Span::styled(error.clone(), theme.error())),
+        (None, true) => Line::from(Span::styled("Saved.", theme.muted())),
+        (None, false) => Line::default(),
+    });
+
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme.muted())
+                .title(" SETTINGS "),
+        ),
+        area,
     );
-    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: true }), area);
+}
+
+fn settings_field_line(lines: &mut Vec<Line<'static>>, state: &AppState, field: SettingsField) {
+    let theme = Theme::default();
+    let form = &state.settings_form;
+    let selected = form.selected == field;
+    let marker = if selected { "> " } else { "  " };
+    let value = if selected && form.editing {
+        format!("{}_", form.buffer)
+    } else {
+        state.settings_field_value(field)
+    };
+    let label_style = if selected {
+        theme.selection()
+    } else {
+        theme.muted()
+    };
+    let value_style = if selected {
+        theme.selection()
+    } else {
+        theme.text()
+    };
+    lines.push(Line::from(vec![
+        Span::raw(marker),
+        Span::styled(format!("{}: ", field.label()), label_style),
+        Span::styled(value, value_style),
+    ]));
 }
 
 pub(crate) fn render_doctor(frame: &mut Frame, state: &AppState, area: Rect) {

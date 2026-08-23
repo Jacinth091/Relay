@@ -182,8 +182,23 @@ pub(crate) fn key_hints(state: &AppState) -> Vec<(String, String)> {
         Screen::Execution => execution_hints(state),
         Screen::Result => vec![("t", "tasks"), ("d", "dashboard"), ("n", "new handoff")],
         Screen::Diff | Screen::Logs => vec![("esc", "dashboard")],
-        Screen::Runtimes | Screen::Settings | Screen::Doctor => {
-            vec![("r", "re-check"), ("esc", "dashboard")]
+        Screen::Runtimes | Screen::Doctor => vec![("r", "re-check"), ("esc", "dashboard")],
+        Screen::Settings => {
+            if state.settings_form.editing {
+                vec![
+                    ("enter", "save"),
+                    ("esc", "cancel edit"),
+                    ("backspace", "delete"),
+                ]
+            } else {
+                vec![
+                    ("up/down", "select"),
+                    ("enter/←→", "edit"),
+                    ("0-9", "set value"),
+                    ("r", "re-check"),
+                    ("esc", "dashboard"),
+                ]
+            }
         }
         Screen::RuntimeDetail => {
             if state.runtime_detail_submenu.is_some() {

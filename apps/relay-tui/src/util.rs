@@ -8,10 +8,12 @@ use relay_core::{
     inspect_trusted_project_repository,
 };
 
+#[cfg(not(test))]
+use crate::runtime_settings;
 use crate::state::AppState;
 
-const CODEX_DEFAULT_MAX_DURATION_SECS: u64 = 30 * 60;
-const CODEX_MAX_DURATION_SECS: u64 = 4 * 60 * 60;
+pub(crate) const CODEX_DEFAULT_MAX_DURATION_SECS: u64 = 30 * 60;
+pub(crate) const CODEX_MAX_DURATION_SECS: u64 = 4 * 60 * 60;
 
 pub(crate) fn parse_codex_duration(value: Option<&str>) -> Result<Duration, String> {
     let seconds = match value {
@@ -30,15 +32,25 @@ pub(crate) fn parse_codex_duration(value: Option<&str>) -> Result<Duration, Stri
 
 #[cfg(not(test))]
 pub(crate) fn production_codex_execution_limits() -> ExecutionLimits {
-    ExecutionLimits {
-        max_duration: parse_codex_duration(
-            std::env::var("RELAY_CODEX_MAX_DURATION_SECS")
-                .ok()
-                .as_deref(),
-        )
-        .unwrap_or_else(|_| Duration::from_secs(CODEX_DEFAULT_MAX_DURATION_SECS)),
+    let mut limits = ExecutionLimits {
+        max_duration: Duration::from_secs(CODEX_DEFAULT_MAX_DURATION_SECS),
         ..ExecutionLimits::default()
+    };
+    // Settings-screen edits persist here and take effect at the next scheduler
+    // construction; an explicit env override still wins for duration.
+    if let Ok(settings) = runtime_settings::RuntimeSettings::load_from_path(
+        &runtime_settings::RuntimeSettings::default_path(),
+    ) {
+        settings.execution.apply_to_limits(&mut limits);
     }
+    if let Ok(duration) = parse_codex_duration(
+        std::env::var("RELAY_CODEX_MAX_DURATION_SECS")
+            .ok()
+            .as_deref(),
+    ) {
+        limits.max_duration = duration;
+    }
+    limits
 }
 
 pub(crate) fn app_execution_limits() -> ExecutionLimits {

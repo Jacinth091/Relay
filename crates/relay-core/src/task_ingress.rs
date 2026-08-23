@@ -38,11 +38,12 @@ impl fmt::Display for TaskId {
     }
 }
 
-/// How a task was submitted to Relay locally.
+/// How a task was submitted to Relay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmissionTransport {
     LocalFile,
     LocalPaste,
+    RelayMcp,
 }
 
 impl SubmissionTransport {
@@ -50,6 +51,7 @@ impl SubmissionTransport {
         match self {
             Self::LocalFile => "local-file",
             Self::LocalPaste => "local-paste",
+            Self::RelayMcp => "relay-mcp",
         }
     }
 }
@@ -142,6 +144,10 @@ pub enum TaskIngressError {
         "local task input is {actual} bytes, exceeding the maximum of {limit} bytes; reject rather than truncate"
     )]
     InputTooLarge { limit: u64, actual: u64 },
+    #[error(
+        "handoff extensions are not accepted through MCP submission; resubmit without extensions"
+    )]
+    ExtensionsNotAllowed,
     #[error("{0}")]
     Protocol(#[from] ProtocolError),
     #[error("{0}")]
@@ -167,6 +173,25 @@ impl Relay {
         let input = read_local_task_file(path)?;
         let handoff = parse_file_content(path, &input)?;
         self.task_import_candidate(handoff, SubmissionTransport::LocalFile)
+    }
+
+    /// Validates a machine-initiated MCP `submit_handoff` payload inline.
+    ///
+    /// Per ADR-0016 the preview/confirm collapse happens at this transport
+    /// boundary: validation runs exactly as local paste ingress does (same
+    /// protocol parser, size cap, and project registry resolution), but the
+    /// human review moves to the TUI before Run. Non-empty extensions are
+    /// rejected here so remote submitters cannot smuggle extra namespaces.
+    pub fn preview_mcp_submission(
+        &self,
+        input: &str,
+    ) -> Result<TaskImportCandidate, TaskIngressError> {
+        ensure_input_within_size_limit(input.len(), MAX_LOCAL_TASK_INPUT_BYTES)?;
+        let handoff = parse_handoff_task_json(input)?;
+        if !handoff.extensions.is_empty() {
+            return Err(TaskIngressError::ExtensionsNotAllowed);
+        }
+        self.task_import_candidate(handoff, SubmissionTransport::RelayMcp)
     }
 
     pub fn confirm_task_import(&mut self, candidate: TaskImportCandidate) -> &ImportedTask {
@@ -478,6 +503,66 @@ mod tests {
             TaskIngressError::InputTooLarge { limit, .. }
                 if limit == MAX_LOCAL_TASK_INPUT_BYTES
         ));
+    }
+
+    #[test]
+    fn mcp_submission_accepts_canonical_payload_with_relay_mcp_provenance() {
+        let relay = relay_with_project("relay");
+
+        let candidate = relay.preview_mcp_submission(TASK_JSON).unwrap();
+
+        assert_eq!(candidate.project_key().as_str(), "relay");
+        assert_eq!(
+            candidate.submission_transport(),
+            SubmissionTransport::RelayMcp
+        );
+        assert_eq!(SubmissionTransport::RelayMcp.as_str(), "relay-mcp");
+    }
+
+    #[test]
+    fn mcp_submission_rejects_non_empty_extensions_at_the_boundary() {
+        let relay = relay_with_project("relay");
+        let json = TASK_JSON.replace(
+            "\"ambiguity_policy\": \"needs_clarification\"",
+            "\"extensions\": {\"vendor\": {\"x\": 1}}, \"ambiguity_policy\": \"needs_clarification\"",
+        );
+
+        let error = relay.preview_mcp_submission(&json).unwrap_err();
+
+        assert!(matches!(error, TaskIngressError::ExtensionsNotAllowed));
+    }
+
+    #[test]
+    fn empty_extensions_stay_valid_on_both_paths() {
+        let relay = relay_with_project("relay");
+        let json = TASK_JSON.replace(
+            "\"ambiguity_policy\": \"needs_clarification\"",
+            "\"extensions\": {}, \"ambiguity_policy\": \"needs_clarification\"",
+        );
+
+        assert!(relay.preview_local_paste(&json).is_ok());
+        assert!(relay.preview_mcp_submission(&json).is_ok());
+    }
+
+    #[test]
+    fn mcp_submission_rejects_markdown_framing() {
+        let relay = relay_with_project("relay");
+        let markdown = format!(
+            "<!-- relay:task:start -->\n```json\n{TASK_JSON}\n```\n<!-- relay:task:end -->"
+        );
+
+        assert!(relay.preview_mcp_submission(&markdown).is_err());
+    }
+
+    #[test]
+    fn mcp_submission_rejects_oversized_payload() {
+        let relay = relay_with_project("relay");
+        let padding = "x".repeat(MAX_LOCAL_TASK_INPUT_BYTES as usize);
+        let json = TASK_JSON.replace("Do not mutate Git.", &padding);
+
+        let error = relay.preview_mcp_submission(&json).unwrap_err();
+
+        assert!(matches!(error, TaskIngressError::InputTooLarge { .. }));
     }
 
     fn relay_with_project(key: &str) -> Relay {

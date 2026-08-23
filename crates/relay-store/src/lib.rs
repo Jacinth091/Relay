@@ -125,6 +125,14 @@ impl SqliteStore {
         Self::connect(Self::connect_options(":memory:").busy_timeout(DEFAULT_BUSY_TIMEOUT)).await
     }
 
+    /// Read access to the underlying connection pool for inspection queries.
+    ///
+    /// Intended for integration tests and operational verification; all schema
+    /// mutations must go through the typed store APIs.
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     fn connect_options(filename: impl AsRef<Path>) -> SqliteConnectOptions {
         SqliteConnectOptions::new()
             .filename(filename)
@@ -137,7 +145,7 @@ impl SqliteStore {
             .max_connections(1)
             .connect_with(options)
             .await?;
-        MIGRATOR.run(&pool).await.map_err(map_migration_error)?;
+        run_migrations(&pool).await?;
 
         Ok(Self { pool })
     }
@@ -927,6 +935,29 @@ fn map_migration_error(error: sqlx::migrate::MigrateError) -> StoreError {
         sqlx::migrate::MigrateError::Dirty(version) => StoreError::SchemaMigrationDirty { version },
         other => StoreError::Migration(other),
     }
+}
+
+/// Runs migrations, tolerating a benign cross-process race.
+///
+/// Two Relay processes (TUI + serve-mcp) may open a database that has never
+/// been migrated at the same moment. sqlx serializes each migration in its own
+/// transaction but not the applied-version bookkeeping across processes, so
+/// the loser of the race sees a UNIQUE constraint on `_sqlx_migrations.version`.
+/// The winner has then finished migrating; one bounded retry observes the
+/// completed migration history and succeeds. Any other failure fails closed.
+async fn run_migrations(pool: &SqlitePool) -> Result<(), StoreError> {
+    if let Err(error) = MIGRATOR.run(pool).await {
+        let display = error.to_string();
+        if !display.contains("_sqlx_migrations") || !display.contains("UNIQUE constraint") {
+            return Err(map_migration_error(error));
+        }
+
+        // relay-store deliberately avoids a tracing dependency; the retry is
+        // observable only as normal latency.
+        MIGRATOR.run(pool).await.map_err(map_migration_error)?;
+    }
+
+    Ok(())
 }
 
 async fn insert_event(

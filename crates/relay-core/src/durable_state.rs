@@ -202,6 +202,7 @@ fn parse_submission_transport(input: &str) -> Result<SubmissionTransport, TaskPe
     match input {
         "local-file" => Ok(SubmissionTransport::LocalFile),
         "local-paste" => Ok(SubmissionTransport::LocalPaste),
+        "relay-mcp" => Ok(SubmissionTransport::RelayMcp),
         transport => Err(TaskPersistenceError::UnknownSubmissionTransport {
             transport: transport.to_owned(),
         }),
@@ -383,6 +384,24 @@ mod tests {
 
         assert!(error.to_string().contains("state conflict"));
         assert_eq!(loaded.state, TaskState::Ready);
+    }
+
+    #[tokio::test]
+    async fn mcp_submission_persists_with_relay_mcp_transport_and_round_trips() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let mut relay = relay_with_project("relay");
+        let candidate = relay.preview_mcp_submission(TASK_JSON).unwrap();
+
+        let stored = relay
+            .confirm_task_import_with_store(&store, candidate)
+            .await
+            .unwrap();
+
+        assert_eq!(stored.submission_transport, SubmissionTransport::RelayMcp);
+        assert_eq!(stored.state, TaskState::Ready);
+
+        let loaded = get_stored_task(&store, stored.id).await.unwrap().unwrap();
+        assert_eq!(loaded.submission_transport, SubmissionTransport::RelayMcp);
     }
 
     #[test]

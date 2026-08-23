@@ -1323,6 +1323,7 @@ dependencies = [
  "futures",
  "ratatui",
  "relay-core",
+ "relay-protocol",
  "relay-runtime",
  "relay-runtime-antigravity",
  "relay-runtime-codex",

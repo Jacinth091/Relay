@@ -7,6 +7,7 @@ mod diff;
 mod events;
 mod input;
 mod markdown;
+mod mcp;
 mod project_discovery;
 mod runtime_settings;
 mod state;
@@ -23,7 +24,7 @@ pub(crate) use ui::render;
 
 use std::{
     error::Error,
-    io::{self, BufRead, Stdout},
+    io::{self, Stdout},
 };
 
 use crossterm::{
@@ -82,19 +83,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 async fn serve_mcp() -> Result<(), Box<dyn Error>> {
+    // stdout carries MCP protocol messages only; diagnostics go to stderr.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .init();
 
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            break;
+    let config_path = default_config_path();
+    let relay = match Relay::load_from_config_path(&config_path) {
+        Ok(relay) => relay,
+        Err(error) => {
+            eprintln!(
+                "relay: config error at {}: {error}\nMCP submissions fail closed until projects are registered.",
+                config_path.display()
+            );
+            Relay::new()
         }
-    }
+    };
+
+    let database_path = default_database_path();
+    let store = relay_core::SqliteStore::open(&database_path).await.map_err(|error| {
+        eprintln!(
+            "relay: database error at {}: {error}\nserve-mcp cannot confirm durability and must exit.",
+            database_path.display()
+        );
+        error
+    })?;
+
+    mcp::run(relay, store).await?;
     Ok(())
 }
 

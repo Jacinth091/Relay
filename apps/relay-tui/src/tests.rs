@@ -18,7 +18,10 @@ use relay_runtime_codex::CodexRuntimeHealth;
 
 use crate::commands::execute_relay_command;
 use crate::input::{command_mode_available, handle_key};
-use crate::state::{AddProjectForm, AppState, Screen, ToolHealth, git_health_marker};
+use crate::state::{
+    AddProjectForm, AppState, RuntimeDetailSubmenu, Screen, TaskReviewSubmenu, ToolHealth,
+    git_health_marker,
+};
 use crate::ui::execution::{render_execution, render_result};
 use crate::util::{
     activity_home, dashboard_status, durable_task_listing, parse_codex_duration, project_listing,
@@ -1319,4 +1322,270 @@ async fn dashboard_projection_shows_waiting_line_when_slots_full() {
         body.contains("waiting for execution slot (1/1 active)"),
         "expected waiting-for-slot line, got:\n{body}"
     );
+}
+
+fn filtered_model_catalog() -> relay_runtime::RuntimeModelCatalog {
+    relay_runtime::RuntimeModelCatalog {
+        default_model: "test-model".to_owned(),
+        available_models: vec![relay_runtime::RuntimeModelInfo {
+            id: "test-model".to_owned(),
+            display_name: "Test Model".to_owned(),
+            supported_reasoning_efforts: vec![
+                relay_core::ReasoningEffort::Low,
+                relay_core::ReasoningEffort::Medium,
+            ],
+            default_reasoning_effort: None,
+        }],
+    }
+}
+
+fn runtime_detail_test_state() -> AppState {
+    let mut state = app_state_with_project();
+    // Route persistence at a temp path so tests never touch real user config.
+    state.runtime_config_path = unique_temp_path("profile-use").join("runtimes.toml");
+    state.screen = Screen::RuntimeDetail;
+    state
+}
+
+async fn press(state: &mut AppState, code: KeyCode) {
+    let quit = handle_key(state, KeyEvent::new(code, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(!quit);
+}
+
+fn render_runtime_detail_text(state: &AppState) -> String {
+    let backend = ratatui::backend::TestBackend::new(80, 60);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| crate::ui::render_runtime_detail(frame, state, frame.area()))
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn runtime_detail_change_profile_uses_the_runtime_use_validation_path() {
+    let mut via_menu = runtime_detail_test_state();
+    via_menu.runtime_detail_provider = Some("antigravity".to_owned());
+    via_menu.active_model =
+        relay_core::RuntimeModelSelection::Explicit("cross-provider-model".to_owned());
+    via_menu.active_reasoning_effort =
+        relay_core::RuntimeReasoningSelection::Explicit(relay_core::ReasoningEffort::XHigh);
+
+    // Navigate to the third menu item ("Change profile") and open it.
+    press(&mut via_menu, KeyCode::Down).await;
+    press(&mut via_menu, KeyCode::Down).await;
+    assert_eq!(via_menu.runtime_detail_menu_index, 2);
+    press(&mut via_menu, KeyCode::Enter).await;
+    assert_eq!(
+        via_menu.runtime_detail_submenu,
+        Some(RuntimeDetailSubmenu::ProfileSelector)
+    );
+
+    // Select antigravity/implement from the provider's offered profiles.
+    let target = "antigravity/implement";
+    let profiles = AppState::provider_profiles("antigravity");
+    assert!(profiles.iter().any(|p| p.id == target));
+    let target_index = profiles
+        .iter()
+        .position(|p| p.id == target)
+        .expect("target profile offered");
+    for _ in 0..target_index {
+        press(&mut via_menu, KeyCode::Down).await;
+    }
+    press(&mut via_menu, KeyCode::Enter).await;
+
+    // Applied like `/runtime use`: submenu closed, provider/profile adopted,
+    // persisted, and cross-provider tuning re-resolved.
+    assert_eq!(via_menu.runtime_detail_submenu, None);
+    assert_eq!(via_menu.active_profile_id, target);
+    assert_eq!(via_menu.active_runtime_provider, "antigravity");
+    assert_ne!(
+        via_menu.active_model.as_option(),
+        Some("cross-provider-model")
+    );
+    assert!(via_menu.feedback.contains("Active runtime profile"));
+    let persisted =
+        crate::runtime_settings::RuntimeSettings::load_from_path(&via_menu.runtime_config_path)
+            .unwrap();
+    assert_eq!(persisted.runtime.default_profile, target);
+
+    // Same outcome as typing the equivalent /runtime use command.
+    let mut via_command = runtime_detail_test_state();
+    via_command.runtime_detail_provider = Some("antigravity".to_owned());
+    via_command.active_model =
+        relay_core::RuntimeModelSelection::Explicit("cross-provider-model".to_owned());
+    via_command.active_reasoning_effort =
+        relay_core::RuntimeReasoningSelection::Explicit(relay_core::ReasoningEffort::XHigh);
+    execute_relay_command(&mut via_command, "/runtime use antigravity/implement")
+        .await
+        .unwrap();
+
+    assert_eq!(via_menu.active_profile_id, via_command.active_profile_id);
+    assert_eq!(
+        via_menu.active_runtime_provider,
+        via_command.active_runtime_provider
+    );
+    assert_eq!(via_menu.active_model, via_command.active_model);
+    assert_eq!(
+        via_menu.active_reasoning_effort,
+        via_command.active_reasoning_effort
+    );
+    assert_eq!(via_menu.feedback, via_command.feedback);
+}
+
+#[tokio::test]
+async fn runtime_detail_reasoning_selector_is_filtered_by_catalog() {
+    // With a model catalog: only the model's supported efforts are reachable.
+    let mut state = runtime_detail_test_state();
+    // Pin the selection so the test never depends on real user config.
+    state.active_model = relay_core::RuntimeModelSelection::ProviderDefault;
+    state.cached_model_catalog = Some(filtered_model_catalog());
+
+    press(&mut state, KeyCode::Down).await; // "Change reasoning"
+    press(&mut state, KeyCode::Enter).await;
+    assert_eq!(
+        state.runtime_detail_submenu,
+        Some(RuntimeDetailSubmenu::ReasoningSelector)
+    );
+
+    // Catalog offers low + medium only; navigation is bounded at medium.
+    press(&mut state, KeyCode::Down).await;
+    press(&mut state, KeyCode::Down).await;
+    press(&mut state, KeyCode::Down).await;
+    eprintln!("DEBUG after down idx={}", state.runtime_detail_menu_index);
+    eprintln!("DEBUG submenu={:?}", state.runtime_detail_submenu);
+    press(&mut state, KeyCode::Down).await;
+    press(&mut state, KeyCode::Down).await;
+    assert_eq!(state.runtime_detail_menu_index, 1);
+    press(&mut state, KeyCode::Enter).await;
+
+    assert_eq!(
+        state.active_reasoning_effort,
+        relay_core::RuntimeReasoningSelection::Explicit(relay_core::ReasoningEffort::Medium)
+    );
+
+    // Without a catalog: full effort list including xhigh.
+    let mut state = runtime_detail_test_state();
+    press(&mut state, KeyCode::Down).await;
+    press(&mut state, KeyCode::Enter).await;
+    for _ in 0..3 {
+        press(&mut state, KeyCode::Down).await;
+    }
+    assert_eq!(state.runtime_detail_menu_index, 3);
+    press(&mut state, KeyCode::Enter).await;
+
+    assert_eq!(
+        state.active_reasoning_effort,
+        relay_core::RuntimeReasoningSelection::Explicit(relay_core::ReasoningEffort::XHigh)
+    );
+}
+
+#[tokio::test]
+async fn task_review_reasoning_selector_is_filtered_by_catalog_and_full_without_one() {
+    async fn review_state_with_catalog(
+        catalog: Option<relay_runtime::RuntimeModelCatalog>,
+    ) -> AppState {
+        let mut state = app_state_with_eligible_project_with_store().await;
+        state.start_paste_task();
+        state.paste_text = task_json();
+        state.submit_paste_task();
+        state.confirm_task_import().await;
+        state.open_selected_task();
+        assert_eq!(state.screen, Screen::TaskReview);
+        for _ in 0..100 {
+            state.tick().await;
+            let task = state.selected_stored_task().unwrap();
+            if state.ui_preflight(task) == "eligible" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let task = state.selected_stored_task().unwrap();
+        assert_eq!(state.ui_preflight(task), "eligible");
+
+        state.cached_model_catalog = catalog;
+        state.one_run_model_override = Some("test-model".to_owned());
+        state
+    }
+
+    // With a catalog matching the one-run model: filtered to low/medium.
+    let mut state = review_state_with_catalog(Some(filtered_model_catalog())).await;
+    press(&mut state, KeyCode::Down).await; // "Change reasoning for this run"
+    press(&mut state, KeyCode::Enter).await;
+    assert_eq!(
+        state.task_review_submenu,
+        Some(TaskReviewSubmenu::ReasoningSelector)
+    );
+    press(&mut state, KeyCode::Down).await;
+    press(&mut state, KeyCode::Down).await;
+    press(&mut state, KeyCode::Down).await;
+    assert_eq!(state.task_review_menu_index, 1);
+    press(&mut state, KeyCode::Enter).await;
+    assert_eq!(state.one_run_reasoning_override.as_deref(), Some("medium"));
+
+    // Without a catalog: full list, xhigh selectable.
+    let mut state = review_state_with_catalog(None).await;
+    press(&mut state, KeyCode::Down).await;
+    press(&mut state, KeyCode::Enter).await;
+    for _ in 0..3 {
+        press(&mut state, KeyCode::Down).await;
+    }
+    assert_eq!(state.task_review_menu_index, 3);
+    press(&mut state, KeyCode::Enter).await;
+    assert_eq!(state.one_run_reasoning_override.as_deref(), Some("xhigh"));
+}
+
+#[test]
+fn codex_transport_label_follows_env_semantics() {
+    let state = app_state_with_project();
+
+    // SAFETY: single-threaded mutation of a test-only env var; restored below.
+    unsafe { std::env::remove_var("RELAY_CODEX_TRANSPORT") };
+    // Unset means the app-server default.
+    let text = render_runtime_detail_text(&state);
+    assert!(
+        text.contains("App Server"),
+        "unset should show App Server:\n{text}"
+    );
+    assert!(
+        !text.contains("Codex exec"),
+        "unset must not show exec:\n{text}"
+    );
+    assert!(
+        text.contains("Live approval ✓"),
+        "app-server supports live approval:\n{text}"
+    );
+
+    // Explicit app-server behaves identically.
+    unsafe { std::env::set_var("RELAY_CODEX_TRANSPORT", "app-server") };
+    let text = render_runtime_detail_text(&state);
+    assert!(
+        text.contains("App Server"),
+        "explicit app-server should show App Server:\n{text}"
+    );
+
+    // Only an explicit `exec` opts out.
+    unsafe { std::env::set_var("RELAY_CODEX_TRANSPORT", "exec") };
+    let text = render_runtime_detail_text(&state);
+    assert!(
+        text.contains("Codex exec"),
+        "exec should show Codex exec:\n{text}"
+    );
+    assert!(
+        text.contains("Pre-approved envelope"),
+        "exec uses pre-approved envelope:\n{text}"
+    );
+
+    // Restore so other tests observe default semantics.
+    unsafe { std::env::remove_var("RELAY_CODEX_TRANSPORT") };
 }

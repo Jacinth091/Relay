@@ -274,10 +274,12 @@ pub(crate) struct AppState {
     pub(crate) settings_form: SettingsForm,
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeDetailSubmenu {
     ModelSelector,
     ReasoningSelector,
+    ProfileSelector,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,6 +329,16 @@ pub(crate) fn git_health_marker(health: &ToolHealth) -> &'static str {
         ToolHealth::Checking => "… Git — checking",
         ToolHealth::Available(_) => "✓ Git",
         ToolHealth::Unavailable(_) => "× Git",
+    }
+}
+
+pub(crate) fn reasoning_effort_label(effort: relay_core::ReasoningEffort) -> &'static str {
+    match effort {
+        relay_core::ReasoningEffort::Default => "default",
+        relay_core::ReasoningEffort::Low => "low",
+        relay_core::ReasoningEffort::Medium => "medium",
+        relay_core::ReasoningEffort::High => "high",
+        relay_core::ReasoningEffort::XHigh => "xhigh",
     }
 }
 
@@ -604,6 +616,94 @@ impl AppState {
     pub(crate) fn get_current_suggestions(&self) -> Vec<command_completion::CommandSuggestion> {
         let ctx = self.build_completion_context();
         command_completion::compute_suggestions(&self.command_input, &ctx)
+    }
+
+    /// Built-in profiles offered by a provider through the runtime seam.
+    pub(crate) fn provider_profiles(
+        provider: &str,
+    ) -> Vec<relay_runtime::RuntimeProfileDescriptor> {
+        build_runtime_router()
+            .integration(provider)
+            .map(|integration| integration.profiles())
+            .unwrap_or_default()
+    }
+
+    /// Applies a runtime profile selection through the same validation path as
+    /// `/runtime use`: provider lookup, profile resolution, cross-provider
+    /// tuning re-resolution (C8/C9), and settings persistence.
+    pub(crate) fn apply_runtime_profile(&mut self, profile: &str) {
+        let Some(provider) = profile.split('/').next().filter(|p| !p.is_empty()) else {
+            self.feedback = "Runtime profile must use provider/name format.".to_owned();
+            return;
+        };
+        let router = build_runtime_router();
+        let Some(integration) = router.integration(provider) else {
+            self.feedback = format!("Unknown runtime provider '{provider}'.");
+            return;
+        };
+        if let Err(error) = integration.resolve_profile(profile) {
+            self.feedback = format!("Cannot use runtime profile '{profile}': {error}");
+            return;
+        }
+        self.active_runtime_provider = provider.to_owned();
+        self.active_profile_id = profile.to_owned();
+        self.runtime_settings.runtime.default_profile = profile.to_owned();
+        // C8/C9: Re-resolve tuning from the new profile to prevent
+        // cross-provider model/reasoning leakage.
+        let resolved = self
+            .runtime_settings
+            .resolve_selection(None, Some(profile), None, None);
+        self.active_model = resolved.model;
+        self.active_reasoning_effort = resolved.reasoning_effort;
+        self.one_run_model_override = None;
+        self.one_run_reasoning_override = None;
+        match self
+            .runtime_settings
+            .save_to_path(&self.runtime_config_path)
+        {
+            Ok(()) => self.feedback = format!("Active runtime profile: {}", self.active_profile_id),
+            Err(error) => {
+                self.feedback =
+                    format!("Runtime selected in memory but could not persist settings: {error}")
+            }
+        }
+    }
+
+    /// Reasoning efforts offered for selection. When a model catalog for the
+    /// active provider is available, options are filtered to the effective
+    /// model's `supported_reasoning_efforts`; without a catalog the standard
+    /// effort list is offered.
+    pub(crate) fn reasoning_options_for_model(
+        &self,
+        preferred_model: Option<&str>,
+    ) -> Vec<relay_core::ReasoningEffort> {
+        const ALL: [relay_core::ReasoningEffort; 4] = [
+            relay_core::ReasoningEffort::Low,
+            relay_core::ReasoningEffort::Medium,
+            relay_core::ReasoningEffort::High,
+            relay_core::ReasoningEffort::XHigh,
+        ];
+        let Some(catalog) = &self.cached_model_catalog else {
+            return ALL.to_vec();
+        };
+        let effective_model = preferred_model
+            .filter(|model| !model.is_empty() && *model != "default")
+            .or_else(|| self.active_model.as_option())
+            .map(str::to_owned)
+            .unwrap_or_else(|| catalog.default_model.clone());
+        let Some(model_info) = catalog
+            .available_models
+            .iter()
+            .find(|candidate| candidate.id == effective_model)
+        else {
+            return ALL.to_vec();
+        };
+        if model_info.supported_reasoning_efforts.is_empty() {
+            return ALL.to_vec();
+        }
+        ALL.into_iter()
+            .filter(|effort| model_info.supported_reasoning_efforts.contains(effort))
+            .collect()
     }
 
     pub(crate) fn cancel_task_selector(&mut self, selector: &str) {

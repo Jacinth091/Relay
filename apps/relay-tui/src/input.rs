@@ -5,7 +5,9 @@ use relay_core::TaskState;
 use relay_runtime::RuntimePermissionDecision;
 
 use crate::commands::execute_relay_command;
-use crate::state::{AppState, RuntimeDetailSubmenu, Screen, TaskReviewSubmenu};
+use crate::state::{
+    AppState, RuntimeDetailSubmenu, Screen, TaskReviewSubmenu, reasoning_effort_label,
+};
 
 pub(crate) async fn handle_key(
     state: &mut AppState,
@@ -274,7 +276,11 @@ pub(crate) async fn handle_key(
                         .as_ref()
                         .map(|c| c.available_models.len().saturating_sub(1))
                         .unwrap_or(0),
-                    Some(TaskReviewSubmenu::ReasoningSelector) => 3,
+                    Some(TaskReviewSubmenu::ReasoningSelector) => {
+                        let options = state
+                            .reasoning_options_for_model(state.one_run_model_override.as_deref());
+                        options.len().saturating_sub(1)
+                    }
                     None => 2, // 3 items (0 to 2)
                 };
                 if state.task_review_menu_index < max {
@@ -315,10 +321,12 @@ pub(crate) async fn handle_key(
                                 state.task_review_menu_index = 0;
                             }
                             Some(TaskReviewSubmenu::ReasoningSelector) => {
-                                let efforts = ["low", "medium", "high", "xhigh"];
-                                if state.task_review_menu_index < efforts.len() {
+                                let options = state.reasoning_options_for_model(
+                                    state.one_run_model_override.as_deref(),
+                                );
+                                if let Some(effort) = options.get(state.task_review_menu_index) {
                                     state.one_run_reasoning_override =
-                                        Some(efforts[state.task_review_menu_index].to_owned());
+                                        Some(reasoning_effort_label(*effort).to_owned());
                                 }
                                 state.task_review_submenu = None;
                                 state.task_review_menu_index = 0;
@@ -632,8 +640,17 @@ pub(crate) async fn handle_key(
                         .as_ref()
                         .map(|c| c.available_models.len().saturating_sub(1))
                         .unwrap_or(0),
-                    Some(RuntimeDetailSubmenu::ReasoningSelector) => 3, // low, medium, high, xhigh
-                    None => 3,                                          // 4 items (0 to 3)
+                    Some(RuntimeDetailSubmenu::ReasoningSelector) => {
+                        let options = state.reasoning_options_for_model(None);
+                        options.len().saturating_sub(1)
+                    }
+                    Some(RuntimeDetailSubmenu::ProfileSelector) => {
+                        let provider = state.runtime_detail_provider.as_deref().unwrap_or("codex");
+                        AppState::provider_profiles(provider)
+                            .len()
+                            .saturating_sub(1)
+                    }
+                    None => 3, // 4 items (0 to 3)
                 };
                 if state.runtime_detail_menu_index < max {
                     state.runtime_detail_menu_index += 1;
@@ -642,28 +659,27 @@ pub(crate) async fn handle_key(
             }
             KeyCode::Enter => {
                 match state.runtime_detail_submenu {
-                    None => {
-                        match state.runtime_detail_menu_index {
-                            0 => {
-                                state.runtime_detail_submenu =
-                                    Some(RuntimeDetailSubmenu::ModelSelector);
-                                state.runtime_detail_menu_index = 0;
-                            }
-                            1 => {
-                                state.runtime_detail_submenu =
-                                    Some(RuntimeDetailSubmenu::ReasoningSelector);
-                                state.runtime_detail_menu_index = 0;
-                            }
-                            2 => {
-                                // For change profile, fallback to settings for now or ignore
-                                // Maybe add a profile selector later
-                            }
-                            3 => {
-                                state.begin_health_refresh(true);
-                            }
-                            _ => {}
+                    None => match state.runtime_detail_menu_index {
+                        0 => {
+                            state.runtime_detail_submenu =
+                                Some(RuntimeDetailSubmenu::ModelSelector);
+                            state.runtime_detail_menu_index = 0;
                         }
-                    }
+                        1 => {
+                            state.runtime_detail_submenu =
+                                Some(RuntimeDetailSubmenu::ReasoningSelector);
+                            state.runtime_detail_menu_index = 0;
+                        }
+                        2 => {
+                            state.runtime_detail_submenu =
+                                Some(RuntimeDetailSubmenu::ProfileSelector);
+                            state.runtime_detail_menu_index = 0;
+                        }
+                        3 => {
+                            state.begin_health_refresh(true);
+                        }
+                        _ => {}
+                    },
                     Some(RuntimeDetailSubmenu::ModelSelector) => {
                         if let Some(catalog) = &state.cached_model_catalog {
                             if let Some(model) = catalog
@@ -678,26 +694,30 @@ pub(crate) async fn handle_key(
                         state.runtime_detail_menu_index = 0;
                     }
                     Some(RuntimeDetailSubmenu::ReasoningSelector) => {
-                        let efforts = [
-                            relay_core::RuntimeReasoningSelection::Explicit(
-                                relay_core::ReasoningEffort::Low,
-                            ),
-                            relay_core::RuntimeReasoningSelection::Explicit(
-                                relay_core::ReasoningEffort::Medium,
-                            ),
-                            relay_core::RuntimeReasoningSelection::Explicit(
-                                relay_core::ReasoningEffort::High,
-                            ),
-                            relay_core::RuntimeReasoningSelection::Explicit(
-                                relay_core::ReasoningEffort::XHigh,
-                            ),
-                        ];
-                        if state.runtime_detail_menu_index < efforts.len() {
+                        let options = state.reasoning_options_for_model(None);
+                        if let Some(effort) = options.get(state.runtime_detail_menu_index) {
                             state.active_reasoning_effort =
-                                efforts[state.runtime_detail_menu_index];
+                                relay_core::RuntimeReasoningSelection::Explicit(*effort);
                         }
                         state.runtime_detail_submenu = None;
                         state.runtime_detail_menu_index = 0;
+                    }
+                    Some(RuntimeDetailSubmenu::ProfileSelector) => {
+                        // Applying goes through the same validation path as
+                        // `/runtime use` (provider lookup, profile resolution,
+                        // cross-provider tuning re-resolution, persistence).
+                        let provider = state
+                            .runtime_detail_provider
+                            .clone()
+                            .unwrap_or_else(|| "codex".to_owned());
+                        let selected_profile = AppState::provider_profiles(&provider)
+                            .get(state.runtime_detail_menu_index)
+                            .map(|profile| profile.id.clone());
+                        state.runtime_detail_submenu = None;
+                        state.runtime_detail_menu_index = 0;
+                        if let Some(profile) = selected_profile {
+                            state.apply_runtime_profile(&profile);
+                        }
                     }
                 }
                 Ok(false)

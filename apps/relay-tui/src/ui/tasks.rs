@@ -6,7 +6,7 @@ use ratatui::{
 
 use relay_core::TaskState;
 
-use crate::state::{AppState, TaskReviewSubmenu};
+use crate::state::{AppState, TaskReviewSubmenu, reasoning_effort_label};
 use crate::util::{handoff_summary_text, task_preview_text, task_selection_listing};
 
 pub(crate) fn render_tasks(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -94,10 +94,11 @@ pub(crate) fn render_task_review(frame: &mut Frame, state: &AppState, area: Rect
                         }
                         TaskReviewSubmenu::ReasoningSelector => {
                             action.push_str("\n\nSelect Reasoning Effort for this run:\n");
-                            let efforts = ["low", "medium", "high", "xhigh"];
-                            for (i, e) in efforts.iter().enumerate() {
+                            let options = state
+                                .reasoning_options_for_model(state.one_run_model_override.as_deref());
+                            for (i, e) in options.iter().enumerate() {
                                 let cursor = if i == state.task_review_menu_index { ">" } else { " " };
-                                action.push_str(&format!("{cursor} {e}\n"));
+                                action.push_str(&format!("{cursor} {}\n", reasoning_effort_label(*e)));
                             }
                         }
                     }

@@ -9,6 +9,7 @@ use relay_runtime_codex::{CodexRuntime, CodexRuntimeHealth};
 
 use crate::state::{
     AppState, RuntimeDetailSubmenu, SETTINGS_FIELDS, SettingsField, git_health_marker,
+    reasoning_effort_label,
 };
 use crate::theme::Theme;
 use crate::util::app_execution_limits;
@@ -97,16 +98,35 @@ pub(crate) fn render_runtime_detail(frame: &mut Frame, state: &AppState, area: R
             }
             RuntimeDetailSubmenu::ReasoningSelector => {
                 let mut lines = vec!["Select Reasoning Effort:\n".to_owned()];
-                // Ideally this would be filtered by `supported_reasoning_efforts` of the selected model.
-                // For simplicity, showing standard efforts.
-                let efforts = ["low", "medium", "high", "xhigh"];
-                for (i, e) in efforts.iter().enumerate() {
+                let options = state.reasoning_options_for_model(None);
+                for (i, e) in options.iter().enumerate() {
                     let cursor = if i == state.runtime_detail_menu_index {
                         ">"
                     } else {
                         " "
                     };
-                    lines.push(format!("{cursor} {e}"));
+                    lines.push(format!("{cursor} {}", reasoning_effort_label(*e)));
+                }
+                if options.is_empty() {
+                    lines.push("  (No supported reasoning efforts)".to_owned());
+                }
+                lines.join("\n")
+            }
+            RuntimeDetailSubmenu::ProfileSelector => {
+                let mut lines = vec!["Select Profile:\n".to_owned()];
+                let provider = state.runtime_detail_provider.as_deref().unwrap_or("codex");
+                let profiles = AppState::provider_profiles(provider);
+                if profiles.is_empty() {
+                    lines.push("  (No profiles available)".to_owned());
+                } else {
+                    for (i, p) in profiles.iter().enumerate() {
+                        let cursor = if i == state.runtime_detail_menu_index {
+                            ">"
+                        } else {
+                            " "
+                        };
+                        lines.push(format!("{cursor} {} — {}", p.id, p.purpose));
+                    }
                 }
                 lines.join("\n")
             }
@@ -140,12 +160,13 @@ pub(crate) fn render_runtime_detail(frame: &mut Frame, state: &AppState, area: R
                 .as_deref()
                 .unwrap_or("Managed Codex login (no secrets displayed)");
 
-            let interface =
-                if std::env::var("RELAY_CODEX_TRANSPORT").ok().as_deref() == Some("app-server") {
-                    "App Server"
-                } else {
-                    "Codex exec"
-                };
+            // Mirrors relay-runtime-codex transport selection: app-server is
+            // the DEFAULT; only an explicit `exec` opts out.
+            let interface = if std::env::var("RELAY_CODEX_TRANSPORT").as_deref() != Ok("exec") {
+                "App Server"
+            } else {
+                "Codex exec"
+            };
             let approval = if interface == "App Server" {
                 "Live approval ✓"
             } else {

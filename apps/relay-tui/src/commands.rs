@@ -53,47 +53,7 @@ pub(crate) async fn execute_relay_command(
             state.screen = Screen::RuntimeDetail;
             state.begin_health_refresh(true);
         }
-        RelayCommand::RuntimeUse { profile } => {
-            let Some(provider) = profile.split('/').next().filter(|p| !p.is_empty()) else {
-                state.feedback = "Runtime profile must use provider/name format.".to_owned();
-                return Ok(false);
-            };
-            let router = build_runtime_router();
-            let Some(integration) = router.integration(provider) else {
-                state.feedback = format!("Unknown runtime provider '{provider}'.");
-                return Ok(false);
-            };
-            if let Err(error) = integration.resolve_profile(&profile) {
-                state.feedback = format!("Cannot use runtime profile '{profile}': {error}");
-                return Ok(false);
-            }
-            state.active_runtime_provider = provider.to_owned();
-            state.active_profile_id = profile.clone();
-            state.runtime_settings.runtime.default_profile = profile.clone();
-            // C8/C9: Re-resolve tuning from the new profile to prevent
-            // cross-provider model/reasoning leakage.
-            let resolved =
-                state
-                    .runtime_settings
-                    .resolve_selection(None, Some(&profile), None, None);
-            state.active_model = resolved.model;
-            state.active_reasoning_effort = resolved.reasoning_effort;
-            state.one_run_model_override = None;
-            state.one_run_reasoning_override = None;
-            match state
-                .runtime_settings
-                .save_to_path(&state.runtime_config_path)
-            {
-                Ok(()) => {
-                    state.feedback = format!("Active runtime profile: {}", state.active_profile_id)
-                }
-                Err(error) => {
-                    state.feedback = format!(
-                        "Runtime selected in memory but could not persist settings: {error}"
-                    )
-                }
-            }
-        }
+        RelayCommand::RuntimeUse { profile } => state.apply_runtime_profile(&profile),
         RelayCommand::RuntimeModel { model } => {
             let provider = state
                 .active_profile_id

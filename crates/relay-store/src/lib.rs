@@ -6,7 +6,9 @@
 
 use std::{
     env,
+    future::Future,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use sqlx::{
@@ -16,6 +18,19 @@ use sqlx::{
 use thiserror::Error;
 
 const MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// Default SQLite busy timeout applied to every Relay connection.
+const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
+
+/// Bounded retry budget applied before transient SQLite lock errors surface.
+const WRITE_RETRY_ATTEMPTS: usize = 5;
+const WRITE_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(20);
+const WRITE_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(160);
+
+// Primary SQLite result codes treated as transient lock contention. Extended
+// codes (for example SQLITE_BUSY_SNAPSHOT) share the low byte.
+const SQLITE_BUSY_PRIMARY_CODE: i32 = 5;
+const SQLITE_LOCKED_PRIMARY_CODE: i32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewTaskRecord {
@@ -75,7 +90,20 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     /// Opens a SQLite database, creates parent directories, and runs migrations.
+    ///
+    /// Every connection sets WAL journal mode, a 5000 ms busy timeout, and
+    /// foreign key enforcement so two Relay processes (TUI, serve-mcp) can
+    /// share the same database file safely.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_with_busy_timeout(path, DEFAULT_BUSY_TIMEOUT).await
+    }
+
+    /// Opens a SQLite database like [`SqliteStore::open`] with an explicit
+    /// busy timeout.
+    pub async fn open_with_busy_timeout(
+        path: impl AsRef<Path>,
+        busy_timeout: Duration,
+    ) -> Result<Self, StoreError> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|source| {
@@ -86,22 +114,22 @@ impl SqliteStore {
             })?;
         }
 
-        let options = SqliteConnectOptions::new()
-            .filename(path)
+        let options = Self::connect_options(path)
             .create_if_missing(true)
-            .foreign_keys(true)
-            .journal_mode(SqliteJournalMode::Wal);
+            .busy_timeout(busy_timeout);
         Self::connect(options).await
     }
 
     /// Opens an in-memory SQLite database and runs migrations.
     pub async fn in_memory() -> Result<Self, StoreError> {
-        Self::connect(
-            SqliteConnectOptions::new()
-                .filename(":memory:")
-                .foreign_keys(true),
-        )
-        .await
+        Self::connect(Self::connect_options(":memory:").busy_timeout(DEFAULT_BUSY_TIMEOUT)).await
+    }
+
+    fn connect_options(filename: impl AsRef<Path>) -> SqliteConnectOptions {
+        SqliteConnectOptions::new()
+            .filename(filename)
+            .foreign_keys(true)
+            .journal_mode(SqliteJournalMode::Wal)
     }
 
     async fn connect(options: SqliteConnectOptions) -> Result<Self, StoreError> {
@@ -109,12 +137,16 @@ impl SqliteStore {
             .max_connections(1)
             .connect_with(options)
             .await?;
-        MIGRATOR.run(&pool).await?;
+        MIGRATOR.run(&pool).await.map_err(map_migration_error)?;
 
         Ok(Self { pool })
     }
 
     pub async fn insert_task(&self, task: &NewTaskRecord) -> Result<TaskRecord, StoreError> {
+        retry_on_transient_lock(|| self.insert_task_once(task)).await
+    }
+
+    async fn insert_task_once(&self, task: &NewTaskRecord) -> Result<TaskRecord, StoreError> {
         let mut transaction = self.pool.begin().await?;
 
         sqlx::query(
@@ -180,6 +212,19 @@ impl SqliteStore {
         event_kind: &str,
         event_json: Option<&str>,
     ) -> Result<(), StoreError> {
+        retry_on_transient_lock(|| {
+            self.append_event_once(task_id, execution_id, event_kind, event_json)
+        })
+        .await
+    }
+
+    async fn append_event_once(
+        &self,
+        task_id: Option<&str>,
+        execution_id: Option<&str>,
+        event_kind: &str,
+        event_json: Option<&str>,
+    ) -> Result<(), StoreError> {
         let mut transaction = self.pool.begin().await?;
         insert_event(
             &mut transaction,
@@ -194,6 +239,15 @@ impl SqliteStore {
     }
 
     pub async fn update_task_state(
+        &self,
+        id: &str,
+        expected_state: &str,
+        new_state: &str,
+    ) -> Result<TaskRecord, StoreError> {
+        retry_on_transient_lock(|| self.update_task_state_once(id, expected_state, new_state)).await
+    }
+
+    async fn update_task_state_once(
         &self,
         id: &str,
         expected_state: &str,
@@ -237,6 +291,13 @@ impl SqliteStore {
     }
 
     pub async fn claim_ready_task_for_execution(
+        &self,
+        execution: &NewExecutionRecord,
+    ) -> Result<(TaskRecord, ExecutionRecord), StoreError> {
+        retry_on_transient_lock(|| self.claim_ready_task_for_execution_once(execution)).await
+    }
+
+    async fn claim_ready_task_for_execution_once(
         &self,
         execution: &NewExecutionRecord,
     ) -> Result<(TaskRecord, ExecutionRecord), StoreError> {
@@ -358,6 +419,14 @@ impl SqliteStore {
         execution_id: &str,
         phase: &str,
     ) -> Result<ExecutionRecord, StoreError> {
+        retry_on_transient_lock(|| self.update_execution_phase_once(execution_id, phase)).await
+    }
+
+    async fn update_execution_phase_once(
+        &self,
+        execution_id: &str,
+        phase: &str,
+    ) -> Result<ExecutionRecord, StoreError> {
         let result = sqlx::query(
             r#"
             UPDATE executions
@@ -384,6 +453,26 @@ impl SqliteStore {
     }
 
     pub async fn transition_task_and_execution(
+        &self,
+        task_id: &str,
+        expected_task_state: &str,
+        new_task_state: &str,
+        execution_id: &str,
+        new_execution_phase: &str,
+    ) -> Result<(TaskRecord, ExecutionRecord), StoreError> {
+        retry_on_transient_lock(|| {
+            self.transition_task_and_execution_once(
+                task_id,
+                expected_task_state,
+                new_task_state,
+                execution_id,
+                new_execution_phase,
+            )
+        })
+        .await
+    }
+
+    async fn transition_task_and_execution_once(
         &self,
         task_id: &str,
         expected_task_state: &str,
@@ -476,6 +565,13 @@ impl SqliteStore {
         &self,
         execution_id: &str,
     ) -> Result<ExecutionRecord, StoreError> {
+        retry_on_transient_lock(|| self.increment_execution_repair_count_once(execution_id)).await
+    }
+
+    async fn increment_execution_repair_count_once(
+        &self,
+        execution_id: &str,
+    ) -> Result<ExecutionRecord, StoreError> {
         let result = sqlx::query(
             r#"
             UPDATE executions
@@ -501,6 +597,22 @@ impl SqliteStore {
     }
 
     pub async fn transition_task_and_increment_repair_count(
+        &self,
+        task_id: &str,
+        expected_task_state: &str,
+        execution_id: &str,
+    ) -> Result<(TaskRecord, ExecutionRecord), StoreError> {
+        retry_on_transient_lock(|| {
+            self.transition_task_and_increment_repair_count_once(
+                task_id,
+                expected_task_state,
+                execution_id,
+            )
+        })
+        .await
+    }
+
+    async fn transition_task_and_increment_repair_count_once(
         &self,
         task_id: &str,
         expected_task_state: &str,
@@ -585,6 +697,28 @@ impl SqliteStore {
     }
 
     pub async fn finish_execution(
+        &self,
+        task_id: &str,
+        expected_task_state: &str,
+        terminal_task_state: &str,
+        execution_id: &str,
+        exit_outcome: &str,
+        failure_category: Option<&str>,
+    ) -> Result<(TaskRecord, ExecutionRecord), StoreError> {
+        retry_on_transient_lock(|| {
+            self.finish_execution_once(
+                task_id,
+                expected_task_state,
+                terminal_task_state,
+                execution_id,
+                exit_outcome,
+                failure_category,
+            )
+        })
+        .await
+    }
+
+    async fn finish_execution_once(
         &self,
         task_id: &str,
         expected_task_state: &str,
@@ -730,6 +864,68 @@ impl SqliteStore {
             .fetch_one(&self.pool)
             .await?;
         Ok(count)
+    }
+}
+
+/// Runs a write operation, retrying transient SQLite lock contention with
+/// bounded exponential backoff before surfacing a typed error.
+///
+/// Each attempt re-runs the whole operation (transactions are never resumed
+/// mid-flight), so a retry always starts from a clean transaction boundary.
+async fn retry_on_transient_lock<T, F, Fut>(mut operation: F) -> Result<T, StoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, StoreError>>,
+{
+    let mut attempt = 1usize;
+    loop {
+        match operation().await {
+            Err(error) if is_transient_lock_error(&error) => {
+                if attempt >= WRITE_RETRY_ATTEMPTS {
+                    return Err(match error {
+                        StoreError::Sqlx(source) => StoreError::DatabaseBusy {
+                            attempts: attempt as u32,
+                            source,
+                        },
+                        other => other,
+                    });
+                }
+                let backoff = WRITE_RETRY_BASE_BACKOFF
+                    .saturating_mul(2u32.pow(attempt as u32 - 1))
+                    .min(WRITE_RETRY_MAX_BACKOFF);
+                tokio::time::sleep(backoff).await;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+fn is_transient_lock_error(error: &StoreError) -> bool {
+    let StoreError::Sqlx(sqlx::Error::Database(database_error)) = error else {
+        return false;
+    };
+    database_error
+        .code()
+        .and_then(|code| code.parse::<i32>().ok())
+        .is_some_and(|code| {
+            matches!(
+                code & 0xff,
+                SQLITE_BUSY_PRIMARY_CODE | SQLITE_LOCKED_PRIMARY_CODE
+            )
+        })
+}
+
+fn map_migration_error(error: sqlx::migrate::MigrateError) -> StoreError {
+    match error {
+        // The database was written by a different Relay build; fail closed.
+        sqlx::migrate::MigrateError::VersionMissing(version)
+        | sqlx::migrate::MigrateError::VersionMismatch(version)
+        | sqlx::migrate::MigrateError::VersionNotPresent(version) => {
+            StoreError::SchemaVersionMismatch { version }
+        }
+        sqlx::migrate::MigrateError::Dirty(version) => StoreError::SchemaMigrationDirty { version },
+        other => StoreError::Migration(other),
     }
 }
 
@@ -893,6 +1089,18 @@ pub enum StoreError {
         expected_state: String,
         actual_state: String,
     },
+    #[error(
+        "database stayed locked after {attempts} attempts (WAL busy timeout exceeded): {source}"
+    )]
+    DatabaseBusy { attempts: u32, source: sqlx::Error },
+    #[error(
+        "database schema was written by a different Relay build (unexpected migration version {version}); refusing to open"
+    )]
+    SchemaVersionMismatch { version: i64 },
+    #[error(
+        "database schema is partially migrated (dirty migration version {version}); refusing to open"
+    )]
+    SchemaMigrationDirty { version: i64 },
 }
 
 #[cfg(test)]
@@ -914,6 +1122,29 @@ mod tests {
         .unwrap();
 
         assert_eq!(tasks, 1);
+    }
+
+    #[tokio::test]
+    async fn file_database_connections_set_concurrency_pragmas() {
+        let database_path = temp_path("relay-pragmas.sqlite3");
+        let store = SqliteStore::open(&database_path).await.unwrap();
+
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(busy_timeout, 5000);
+        assert_eq!(foreign_keys, 1);
     }
 
     #[tokio::test]

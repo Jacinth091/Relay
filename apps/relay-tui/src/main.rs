@@ -533,10 +533,70 @@ fn render_runtimes(frame: &mut Frame, state: &AppState, area: Rect) {
 
 fn render_runtime_detail(frame: &mut Frame, state: &AppState, area: Rect) {
     let provider = state.runtime_detail_provider.as_deref().unwrap_or("codex");
+
+    if let Some(submenu) = state.runtime_detail_submenu {
+        let body = match submenu {
+            RuntimeDetailSubmenu::ModelSelector => {
+                let mut lines = vec!["Select Model:\n".to_owned()];
+                if let Some(catalog) = &state.cached_model_catalog {
+                    for (i, m) in catalog.available_models.iter().enumerate() {
+                        let cursor = if i == state.runtime_detail_menu_index {
+                            ">"
+                        } else {
+                            " "
+                        };
+                        lines.push(format!("{cursor} {}", m.id));
+                    }
+                } else {
+                    lines.push("  (No models available or loading...)".to_owned());
+                }
+                lines.join("\n")
+            }
+            RuntimeDetailSubmenu::ReasoningSelector => {
+                let mut lines = vec!["Select Reasoning Effort:\n".to_owned()];
+                // Ideally this would be filtered by `supported_reasoning_efforts` of the selected model.
+                // For simplicity, showing standard efforts.
+                let efforts = ["low", "medium", "high", "xhigh"];
+                for (i, e) in efforts.iter().enumerate() {
+                    let cursor = if i == state.runtime_detail_menu_index {
+                        ">"
+                    } else {
+                        " "
+                    };
+                    lines.push(format!("{cursor} {e}"));
+                }
+                lines.join("\n")
+            }
+        };
+        frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), area);
+        return;
+    }
+
+    let menu_items = [
+        "Change model",
+        "Change reasoning",
+        "Change profile",
+        "Test runtime",
+    ];
+    let mut menu_lines = String::new();
+    for (i, item) in menu_items.iter().enumerate() {
+        let cursor = if i == state.runtime_detail_menu_index {
+            ">"
+        } else {
+            " "
+        };
+        menu_lines.push_str(&format!("{cursor} {item}\n"));
+    }
+
     let body = match provider {
         "codex" => {
             let health_detail =
                 codex_health_detail(&state.runtime_health, &CodexRuntime::default());
+            let account_info = state
+                .cached_codex_account
+                .as_deref()
+                .unwrap_or("Managed Codex login (no secrets displayed)");
+
             let interface =
                 if std::env::var("RELAY_CODEX_TRANSPORT").ok().as_deref() == Some("app-server") {
                     "App Server"
@@ -549,8 +609,9 @@ fn render_runtime_detail(frame: &mut Frame, state: &AppState, area: Rect) {
                 "Pre-approved envelope"
             };
             format!(
-                "Runtime / Codex\n\nStatus\n{}\n\nAuthentication\n  Managed Codex login (no secrets displayed)\n\nInterface\n  {}\n\nActive profile\n  {}\n\nAI\n  Model: {}\n  Reasoning: {}\n\nPermissions\n  {}\n\nUsage\n  Rate limits: available through provider dashboard\n\nCapabilities\n  Workspace read: ✓\n  Workspace write: ✓\n  Commands: ✓\n  Network: ×\n  Commit: ×\n  Push: ×\n\nLimits\n  Duration: {} min\n  Repairs: {}",
+                "Runtime / Codex\n\nStatus\n{}\n\nAuthentication\n  {}\n\nInterface\n  {}\n\nActive profile\n  {}\n\nAI\n  Model: {}\n  Reasoning: {}\n\n{}\nPermissions\n  {}\n\nCapabilities\n  Workspace read: ✓\n  Workspace write: Configured\n  Commands: Configured\n  Network: ×\n  Commit: ×\n  Push: ×\n\nLimits\n  Duration: {} min\n  Repairs: {}",
                 health_detail,
+                account_info,
                 interface,
                 state.active_profile_id,
                 state.active_model.as_option().unwrap_or("provider default"),
@@ -559,6 +620,7 @@ fn render_runtime_detail(frame: &mut Frame, state: &AppState, area: Rect) {
                     .as_option()
                     .map(|effort| format!("{effort:?}"))
                     .unwrap_or_else(|| "profile default".to_owned()),
+                menu_lines,
                 approval,
                 app_execution_limits().max_duration.as_secs() / 60,
                 app_execution_limits().max_repair_attempts
@@ -566,8 +628,9 @@ fn render_runtime_detail(frame: &mut Frame, state: &AppState, area: Rect) {
         }
         "antigravity" => {
             format!(
-                "Runtime / Antigravity\n\nStatus\n  {}\n\nActive profile\n  antigravity/implement\n\nAI\n  Model: Default\n  Effort: High\n\nCapabilities\n  Workspace read: ✓\n  Workspace write: ✓\n  Commands: ✓\n  Network: ×\n  Commit: ×\n  Push: ×",
-                state.antigravity_health.display_status()
+                "Runtime / Antigravity\n\nStatus\n  {}\n\nActive profile\n  antigravity/implement\n\nAI\n  Model: Default\n  Effort: High\n\n{}\nCapabilities\n  Workspace read: ✓\n  Workspace write: Configured\n  Commands: Configured\n  Network: ×\n  Commit: ×\n  Push: ×",
+                state.antigravity_health.display_status(),
+                menu_lines
             )
         }
         _ => format!("Unknown runtime provider: {provider}"),
@@ -676,7 +739,7 @@ fn codex_health_detail(health: &CodexRuntimeHealth, runtime: &CodexRuntime) -> S
         CodexRuntimeHealth::Checking => {
             "  health probe pending; Run remains blocked until verification completes".to_owned()
         }
-        CodexRuntimeHealth::Available { version } => {
+        CodexRuntimeHealth::Available { version, .. } => {
             format!("  {executable}\n  {version}\n✓ Codex authentication and exec compatibility")
         }
         CodexRuntimeHealth::NotAuthenticated { version, error } => format!(
@@ -811,32 +874,70 @@ fn render_task_review(frame: &mut Frame, state: &AppState, area: Rect) {
         .selected_stored_task()
         .map(|task| {
             let preflight = state.ui_preflight(task);
-            let action = if task.state == TaskState::Ready && preflight == "eligible" {
-                "\n\n[R] Run  [B] Back\nOne-run tuning: /run <task> --model=<id> --reasoning=<low|medium|high|xhigh>"
+            let mut action = String::new();
+            if task.state == TaskState::Ready && preflight == "eligible" {
+                if let Some(submenu) = state.task_review_submenu {
+                    match submenu {
+                        TaskReviewSubmenu::ModelSelector => {
+                            action.push_str("\n\nSelect Model for this run:\n");
+                            if let Some(catalog) = &state.cached_model_catalog {
+                                for (i, m) in catalog.available_models.iter().enumerate() {
+                                    let cursor = if i == state.task_review_menu_index { ">" } else { " " };
+                                    action.push_str(&format!("{cursor} {}\n", m.id));
+                                }
+                            } else {
+                                action.push_str("  (No models available or loading...)\n");
+                            }
+                        }
+                        TaskReviewSubmenu::ReasoningSelector => {
+                            action.push_str("\n\nSelect Reasoning Effort for this run:\n");
+                            let efforts = ["low", "medium", "high", "xhigh"];
+                            for (i, e) in efforts.iter().enumerate() {
+                                let cursor = if i == state.task_review_menu_index { ">" } else { " " };
+                                action.push_str(&format!("{cursor} {e}\n"));
+                            }
+                        }
+                    }
+                } else {
+                    let menu_items = [
+                        "Change model for this run",
+                        "Change reasoning for this run",
+                        "Run",
+                    ];
+                    let current_model = state.one_run_model_override.as_deref().unwrap_or("provider default");
+                    let current_reasoning = state.one_run_reasoning_override.as_deref().unwrap_or("profile default");
+
+                    action.push_str(&format!("\n\nRuntime: {}\nModel: {}\nReasoning: {}\n\n",
+                        state.active_profile_id, current_model, current_reasoning));
+
+                    for (i, item) in menu_items.iter().enumerate() {
+                        let cursor = if i == state.task_review_menu_index { ">" } else { " " };
+                        action.push_str(&format!("{cursor} {item}\n"));
+                    }
+                }
             } else if matches!(
                 task.state,
                 TaskState::Done | TaskState::Failed | TaskState::Cancelled
             ) {
-                "\n\n[Enter] View result  [B] Back"
+                action = "\n\n[Enter] View result  [B] Back".to_owned();
             } else if matches!(
                 task.state,
                 TaskState::NeedsClarification | TaskState::NeedsDecision
             ) {
-                "\n\nATTENTION REQUIRED: external resolution is required.\n[B] Back"
+                action = "\n\nATTENTION REQUIRED: external resolution is required.\n[B] Back".to_owned();
             } else {
-                "\n\n[B] Back\nOne-run tuning: /run <task> --model=<id> --reasoning=<low|medium|high|xhigh>"
+                action = "\n\n[B] Back".to_owned();
             };
             let requested_stack = task.handoff.stack.as_deref().unwrap_or("not requested");
             let effective_stack = state
                 .effective_stack(task)
                 .unwrap_or("missing or unsupported");
             format!(
-                "Task: {}\nProject: {}\nRequested stack: {}\nEffective stack: {}\nRuntime profile: {}\nRuntime availability: {}\nState: {}\nRepository: {}\n\n{}{}",
+                "Task Review\n\nTask: {}\nProject: {}\nRequested stack: {}\nEffective stack: {}\nRuntime availability: {}\nState: {}\nRepository: {}\n\n{}{}",
                 task.id,
                 task.project_key,
                 requested_stack,
                 effective_stack,
-                state.active_profile_id,
                 if state.active_runtime_provider == "antigravity" {
                     state.antigravity_health.display_status()
                 } else {
@@ -861,10 +962,19 @@ fn render_task_review(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn render_execution(frame: &mut Frame, state: &AppState, area: Rect) {
+    let mut permission_popup = None;
+
     let body = state.selected_task.and_then(|id| state.execution_views.get(&id).map(|view| (id, view))).map(|(id, view)| {
         let task = state.durable_tasks.iter().find(|task| task.id == id);
         let output = view.output.iter().cloned().collect::<Vec<_>>().join("");
-        format!("Task: {id}\nProject: {}\nRuntime: {}\nModel: {}\nReasoning: {}\nScheduler: {}\nPhase: {}\nRepair: {}\nElapsed: {}s\n{}\n{}\n\nOutput:\n{}\n\nTry:\n  /cancel\n  /diff\n  /logs\n  /tasks",
+
+        if let Some((task_id, request)) = &state.pending_permission {
+            if *task_id == id {
+                permission_popup = Some(request.clone());
+            }
+        }
+
+        format!("Task: {id}\nProject: {}\nRuntime: {}\nModel: {}\nReasoning: {}\nScheduler: {}\nPhase: {}\nRepair: {}\nElapsed: {}s\n{}\n\nOutput:\n{}\n\nTry:\n  /cancel\n  /diff\n  /logs\n  /tasks",
             task.map(|task| task.project_key.as_str()).unwrap_or("unknown"),
             view.frozen_profile.as_deref().map(|p| state.runtime_label_for_profile(p)).unwrap_or_else(|| state.runtime_label()),
             view.frozen_model.as_deref().unwrap_or("provider default"),
@@ -873,8 +983,13 @@ fn render_execution(frame: &mut Frame, state: &AppState, area: Rect) {
             view.durable_state.map(|state| state.as_str()).unwrap_or("state pending"), view.repair_attempt,
             view.started_at.map(|started| started.elapsed().as_secs()).unwrap_or(0),
             view.persistence_error.as_ref().map(|error| format!("STATE UNCERTAIN / DURABILITY FAILURE\n{error}")).unwrap_or_else(|| if view.cancellation_requested { "Cancellation requested...".to_owned() } else { String::new() }),
-            state.pending_permission.as_ref().filter(|(task_id, _)| *task_id == id).map(|(_, request)| format!("! WAITING FOR PERMISSION\nKind: {:?}\n{}{}{}Reason: {}\n\n[Y] Allow once  [S] Allow for run  [N/Esc] Deny", request.kind, request.command.as_deref().map(|command| format!("Command: {command}\n")).unwrap_or_default(), request.cwd.as_ref().map(|cwd| format!("cwd: {}\n", cwd.display())).unwrap_or_default(), if request.requested.paths.is_empty() { String::new() } else { format!("Paths:\n{}\n", request.requested.paths.iter().map(|path| format!("  {}\n", path.display())).collect::<String>()) }, request.reason.as_deref().unwrap_or("provider approval required"))).unwrap_or_default(), output)
+            output)
     }).unwrap_or_else(|| "No execution selected.".to_owned());
+    let body = if !state.execution_follow_tail {
+        format!("{body}\n\n── paused · End to resume live ──")
+    } else {
+        body
+    };
     let scroll = state
         .execution_scroll
         .min(visible_scroll(&body, area.height));
@@ -884,18 +999,92 @@ fn render_execution(frame: &mut Frame, state: &AppState, area: Rect) {
             .wrap(Wrap { trim: false }),
         area,
     );
+
+    if let Some(request) = permission_popup {
+        let kind = format!("{:?}", request.kind);
+        let command = request
+            .command
+            .as_deref()
+            .map(|c| format!("Command: {c}\n"))
+            .unwrap_or_default();
+        let cwd = request
+            .cwd
+            .as_ref()
+            .map(|c| format!("cwd: {}\n", c.display()))
+            .unwrap_or_default();
+        let paths = if request.requested.paths.is_empty() {
+            String::new()
+        } else {
+            let mut paths_str = "Paths:\n".to_owned();
+            for path in &request.requested.paths {
+                paths_str.push_str(&format!("  {}\n", path.display()));
+            }
+            paths_str
+        };
+        let reason = request
+            .reason
+            .as_deref()
+            .unwrap_or("provider approval required");
+        let popup_text = format!(
+            "Kind: {kind}\n{command}{cwd}{paths}Reason: {reason}\n──────────────\n[Y] Allow once  [S] Allow for session  [N] Deny"
+        );
+
+        let popup_width = popup_text
+            .lines()
+            .map(|l| l.len())
+            .max()
+            .unwrap_or(50)
+            .max(50)
+            .min(area.width.saturating_sub(4) as usize) as u16
+            + 4;
+        let popup_height = popup_text.lines().count() as u16 + 2;
+
+        let popup_x = area.x + (area.width.saturating_sub(popup_width) / 2);
+        let popup_y = area.y + (area.height.saturating_sub(popup_height) / 2);
+
+        let popup_area = Rect {
+            x: popup_x,
+            y: popup_y,
+            width: popup_width,
+            height: popup_height,
+        };
+
+        frame.render_widget(ratatui::widgets::Clear, popup_area);
+        frame.render_widget(
+            Paragraph::new(popup_text).block(
+                Block::default()
+                    .title(" Permission Required ")
+                    .borders(Borders::ALL),
+            ),
+            popup_area,
+        );
+    }
 }
 
 fn render_result(frame: &mut Frame, state: &AppState, area: Rect) {
     let body = state.selected_stored_task().map(|task| {
         let report = state.last_reports.get(&task.id);
         let repository = state.relay.inspect_project_repository(task.project_key.as_str()).ok().map(|i| repository_inspection_line(&i.eligibility, &i.status)).unwrap_or_else(|| "unavailable".to_owned());
-        format!("Task: {}\nProject: {}\nRuntime: {}\nModel: {}\nReasoning: {}\nState: {}\nOutcome: {}\nVerification: {}\nRepairs: {}\nRepository: {}\n\nSummary:\n{}\n\nTry:\n  /diff\n  /logs\n  /tasks\n  /new",
-            task.id, task.project_key, state.execution_profile(task.id).map(|p| state.runtime_label_for_profile(&p)).unwrap_or_else(|| state.runtime_label()), task.state.as_str(), report.and_then(|r| r.outcome).map(|o| o.as_str()).unwrap_or("not confirmed"),
-            state.execution_model(task.id).as_deref().unwrap_or("provider default"),
-            state.execution_reasoning(task.id).as_deref().unwrap_or("profile default"),
-            match task.state { TaskState::Done => "PASS", TaskState::NeedsDecision => "NEEDS DECISION", TaskState::NeedsClarification => "NEEDS CLARIFICATION", TaskState::Failed => "FAILED", TaskState::Cancelled => "CANCELLED", _ => "not available" }, state.execution_views.get(&task.id).map(|v| v.repair_attempt).unwrap_or(0), repository,
-            report.and_then(|r| r.outcome_summary.as_deref()).unwrap_or("No confirmed execution report."))
+
+        let task_id = &task.id;
+        let project = &task.project_key;
+        let runtime = state.execution_profile(task.id).map(|p| state.runtime_label_for_profile(&p)).unwrap_or_else(|| state.runtime_label());
+        let model = state.execution_model(task.id).as_deref().unwrap_or("provider default").to_owned();
+        let reasoning = state.execution_reasoning(task.id).as_deref().unwrap_or("profile default").to_owned();
+        let task_state = task.state.as_str();
+        let outcome = report.and_then(|r| r.outcome).map(|o| o.as_str()).unwrap_or("not confirmed");
+        let verification = match task.state {
+            TaskState::Done => "PASS",
+            TaskState::NeedsDecision => "NEEDS DECISION",
+            TaskState::NeedsClarification => "NEEDS CLARIFICATION",
+            TaskState::Failed => "FAILED",
+            TaskState::Cancelled => "CANCELLED",
+            _ => "not available",
+        };
+        let repairs = state.execution_views.get(&task.id).map(|v| v.repair_attempt).unwrap_or(0);
+        let summary = report.and_then(|r| r.outcome_summary.as_deref()).unwrap_or("No confirmed execution report.");
+
+        format!("Task: {task_id}\nProject: {project}\nRuntime: {runtime}\nModel: {model}\nReasoning: {reasoning}\nState: {task_state}\nOutcome: {outcome}\nVerification: {verification}\nRepairs: {repairs}\nRepository: {repository}\n\nSummary:\n{summary}\n\nTry:\n  /diff\n  /logs\n  /tasks\n  /new")
     }).unwrap_or_else(|| "No durable task selected.".to_owned());
     let scroll = state.result_scroll.min(visible_scroll(&body, area.height));
     frame.render_widget(
@@ -1131,15 +1320,86 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
         },
         Screen::TaskReview => match key.code {
             KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('B') => {
-                state.screen = Screen::Tasks;
+                if state.task_review_submenu.is_some() {
+                    state.task_review_submenu = None;
+                    state.task_review_menu_index = 0;
+                    Ok(false)
+                } else {
+                    state.screen = Screen::Tasks;
+                    Ok(false)
+                }
+            }
+            KeyCode::Up => {
+                state.task_review_menu_index = state.task_review_menu_index.saturating_sub(1);
                 Ok(false)
             }
-            KeyCode::Char('r') | KeyCode::Char('R') => {
-                state.submit_selected_task().await;
+            KeyCode::Down => {
+                let max = match state.task_review_submenu {
+                    Some(TaskReviewSubmenu::ModelSelector) => state
+                        .cached_model_catalog
+                        .as_ref()
+                        .map(|c| c.available_models.len().saturating_sub(1))
+                        .unwrap_or(0),
+                    Some(TaskReviewSubmenu::ReasoningSelector) => 3,
+                    None => 2, // 3 items (0 to 2)
+                };
+                if state.task_review_menu_index < max {
+                    state.task_review_menu_index += 1;
+                }
                 Ok(false)
             }
             KeyCode::Enter => {
+                if let Some(task) = state.selected_stored_task() {
+                    let preflight = state.ui_preflight(task);
+                    if task.state == TaskState::Ready && preflight == "eligible" {
+                        match state.task_review_submenu {
+                            None => match state.task_review_menu_index {
+                                0 => {
+                                    state.task_review_submenu =
+                                        Some(TaskReviewSubmenu::ModelSelector);
+                                    state.task_review_menu_index = 0;
+                                }
+                                1 => {
+                                    state.task_review_submenu =
+                                        Some(TaskReviewSubmenu::ReasoningSelector);
+                                    state.task_review_menu_index = 0;
+                                }
+                                2 => {
+                                    state.submit_selected_task().await;
+                                }
+                                _ => {}
+                            },
+                            Some(TaskReviewSubmenu::ModelSelector) => {
+                                if let Some(catalog) = &state.cached_model_catalog {
+                                    if let Some(model) =
+                                        catalog.available_models.get(state.task_review_menu_index)
+                                    {
+                                        state.one_run_model_override = Some(model.id.clone());
+                                    }
+                                }
+                                state.task_review_submenu = None;
+                                state.task_review_menu_index = 0;
+                            }
+                            Some(TaskReviewSubmenu::ReasoningSelector) => {
+                                let efforts = ["low", "medium", "high", "xhigh"];
+                                if state.task_review_menu_index < efforts.len() {
+                                    state.one_run_reasoning_override =
+                                        Some(efforts[state.task_review_menu_index].to_owned());
+                                }
+                                state.task_review_submenu = None;
+                                state.task_review_menu_index = 0;
+                            }
+                        }
+                        return Ok(false);
+                    }
+                }
                 state.open_selected_task();
+                Ok(false)
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                if state.task_review_submenu.is_none() {
+                    state.submit_selected_task().await;
+                }
                 Ok(false)
             }
             KeyCode::Char('n') | KeyCode::Char('N') => {
@@ -1169,9 +1429,23 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
                         }
                         _ => RuntimePermissionDecision::Deny,
                     };
+                    let scope = match decision {
+                        RuntimePermissionDecision::AllowOnce => {
+                            relay_runtime::RuntimePermissionScope::Once
+                        }
+                        RuntimePermissionDecision::AllowForRun => {
+                            relay_runtime::RuntimePermissionScope::Session
+                        }
+                        _ => relay_runtime::RuntimePermissionScope::Once,
+                    };
+                    let grant = relay_runtime::RuntimePermissionGrant {
+                        decision,
+                        scope,
+                        granted_paths: request.requested.paths.clone(),
+                    };
                     if let Some(scheduler) = state.scheduler.clone() {
                         let _ = scheduler
-                            .resolve_permission(task_id, request.request_id, decision)
+                            .resolve_permission(task_id, request.request_id, grant)
                             .await;
                     }
                 }
@@ -1328,19 +1602,119 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
             }
             _ => Ok(false),
         },
-        Screen::Runtimes | Screen::RuntimeDetail | Screen::Settings | Screen::Doctor => {
-            match key.code {
-                KeyCode::Char('r') | KeyCode::Char('R') => {
-                    state.begin_health_refresh(true);
+        Screen::Runtimes | Screen::Settings | Screen::Doctor => match key.code {
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                state.begin_health_refresh(true);
+                Ok(false)
+            }
+            KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => {
+                state.screen = Screen::Dashboard;
+                Ok(false)
+            }
+            _ => Ok(false),
+        },
+        Screen::RuntimeDetail => match key.code {
+            KeyCode::Esc => {
+                if state.runtime_detail_submenu.is_some() {
+                    state.runtime_detail_submenu = None;
+                    state.runtime_detail_menu_index = 0;
                     Ok(false)
-                }
-                KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => {
+                } else {
                     state.screen = Screen::Dashboard;
                     Ok(false)
                 }
-                _ => Ok(false),
             }
-        }
+            KeyCode::Up => {
+                state.runtime_detail_menu_index = state.runtime_detail_menu_index.saturating_sub(1);
+                Ok(false)
+            }
+            KeyCode::Down => {
+                let max = match state.runtime_detail_submenu {
+                    Some(RuntimeDetailSubmenu::ModelSelector) => state
+                        .cached_model_catalog
+                        .as_ref()
+                        .map(|c| c.available_models.len().saturating_sub(1))
+                        .unwrap_or(0),
+                    Some(RuntimeDetailSubmenu::ReasoningSelector) => 3, // low, medium, high, xhigh
+                    None => 3,                                          // 4 items (0 to 3)
+                };
+                if state.runtime_detail_menu_index < max {
+                    state.runtime_detail_menu_index += 1;
+                }
+                Ok(false)
+            }
+            KeyCode::Enter => {
+                match state.runtime_detail_submenu {
+                    None => {
+                        match state.runtime_detail_menu_index {
+                            0 => {
+                                state.runtime_detail_submenu =
+                                    Some(RuntimeDetailSubmenu::ModelSelector);
+                                state.runtime_detail_menu_index = 0;
+                            }
+                            1 => {
+                                state.runtime_detail_submenu =
+                                    Some(RuntimeDetailSubmenu::ReasoningSelector);
+                                state.runtime_detail_menu_index = 0;
+                            }
+                            2 => {
+                                // For change profile, fallback to settings for now or ignore
+                                // Maybe add a profile selector later
+                            }
+                            3 => {
+                                state.begin_health_refresh(true);
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(RuntimeDetailSubmenu::ModelSelector) => {
+                        if let Some(catalog) = &state.cached_model_catalog {
+                            if let Some(model) = catalog
+                                .available_models
+                                .get(state.runtime_detail_menu_index)
+                            {
+                                state.active_model =
+                                    relay_core::RuntimeModelSelection::Explicit(model.id.clone());
+                            }
+                        }
+                        state.runtime_detail_submenu = None;
+                        state.runtime_detail_menu_index = 0;
+                    }
+                    Some(RuntimeDetailSubmenu::ReasoningSelector) => {
+                        let efforts = [
+                            relay_core::RuntimeReasoningSelection::Explicit(
+                                relay_core::ReasoningEffort::Low,
+                            ),
+                            relay_core::RuntimeReasoningSelection::Explicit(
+                                relay_core::ReasoningEffort::Medium,
+                            ),
+                            relay_core::RuntimeReasoningSelection::Explicit(
+                                relay_core::ReasoningEffort::High,
+                            ),
+                            relay_core::RuntimeReasoningSelection::Explicit(
+                                relay_core::ReasoningEffort::XHigh,
+                            ),
+                        ];
+                        if state.runtime_detail_menu_index < efforts.len() {
+                            state.active_reasoning_effort =
+                                efforts[state.runtime_detail_menu_index];
+                        }
+                        state.runtime_detail_submenu = None;
+                        state.runtime_detail_menu_index = 0;
+                    }
+                }
+                Ok(false)
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                state.begin_health_refresh(true);
+                Ok(false)
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') if state.runtime_detail_submenu.is_none() => {
+                state.screen = Screen::Dashboard;
+                Ok(false)
+            }
+            _ => Ok(false),
+        },
     }
 }
 
@@ -1421,7 +1795,17 @@ async fn execute_relay_command(state: &mut AppState, input: &str) -> Result<bool
             }
             state.active_runtime_provider = provider.to_owned();
             state.active_profile_id = profile.clone();
-            state.runtime_settings.runtime.default_profile = profile;
+            state.runtime_settings.runtime.default_profile = profile.clone();
+            // C8/C9: Re-resolve tuning from the new profile to prevent
+            // cross-provider model/reasoning leakage.
+            let resolved =
+                state
+                    .runtime_settings
+                    .resolve_selection(None, Some(&profile), None, None);
+            state.active_model = resolved.model;
+            state.active_reasoning_effort = resolved.reasoning_effort;
+            state.one_run_model_override = None;
+            state.one_run_reasoning_override = None;
             match state
                 .runtime_settings
                 .save_to_path(&runtime_settings::RuntimeSettings::default_path())
@@ -2063,6 +2447,24 @@ struct AppState {
     repository_inspections: BTreeMap<ProjectKey, RepositoryInspection>,
     feedback: String,
     pending_permission: Option<(TaskId, RuntimePermissionRequest)>,
+    cached_model_catalog: Option<relay_runtime::RuntimeModelCatalog>,
+    runtime_detail_menu_index: usize,
+    runtime_detail_submenu: Option<RuntimeDetailSubmenu>,
+    task_review_menu_index: usize,
+    task_review_submenu: Option<TaskReviewSubmenu>,
+    cached_codex_account: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeDetailSubmenu {
+    ModelSelector,
+    ReasoningSelector,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskReviewSubmenu {
+    ModelSelector,
+    ReasoningSelector,
 }
 
 #[derive(Debug, Default)]
@@ -2144,12 +2546,23 @@ impl AppState {
         if let Ok(snapshot) = task.await {
             self.git_health = snapshot.git_health;
             if snapshot.runtime_health != CodexRuntimeHealth::Checking {
+                if let CodexRuntimeHealth::Available { ref account, .. } = snapshot.runtime_health {
+                    self.cached_codex_account = account.clone();
+                }
                 self.runtime_health = snapshot.runtime_health;
             }
             if snapshot.antigravity_health != AntigravityRuntimeHealth::Checking {
                 self.antigravity_health = snapshot.antigravity_health;
             }
             self.github_cli_health = snapshot.github_cli_health;
+
+            let provider = self
+                .runtime_detail_provider
+                .as_deref()
+                .unwrap_or(&self.active_runtime_provider);
+            if let Some(integration) = build_runtime_router().integration(provider) {
+                self.cached_model_catalog = Some(integration.models().await);
+            }
         }
     }
 
@@ -2321,12 +2734,32 @@ impl AppState {
             inspectable_tasks.push(item);
         }
 
+        let models = self
+            .cached_model_catalog
+            .as_ref()
+            .map(|catalog| {
+                catalog
+                    .available_models
+                    .iter()
+                    .map(|m| m.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let reasoning_efforts = vec![
+            "low".to_owned(),
+            "medium".to_owned(),
+            "high".to_owned(),
+            "xhigh".to_owned(),
+        ];
+
         command_completion::CompletionContext {
             providers,
             profiles,
             ready_tasks,
             cancellable_tasks,
             inspectable_tasks,
+            models,
+            reasoning_efforts,
         }
     }
 
@@ -2432,9 +2865,17 @@ impl AppState {
                 .next()
                 .unwrap_or("codex")
                 .to_owned(),
-            active_profile_id: default_profile,
-            active_model: relay_core::RuntimeModelSelection::ProviderDefault,
-            active_reasoning_effort: relay_core::RuntimeReasoningSelection::ProfileDefault,
+            active_profile_id: default_profile.clone(),
+            active_model: {
+                let resolved =
+                    runtime_settings.resolve_selection(None, Some(&default_profile), None, None);
+                resolved.model
+            },
+            active_reasoning_effort: {
+                let resolved =
+                    runtime_settings.resolve_selection(None, Some(&default_profile), None, None);
+                resolved.reasoning_effort
+            },
             one_run_model_override: None,
             one_run_reasoning_override: None,
             runtime_settings,
@@ -2470,6 +2911,12 @@ impl AppState {
             repository_inspections: BTreeMap::new(),
             feedback,
             pending_permission: None,
+            cached_model_catalog: None,
+            runtime_detail_menu_index: 0,
+            runtime_detail_submenu: None,
+            task_review_menu_index: 0,
+            task_review_submenu: None,
+            cached_codex_account: None,
         }
     }
 
@@ -2732,11 +3179,16 @@ impl AppState {
             one_run_model.as_deref().or(self.active_model.as_option()),
             one_run_effort.or(self.active_reasoning_effort.as_option()),
         );
+        let trusted_workspace = self
+            .relay
+            .resolve_project(task.project_key.as_str())
+            .ok()
+            .map(|project| project.local_path().to_path_buf());
         let permission_envelope = build_runtime_router()
             .integration(selection.profile_id.split('/').next().unwrap_or_default())
             .and_then(|integration| integration.resolve_profile(&selection.profile_id).ok())
             .map(|effective| relay_runtime::RuntimePermissionEnvelope {
-                trusted_workspace: None,
+                trusted_workspace,
                 workspace_write: matches!(
                     effective.profile.filesystem,
                     relay_runtime::FilesystemCapability::WorkspaceWrite
@@ -2761,11 +3213,21 @@ impl AppState {
                 .model
                 .as_option()
                 .map(str::to_owned);
-            view.frozen_reasoning = policy
-                .runtime_selection
-                .reasoning_effort
-                .as_option()
-                .map(|e| format!("{e:?}"));
+            view.frozen_reasoning =
+                policy
+                    .runtime_selection
+                    .reasoning_effort
+                    .as_option()
+                    .map(|e| {
+                        match e {
+                            relay_core::ReasoningEffort::Default => "default",
+                            relay_core::ReasoningEffort::Low => "low",
+                            relay_core::ReasoningEffort::Medium => "medium",
+                            relay_core::ReasoningEffort::High => "high",
+                            relay_core::ReasoningEffort::XHigh => "xhigh",
+                        }
+                        .to_owned()
+                    });
         }
         match scheduler.submit_with_policy(task.id, policy).await {
             Ok(()) => {
@@ -4126,6 +4588,7 @@ mod tests {
         );
         state.runtime_health = CodexRuntimeHealth::Available {
             version: "test runtime".to_owned(),
+            account: None,
         };
         state
     }
@@ -4143,6 +4606,7 @@ mod tests {
         );
         state.runtime_health = CodexRuntimeHealth::Available {
             version: "test runtime".to_owned(),
+            account: None,
         };
         state
     }
@@ -4199,6 +4663,7 @@ mod tests {
         );
         state.runtime_health = CodexRuntimeHealth::Available {
             version: "test runtime".to_owned(),
+            account: None,
         };
         state
     }
@@ -4225,6 +4690,91 @@ mod tests {
             "# Presentation title ignored\n\n<!-- relay:task:start -->\n```json\n{}\n```\n<!-- relay:task:end -->",
             task_json()
         )
+    }
+
+    #[tokio::test]
+    async fn result_view_displays_correct_labels_and_values() {
+        let mut state = app_state_with_eligible_project_with_store().await;
+        state.start_paste_task();
+        state.paste_text = task_json();
+        state.submit_paste_task();
+        state.confirm_task_import().await;
+        let task_id = state.selected_task.unwrap();
+
+        // Populate execution view and last report with explicit test values
+        let view = state.execution_views.entry(task_id).or_default();
+        view.frozen_profile = Some("codex/implement".to_owned());
+        view.frozen_model = Some("gpt-5.6-sol".to_owned());
+        view.frozen_reasoning = Some("high".to_owned());
+        view.durable_state = Some(TaskState::Done);
+
+        if let Some(task) = state.durable_tasks.iter_mut().find(|t| t.id == task_id) {
+            task.state = TaskState::Done;
+        }
+        state.last_reports.insert(
+            task_id,
+            relay_core::ExecutionReport {
+                task_id,
+                project_key: ProjectKey::parse("relay").unwrap(),
+                execution_id: None,
+                final_state: Some(TaskState::Done),
+                outcome: Some(relay_runtime::RuntimeOutcomeKind::Success),
+                outcome_summary: Some("All acceptance criteria satisfied.".to_owned()),
+                persistence_error: None,
+                output: relay_core::BoundedOutputSnapshot {
+                    chunks: Vec::new(),
+                    retained_bytes: 0,
+                    retained_chunks: 0,
+                    dropped_bytes: 0,
+                    dropped_chunks: 0,
+                },
+            },
+        );
+
+        let backend = ratatui::backend::TestBackend::new(80, 25);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_result(frame, &state, frame.area());
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered_text: String = (0..buffer.area.height)
+            .flat_map(|y| {
+                let mut line = String::new();
+                for x in 0..buffer.area.width {
+                    line.push_str(buffer[(x, y)].symbol());
+                }
+                line.push('\n');
+                line.chars().collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert!(
+            rendered_text.contains("Runtime: Codex"),
+            "Expected Runtime line in rendered output, got:\n{rendered_text}"
+        );
+        assert!(
+            rendered_text.contains("Model: gpt-5.6-sol"),
+            "Expected Model line with correct value, got:\n{rendered_text}"
+        );
+        assert!(
+            rendered_text.contains("Reasoning: high"),
+            "Expected Reasoning line with correct value, got:\n{rendered_text}"
+        );
+        assert!(
+            rendered_text.contains("State: done"),
+            "Expected State line with correct value, got:\n{rendered_text}"
+        );
+        assert!(
+            rendered_text.contains("Outcome: success"),
+            "Expected Outcome line with correct value, got:\n{rendered_text}"
+        );
+        assert!(
+            rendered_text.contains("Verification: PASS"),
+            "Expected Verification line, got:\n{rendered_text}"
+        );
     }
 
     fn unique_temp_path(name: &str) -> PathBuf {

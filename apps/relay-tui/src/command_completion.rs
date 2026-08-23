@@ -11,6 +11,8 @@ pub enum CommandId {
     Runtimes,
     RuntimeDetail,
     RuntimeUse,
+    RuntimeModel,
+    RuntimeReasoning,
     RuntimeTest,
     Settings,
     Doctor,
@@ -38,6 +40,8 @@ pub enum CommandArgumentKind {
     None,
     Provider,
     RuntimeProfile,
+    Model,
+    Reasoning,
     ReadyTask,
     CancellableTask,
     InspectableTask,
@@ -119,6 +123,22 @@ pub const COMMAND_CATALOG: &[CommandSpec] = &[
         description: "Select global default runtime profile",
         category: CommandCategory::Runtime,
         argument_kind: CommandArgumentKind::RuntimeProfile,
+    },
+    CommandSpec {
+        id: CommandId::RuntimeModel,
+        syntax: "/runtime model <model>",
+        completion: "/runtime model ",
+        description: "Select global default runtime model",
+        category: CommandCategory::Runtime,
+        argument_kind: CommandArgumentKind::Model,
+    },
+    CommandSpec {
+        id: CommandId::RuntimeReasoning,
+        syntax: "/runtime reasoning <effort>",
+        completion: "/runtime reasoning ",
+        description: "Select global default runtime reasoning effort",
+        category: CommandCategory::Runtime,
+        argument_kind: CommandArgumentKind::Reasoning,
     },
     CommandSpec {
         id: CommandId::RuntimeTest,
@@ -229,6 +249,8 @@ pub struct CompletionContext {
     pub ready_tasks: Vec<TaskCompletion>,
     pub cancellable_tasks: Vec<TaskCompletion>,
     pub inspectable_tasks: Vec<TaskCompletion>,
+    pub models: Vec<String>,
+    pub reasoning_efforts: Vec<String>,
 }
 
 #[allow(dead_code)]
@@ -237,6 +259,8 @@ pub enum SuggestionKind {
     Command,
     Provider,
     RuntimeProfile,
+    Model,
+    Reasoning,
     Task,
     Path,
 }
@@ -263,6 +287,12 @@ pub fn compute_suggestions(input: &str, context: &CompletionContext) -> Vec<Comm
     // Argument completions: check if input matches specific command prefixes
     if let Some(query) = trimmed.strip_prefix("/runtime use ") {
         return compute_profile_suggestions(query, context);
+    }
+    if let Some(query) = trimmed.strip_prefix("/runtime model ") {
+        return compute_model_suggestions(query, context);
+    }
+    if let Some(query) = trimmed.strip_prefix("/runtime reasoning ") {
+        return compute_reasoning_suggestions(query, context);
     }
     if let Some(query) = trimmed.strip_prefix("/runtime test ") {
         return compute_provider_suggestions(query, context, "/runtime test ");
@@ -488,6 +518,18 @@ fn compute_runtime_subcommand_suggestions(
             "Recheck provider prerequisites & probe health",
             CommandArgumentKind::Provider,
         ),
+        (
+            "model",
+            "/runtime model ",
+            "Select global default runtime model",
+            CommandArgumentKind::Model,
+        ),
+        (
+            "reasoning",
+            "/runtime reasoning ",
+            "Select global default runtime reasoning effort",
+            CommandArgumentKind::Reasoning,
+        ),
     ];
 
     let mut suggestions = Vec::new();
@@ -542,14 +584,23 @@ fn compute_task_suggestions(
 
         if score > 0 {
             let desc = format!("{} · {}", t.project_key, t.title);
+            let is_executable = if command_prefix.starts_with("/run") {
+                t.eligible_for_run
+            } else if command_prefix.starts_with("/cancel") {
+                matches!(t.state, TaskState::Running | TaskState::Ready)
+            } else if command_prefix.starts_with("/diff") || command_prefix.starts_with("/logs") {
+                true
+            } else {
+                t.eligible_for_run
+            };
             suggestions.push(CommandSuggestion {
                 display_primary: t.short_id.clone(),
                 display_secondary: Some(t.project_key.clone()),
                 completion: format!("{command_prefix}{}", t.short_id),
                 description: desc,
                 kind: SuggestionKind::Task,
-                executable: t.eligible_for_run,
-                disabled_reason: if t.eligible_for_run {
+                executable: is_executable,
+                disabled_reason: if is_executable {
                     None
                 } else {
                     Some(format!("{:?}", t.state))
@@ -578,6 +629,84 @@ fn compute_path_suggestions(query: &str) -> Vec<CommandSuggestion> {
             score: 100,
         });
     }
+    suggestions
+}
+
+fn compute_model_suggestions(query: &str, context: &CompletionContext) -> Vec<CommandSuggestion> {
+    let lower_q = query.trim().to_ascii_lowercase();
+    let mut suggestions = Vec::new();
+    let default_models = vec!["default".to_owned()];
+
+    let models = if context.models.is_empty() {
+        &default_models
+    } else {
+        &context.models
+    };
+
+    for m in models {
+        let lower_m = m.to_ascii_lowercase();
+        if lower_q.is_empty() || lower_m.contains(&lower_q) {
+            let score = if lower_m.starts_with(&lower_q) {
+                90
+            } else {
+                50
+            };
+            suggestions.push(CommandSuggestion {
+                display_primary: m.clone(),
+                display_secondary: None,
+                completion: format!("/runtime model {}", m),
+                description: "AI Model".to_owned(),
+                kind: SuggestionKind::Model,
+                executable: true,
+                disabled_reason: None,
+                score,
+            });
+        }
+    }
+    suggestions.sort_by_key(|b| std::cmp::Reverse(b.score));
+    suggestions
+}
+
+fn compute_reasoning_suggestions(
+    query: &str,
+    context: &CompletionContext,
+) -> Vec<CommandSuggestion> {
+    let lower_q = query.trim().to_ascii_lowercase();
+    let mut suggestions = Vec::new();
+    let default_efforts = vec![
+        "low".to_owned(),
+        "medium".to_owned(),
+        "high".to_owned(),
+        "xhigh".to_owned(),
+    ];
+
+    let efforts = if context.reasoning_efforts.is_empty() {
+        &default_efforts
+    } else {
+        &context.reasoning_efforts
+    };
+
+    for e in efforts {
+        let lower_e = e.to_ascii_lowercase();
+        if lower_q.is_empty() || lower_e.contains(&lower_q) {
+            let score = if lower_e.starts_with(&lower_q) {
+                90
+            } else {
+                50
+            };
+            suggestions.push(CommandSuggestion {
+                display_primary: e.clone(),
+                display_secondary: None,
+                completion: format!("/runtime reasoning {}", e),
+                description: "Reasoning Effort".to_owned(),
+                kind: SuggestionKind::Reasoning,
+                executable: true,
+                disabled_reason: None,
+                score,
+            });
+        }
+    }
+    suggestions.sort_by_key(|b| std::cmp::Reverse(b.score));
     suggestions
 }
 

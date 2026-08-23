@@ -80,6 +80,7 @@ pub struct RuntimeModelInfo {
     pub id: String,
     pub display_name: String,
     pub supported_reasoning_efforts: Vec<crate::ReasoningEffort>,
+    pub default_reasoning_effort: Option<crate::ReasoningEffort>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

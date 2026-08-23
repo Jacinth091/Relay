@@ -96,6 +96,7 @@ impl Default for ExecutionLimits {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum CoreExecutionEvent {
     ExecutionQueued {
         task_id: TaskId,
@@ -304,7 +305,7 @@ impl<R: Runtime> ExecutionScheduler<R> {
         &self,
         task_id: TaskId,
         request_id: String,
-        decision: relay_runtime::RuntimePermissionDecision,
+        grant: relay_runtime::RuntimePermissionGrant,
     ) -> Result<(), ExecutionSchedulerError> {
         let sender = self.permission_channels.lock().await.get(&task_id).cloned();
         let Some(sender) = sender else {
@@ -345,7 +346,7 @@ impl<R: Runtime> ExecutionScheduler<R> {
             });
         }
         if let Some(request) = self.pending_permissions.lock().await.get(&task_id) {
-            let decision_name = match decision {
+            let decision_name = match grant.decision {
                 relay_runtime::RuntimePermissionDecision::AllowOnce => "allow_once",
                 relay_runtime::RuntimePermissionDecision::AllowForRun => "allow_for_run",
                 relay_runtime::RuntimePermissionDecision::Deny => "deny",
@@ -374,11 +375,12 @@ impl<R: Runtime> ExecutionScheduler<R> {
                     ExecutionSchedulerError::TaskPersistence(TaskPersistenceError::Store(error))
                 })?;
         }
+        self.send(CoreExecutionEvent::SchedulerStatusChanged {
+            task_id,
+            status: SchedulerTaskStatus::Running,
+        });
         sender
-            .send(RuntimeControl::PermissionDecision {
-                request_id,
-                decision,
-            })
+            .send(RuntimeControl::PermissionDecision { request_id, grant })
             .await
             .map_err(|_| ExecutionSchedulerError::TaskNotFound { task_id })
     }
@@ -1260,6 +1262,13 @@ async fn collect_runtime_events<R: Runtime>(
                             permission_execution_ids.lock().await.remove(&task_id);
                             return RuntimeOutcome::new(RuntimeOutcomeKind::NeedsDecision, "provider could not receive permission decision");
                         }
+                        send(
+                            event_tx,
+                            CoreExecutionEvent::SchedulerStatusChanged {
+                                task_id,
+                                status: SchedulerTaskStatus::Running,
+                            },
+                        );
                     }
                     None => {
                         permission_channels.lock().await.remove(&task_id);

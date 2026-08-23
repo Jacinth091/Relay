@@ -199,8 +199,9 @@ impl RuntimeIntegration for AntigravityRuntime {
                 default_model: "default".to_owned(),
                 available_models: vec![RuntimeModelInfo {
                     id: "default".to_owned(),
-                    display_name: "Default (Account/CLI Setting)".to_owned(),
+                    display_name: "Default Shell".to_owned(),
                     supported_reasoning_efforts: vec![],
+                    default_reasoning_effort: None,
                 }],
             }
         })
@@ -636,7 +637,7 @@ fn render_agy_json_event(event: &Value) -> Option<Vec<u8>> {
 fn normalize_agy_activity(event: &Value) -> Option<RuntimeActivity> {
     let kind = event.get("type")?.as_str()?;
     match kind {
-        "thread.started" => Some(RuntimeActivity::SessionStarted),
+        "init" | "thread.started" => Some(RuntimeActivity::SessionStarted),
         "turn.started" => Some(RuntimeActivity::Analyzing {
             description: "AGY started working".to_owned(),
         }),
@@ -1072,5 +1073,32 @@ impl Runtime for AntigravityRuntime {
                 control: None,
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_stream_json_init_and_result() {
+        let init_json = serde_json::json!({
+            "type": "init",
+            "session_id": "test-session"
+        });
+        let activity = normalize_agy_activity(&init_json);
+        assert!(matches!(activity, Some(RuntimeActivity::SessionStarted)));
+
+        let result_json = serde_json::json!({
+            "type": "result",
+            "result": {
+                "outcome": "success",
+                "summary": "Completed successfully",
+                "verification_summary": "Passed all tests"
+            }
+        });
+        let res: RelayResult = serde_json::from_value(result_json["result"].clone()).unwrap();
+        assert!(matches!(res.outcome, RelayResultKind::Success));
+        assert_eq!(res.summary, "Completed successfully");
     }
 }

@@ -4,6 +4,13 @@ This is the implementation sequence for Relay.
 
 The goal is to prove boundaries in small vertical slices.
 
+Note: day-to-day milestone tracking has moved to the M-ladder (M1 through
+M8.1). The phases below are the original plan and are retained as the record
+of intent; current status is summarized per phase and in
+[docs/status-2026-08.md](status-2026-08.md). See
+[docs/M8_1_PACK/RELAY_M8_1_SEQUENTIAL_IMPLEMENTATION_PACK/00-IMPLEMENTATION-SEQUENCE.md](M8_1_PACK/RELAY_M8_1_SEQUENTIAL_IMPLEMENTATION_PACK/00-IMPLEMENTATION-SEQUENCE.md)
+for the active implementation sequence.
+
 ---
 
 ## Phase 0 — Repository Foundation
@@ -137,6 +144,11 @@ Implement:
 
 ## Phase 8 — GitHub Integration and Binding Boundary
 
+Status: **missing — planned, not started**. No `gh` adapter crate exists in the
+codebase. GitHub appears today only as expected-remote metadata used by
+repository safety checks (Phase 3). This phase remains intent, not a claim of
+current capability.
+
 Implement the initial `gh` GitHub adapter for GitHub Issue ingestion and establish the separate external-binding abstraction.
 
 Capabilities:
@@ -172,6 +184,12 @@ Codex integration:
 ---
 
 ## Phase 10 — End-to-End Reference Loop
+
+Status: **partial**. The loop works end-to-end today with local file/paste
+ingress instead of GitHub: local task -> review -> Run -> Codex (app-server by
+default, `codex exec` also supported) -> events/diff/logs -> DONE or escalation.
+The GitHub leg of the loop does not exist. See
+[docs/status-2026-08.md](status-2026-08.md).
 
 Prove:
 
@@ -232,6 +250,9 @@ Before promoting an experimental adapter to first-class, run the shared conforma
 ---
 
 ## Phase 12 — Relay Direct / MCP Submission
+
+Status: **missing — planned, not started**. No `submit_handoff` boundary or
+MCP transport exists in the codebase.
 
 Expose a direct planner-to-Relay submission interface without requiring GitHub.
 

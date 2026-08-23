@@ -1,40 +1,92 @@
 # Roadmap
 
+Milestone tracking has moved to the M-ladder (M1 through M8.1). See
+[docs/status-2026-08.md](status-2026-08.md) for a current end-to-end status
+summary and [docs/M8_1_PACK/RELAY_M8_1_SEQUENTIAL_IMPLEMENTATION_PACK/00-IMPLEMENTATION-SEQUENCE.md](M8_1_PACK/RELAY_M8_1_SEQUENTIAL_IMPLEMENTATION_PACK/00-IMPLEMENTATION-SEQUENCE.md)
+for the M8.1 implementation sequence.
+
+## Current Status — Milestone Ladder
+
+Tracked by commits, in order:
+
+- M1 — TUI shell + core boundary: **done**.
+- M2 — project registry: **done**.
+- M3 — repository safety: **done**.
+- M4 — task semantics: **done**.
+- M5 — SQLite durable state: **done**.
+- M6 — scheduler: **done**.
+- M7 — explicit Run approval: **done**.
+- M8 — Codex runtime: **done**, including both `codex exec` and `codex app-server`
+  transports; app-server is now the default rich-client path.
+- M8.1 — multi-runtime orchestration: **mostly landed**. Per the M8.1 pack,
+  items 01–03 are complete and items 04–05 are partial:
+  - RuntimeRouter and ExecutionRunPolicy are implemented;
+  - a second runtime (Antigravity) is wired through RuntimeRouter;
+  - command-palette TUI overhaul, model/reasoning selection, Diff/Logs screens,
+    Doctor view, and the permission broker with scoped grants are shipped;
+  - provider-neutral Markdown rendering and full scrollable execution/result UX
+    polish remain incomplete (pack items 04 and 05).
+
+Capabilities shipped ahead of earlier plan documents: second runtime
+(Antigravity) + RuntimeRouter, Codex app-server transport as default,
+command palette, model/reasoning selectors, permission broker with scoped
+grants, Diff/Logs screens, Doctor view.
+
+Not started, despite appearing in older plans:
+
+- GitHub ingress / `gh` adapter: **planned, not started**. GitHub currently
+  appears only as expected-remote metadata in repository safety checks.
+- Relay Direct / MCP submission transport: **planned, not started**.
+- Executable planner-adapter conformance harness: **planned, not started**.
+  The conformance cases exist only as documentation
+  ([docs/planner-adapter-conformance.md](planner-adapter-conformance.md)).
+
 ## v0.1 — Reliable Human-Controlled Handoff
 
 Primary stack:
 
 ```text
-ChatGPT -> GitHub compatibility transport -> Relay -> Codex CLI
+ChatGPT -> local file/paste ingress -> Relay -> Codex CLI
 ```
+
+The originally documented primary stack assumed a GitHub compatibility
+transport. That leg is planned but not started; today the only working
+end-to-end ingress is local file/paste.
 
 Must include:
 
-- one Relay engine;
-- project registry;
-- repository safety;
-- task protocol;
-- local JSON/Markdown file and paste ingress;
-- durable state;
-- GitHub ingress and optional GitHub binding;
-- Codex runtime;
-- live execution;
-- bounded automatic repair;
-- `NEEDS_CLARIFICATION`;
-- `NEEDS_DECISION`;
-- structured Markdown packets;
-- Resolution Packets;
-- no automatic push.
+- one Relay engine — met;
+- project registry — met;
+- repository safety — met;
+- task protocol — met;
+- local JSON/Markdown file and paste ingress — met;
+- durable state — met;
+- GitHub ingress and optional GitHub binding — **unmet: planned, not started**;
+  see the pending ADR question in [docs/status-2026-08.md](status-2026-08.md);
+- Codex runtime — met;
+- live execution — met;
+- bounded automatic repair — met;
+- `NEEDS_CLARIFICATION` — met;
+- `NEEDS_DECISION` — met;
+- structured Markdown packets — met;
+- Resolution Packets — met;
+- no automatic push — met.
+
+The unmet bullet is flagged, not descoped. v0.1 either gains the GitHub leg or
+the descope is made explicit by an ADR.
 
 ## v0.2 — Daily Driver
 
+Some items already have early implementations shipped during M8/M8.1
+(Diff/Logs screens, Doctor view). The remaining work is depth, not existence:
+
 - stronger task history;
 - project locks;
-- better diff experience;
+- better diff experience (basic Diff screen exists);
 - clarification/resolution history;
 - retry/restart controls;
 - validation profiles;
-- runtime diagnostics;
+- runtime diagnostics (Doctor view exists);
 - `relay doctor`;
 - bounded log retention.
 
@@ -42,10 +94,12 @@ Must include:
 
 - provider-neutral Relay Handoff Planner Specification;
 - ChatGPT Skill as the first provider adapter;
-- Codex-native capability improvements;
+- Codex-native capability improvements (partially delivered via the app-server
+  transport and model/reasoning selection);
 - project Skills/instruction awareness;
 - optional provider-reported usage/limit display where reliable;
-- better GitHub status synchronization.
+- better GitHub status synchronization (**blocked: GitHub ingress does not
+  exist yet**).
 
 ## v0.4 — Second Ecosystem
 
@@ -85,7 +139,7 @@ Optional, not promises:
 
 - Tauri desktop client;
 - local Axum server/browser client;
-- Relay Direct/MCP submission;
+- Relay Direct/MCP submission (currently planned, not started — see build-plan Phase 12);
 - optional external binding configuration independent of submission transport;
 - multiple execution lanes;
 - remote Relay node;

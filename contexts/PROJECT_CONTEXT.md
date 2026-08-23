@@ -22,12 +22,16 @@ Human + Planner
 The first supported path is:
 
 ```text
-ChatGPT -> GitHub compatibility transport -> Relay -> Codex CLI -> local Git repo
+ChatGPT -> local file/paste ingress -> Relay -> Codex CLI -> local Git repo
 ```
 
-GitHub is only the first durable ingress bridge. It is not a second Relay implementation.
+The originally planned first durable ingress bridge was the GitHub
+compatibility transport. That bridge is planned but not started; today local
+file/paste is the only ingress that works end to end.
 
-The local ingress accepts canonical JSON files/paste, with optional Markdown wrappers containing the same JSON block.
+GitHub remains planned as an additional durable ingress bridge, not a second Relay implementation.
+
+The local ingress accepts canonical JSON files/paste, with optional Markdown wrappers containing the same JSON block, and it is the path that works end to end today.
 
 ## Why It Exists
 
@@ -111,7 +115,7 @@ A packet explains:
 
 The planner returns a Resolution Packet.
 
-For the first GitHub-based integration, these packets can be posted to the task issue and copied as Markdown into a normal planning conversation.
+For the first GitHub-based integration (planned, not yet implemented), these packets can be posted to the task issue and copied as Markdown into a normal planning conversation. Today, packets are copied as Markdown into a normal planning conversation via local file/paste.
 
 ## Hard Invariants
 
@@ -187,8 +191,8 @@ Resolution Packet: approved answer used to resume/restart execution.
 - planner: normal ChatGPT conversation;
 - planner specification: Relay Handoff Planner Specification;
 - planner adapter: installable ChatGPT `relay-handoff` Skill;
-- v0.1 submission: GitHub compatibility transport;
-- future preferred submission: Relay Direct/MCP;
+- v0.1 submission: local file/paste today; GitHub compatibility transport planned but not started;
+- future preferred submission: Relay Direct/MCP (planned, not started);
 - external binding: optional GitHub Issue;
 - runtime: Codex;
 - runtime transport: CLI;

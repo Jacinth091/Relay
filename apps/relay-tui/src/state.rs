@@ -263,6 +263,8 @@ pub(crate) struct AppState {
     pub(crate) cached_model_catalog: Option<relay_runtime::RuntimeModelCatalog>,
     pub(crate) runtime_detail_menu_index: usize,
     pub(crate) runtime_detail_submenu: Option<RuntimeDetailSubmenu>,
+    /// Selected row on the Runtimes screen (index into `RUNTIME_PROVIDERS`).
+    pub(crate) runtimes_list_index: usize,
     pub(crate) task_review_menu_index: usize,
     pub(crate) task_review_submenu: Option<TaskReviewSubmenu>,
     pub(crate) cached_codex_account: Option<String>,
@@ -774,6 +776,11 @@ impl AppState {
         durable_tasks: Vec<StoredTask>,
         feedback: String,
     ) -> Self {
+        // Test builds stay hermetic: the developer's real runtimes.toml
+        // (e.g. an antigravity default profile) must not decide test outcomes.
+        #[cfg(test)]
+        let runtime_settings = runtime_settings::RuntimeSettings::default();
+        #[cfg(not(test))]
         let runtime_settings = runtime_settings::RuntimeSettings::load_from_path(
             &runtime_settings::RuntimeSettings::default_path(),
         )
@@ -860,6 +867,7 @@ impl AppState {
             cached_model_catalog: None,
             runtime_detail_menu_index: 0,
             runtime_detail_submenu: None,
+            runtimes_list_index: 0,
             task_review_menu_index: 0,
             task_review_submenu: None,
             cached_codex_account: None,
@@ -911,6 +919,25 @@ impl AppState {
     pub(crate) fn enter_projects(&mut self) {
         self.refresh_repository_inspections();
         self.screen = Screen::Projects;
+    }
+
+    pub(crate) fn select_next_runtime(&mut self) {
+        self.runtimes_list_index = (self.runtimes_list_index + 1) % RUNTIME_PROVIDERS.len();
+    }
+
+    pub(crate) fn select_previous_runtime(&mut self) {
+        self.runtimes_list_index =
+            (self.runtimes_list_index + RUNTIME_PROVIDERS.len() - 1) % RUNTIME_PROVIDERS.len();
+    }
+
+    /// Opens Runtime Detail for the provider highlighted on the Runtimes
+    /// screen, mirroring `/runtime status <provider>`.
+    pub(crate) fn open_selected_runtime(&mut self) {
+        let index = self.runtimes_list_index.min(RUNTIME_PROVIDERS.len() - 1);
+        let provider = RUNTIME_PROVIDERS[index];
+        self.runtime_detail_provider = Some(provider.to_owned());
+        self.screen = Screen::RuntimeDetail;
+        self.begin_health_refresh(true);
     }
 
     pub(crate) fn enter_tasks(&mut self) {
@@ -1983,6 +2010,9 @@ impl AppState {
         Ok(())
     }
 }
+
+/// Providers listed on the Runtimes screen, in display order.
+pub(crate) const RUNTIME_PROVIDERS: [&str; 2] = ["codex", "antigravity"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Screen {

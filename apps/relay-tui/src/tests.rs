@@ -1589,3 +1589,141 @@ fn codex_transport_label_follows_env_semantics() {
     // Restore so other tests observe default semantics.
     unsafe { std::env::remove_var("RELAY_CODEX_TRANSPORT") };
 }
+
+/// Renders the full UI at the given size and returns one string per row.
+fn render_full_ui_rows(state: &AppState, width: u16, height: u16) -> Vec<String> {
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| crate::ui::render(frame, state))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn runtimes_list_selection_moves_wraps_and_enter_opens_selected_provider() {
+    let mut state = app_state_with_project();
+    state.screen = Screen::Runtimes;
+    assert_eq!(state.runtimes_list_index, 0);
+
+    press(&mut state, KeyCode::Down).await;
+    assert_eq!(state.runtimes_list_index, 1);
+    press(&mut state, KeyCode::Char('j')).await;
+    assert_eq!(
+        state.runtimes_list_index, 0,
+        "j/Down must wrap past the end"
+    );
+    press(&mut state, KeyCode::Up).await;
+    assert_eq!(state.runtimes_list_index, 1);
+    press(&mut state, KeyCode::Char('k')).await;
+    assert_eq!(
+        state.runtimes_list_index, 0,
+        "k/Up must wrap past the start"
+    );
+
+    // Enter on the highlighted provider opens ITS runtime detail.
+    press(&mut state, KeyCode::Enter).await;
+    assert_eq!(state.screen, Screen::RuntimeDetail);
+    assert_eq!(state.runtime_detail_provider.as_deref(), Some("codex"));
+
+    let mut state = app_state_with_project();
+    state.screen = Screen::Runtimes;
+    press(&mut state, KeyCode::Down).await;
+    press(&mut state, KeyCode::Enter).await;
+    assert_eq!(state.screen, Screen::RuntimeDetail);
+    assert_eq!(
+        state.runtime_detail_provider.as_deref(),
+        Some("antigravity")
+    );
+}
+
+#[test]
+fn runtimes_screen_renders_selectable_panel_rows() {
+    let mut state = app_state_with_project();
+    state.screen = Screen::Runtimes;
+    let rows = render_full_ui_rows(&state, 80, 24);
+
+    assert!(
+        rows.iter().any(|row| row.contains("RUNTIMES")),
+        "expected bordered RUNTIMES panel title:\n{rows:?}"
+    );
+    let list_row = rows
+        .iter()
+        .find(|row| row.contains("Codex CLI"))
+        .expect("provider row rendered");
+    assert!(
+        list_row.contains('›'),
+        "selected row must show the cursor marker: {list_row}"
+    );
+    let unselected = rows
+        .iter()
+        .find(|row| row.contains("Antigravity"))
+        .expect("antigravity row rendered");
+    assert!(
+        !unselected.contains('›'),
+        "unselected rows must not show a cursor: {unselected}"
+    );
+}
+
+#[test]
+fn top_bar_keeps_right_segment_visible_at_narrow_width() {
+    let mut state = app_state_with_project();
+    state.active_runtime_provider = "antigravity".to_owned();
+
+    // Narrow enough that the old padded single-line bar truncated "antigravity".
+    let rows = render_full_ui_rows(&state, 26, 12);
+    let bar = &rows[0];
+    assert!(
+        bar.contains("antigravity"),
+        "provider name must be fully visible at width 26: {bar:?}"
+    );
+    assert!(
+        bar.trim_end().ends_with('●'),
+        "health marker must sit at the right edge: {bar:?}"
+    );
+    assert!(
+        !bar.contains("dashboard"),
+        "the left title truncates first when space is tight: {bar:?}"
+    );
+}
+
+#[tokio::test]
+async fn runtime_detail_action_menu_activates_change_model_and_test_runtime() {
+    // Action 0: Change model opens the catalog selector and commits a choice.
+    let mut state = runtime_detail_test_state();
+    state.cached_model_catalog = Some(filtered_model_catalog());
+    assert_eq!(state.runtime_detail_menu_index, 0);
+    press(&mut state, KeyCode::Enter).await;
+    assert_eq!(
+        state.runtime_detail_submenu,
+        Some(RuntimeDetailSubmenu::ModelSelector)
+    );
+    press(&mut state, KeyCode::Enter).await;
+    assert_eq!(state.runtime_detail_submenu, None);
+    assert_eq!(
+        state.active_model,
+        relay_core::RuntimeModelSelection::Explicit("test-model".to_owned())
+    );
+
+    // Action 3: Test runtime wraps into reach from index 0 via Up.
+    let mut state = runtime_detail_test_state();
+    press(&mut state, KeyCode::Up).await;
+    assert_eq!(
+        state.runtime_detail_menu_index, 3,
+        "top-level action menu wraps upward"
+    );
+    press(&mut state, KeyCode::Enter).await;
+    assert!(state.runtime_detail_submenu.is_none());
+    assert!(matches!(state.runtime_health, CodexRuntimeHealth::Checking));
+    assert!(
+        state.health_refresh.is_some(),
+        "Test runtime must trigger a fresh health probe"
+    );
+}

@@ -1,205 +1,419 @@
 use ratatui::{
     Frame,
-    layout::Rect,
+    layout::{Constraint, Direction, Layout, Rect},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
+use relay_runtime_antigravity::AntigravityRuntimeHealth;
 use relay_runtime_codex::{CodexRuntime, CodexRuntimeHealth};
 
 use crate::state::{
-    AppState, RuntimeDetailSubmenu, SETTINGS_FIELDS, SettingsField, git_health_marker,
-    reasoning_effort_label,
+    AppState, RUNTIME_PROVIDERS, RuntimeDetailSubmenu, SETTINGS_FIELDS, SettingsField,
+    git_health_marker, reasoning_effort_label,
 };
-use crate::theme::Theme;
+use crate::theme::{Theme, marker_active, marker_failure, marker_success, marker_waiting};
 use crate::util::app_execution_limits;
 
-pub(crate) fn render_runtimes(frame: &mut Frame, state: &AppState, area: Rect) {
-    let mut lines = vec!["Runtimes\n".to_owned()];
-
-    // Codex
-    let codex_marker = if state.runtime_health.is_ready() {
-        "●"
-    } else {
-        "○"
-    };
-    let codex_selected = if state.active_runtime_provider == "codex" {
-        "> "
-    } else {
-        "  "
-    };
-    lines.push(format!("{codex_selected}Codex CLI"));
-    lines.push(format!(
-        "  {codex_marker} {}",
-        state.runtime_health.display_status()
-    ));
-    lines.push(format!(
-        "  Profile: {}",
-        if state.active_runtime_provider == "codex" {
-            &state.active_profile_id
-        } else {
-            "codex/implement"
-        }
-    ));
-    lines.push(String::new());
-
-    // Antigravity
-    let agy_marker = if state.antigravity_health.is_ready() {
-        "●"
-    } else {
-        "○"
-    };
-    let agy_selected = if state.active_runtime_provider == "antigravity" {
-        "> "
-    } else {
-        "  "
-    };
-    lines.push(format!("{agy_selected}Antigravity"));
-    lines.push(format!(
-        "  {agy_marker} {}",
-        state.antigravity_health.display_status()
-    ));
-    lines.push(format!(
-        "  Profile: {}",
-        if state.active_runtime_provider == "antigravity" {
-            &state.active_profile_id
-        } else {
-            "antigravity/implement"
-        }
-    ));
-    lines.push(String::new());
-
-    lines.push(format!("\nDefault: {}", state.active_profile_id));
-
-    let body = lines.join("\n");
-    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), area);
+fn panel_block(title: &str, theme: &Theme) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.muted())
+        .title(Span::styled(format!(" {title} "), theme.header()))
 }
 
-pub(crate) fn render_runtime_detail(frame: &mut Frame, state: &AppState, area: Rect) {
-    let provider = state.runtime_detail_provider.as_deref().unwrap_or("codex");
+fn label_value_line(label: &str, value: String, theme: &Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label}: "), theme.muted()),
+        Span::styled(value, theme.text()),
+    ])
+}
 
-    if let Some(submenu) = state.runtime_detail_submenu {
-        let body = match submenu {
-            RuntimeDetailSubmenu::ModelSelector => {
-                let mut lines = vec!["Select Model:\n".to_owned()];
-                if let Some(catalog) = &state.cached_model_catalog {
-                    for (i, m) in catalog.available_models.iter().enumerate() {
-                        let cursor = if i == state.runtime_detail_menu_index {
-                            ">"
-                        } else {
-                            " "
-                        };
-                        lines.push(format!("{cursor} {}", m.id));
-                    }
-                } else {
-                    lines.push("  (No models available or loading...)".to_owned());
-                }
-                lines.join("\n")
-            }
-            RuntimeDetailSubmenu::ReasoningSelector => {
-                let mut lines = vec!["Select Reasoning Effort:\n".to_owned()];
-                let options = state.reasoning_options_for_model(None);
-                for (i, e) in options.iter().enumerate() {
-                    let cursor = if i == state.runtime_detail_menu_index {
-                        ">"
-                    } else {
-                        " "
-                    };
-                    lines.push(format!("{cursor} {}", reasoning_effort_label(*e)));
-                }
-                if options.is_empty() {
-                    lines.push("  (No supported reasoning efforts)".to_owned());
-                }
-                lines.join("\n")
-            }
-            RuntimeDetailSubmenu::ProfileSelector => {
-                let mut lines = vec!["Select Profile:\n".to_owned()];
-                let provider = state.runtime_detail_provider.as_deref().unwrap_or("codex");
-                let profiles = AppState::provider_profiles(provider);
-                if profiles.is_empty() {
-                    lines.push("  (No profiles available)".to_owned());
-                } else {
-                    for (i, p) in profiles.iter().enumerate() {
-                        let cursor = if i == state.runtime_detail_menu_index {
-                            ">"
-                        } else {
-                            " "
-                        };
-                        lines.push(format!("{cursor} {} — {}", p.id, p.purpose));
-                    }
-                }
-                lines.join("\n")
-            }
-        };
-        frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), area);
+/// One provider row on the Runtimes screen: cursor marker, health-colored
+/// status dot, bright display name, muted profile id, and a default marker.
+fn runtime_row(state: &AppState, provider: &str, selected: bool, theme: &Theme) -> Line<'static> {
+    let (name, default_profile, ready, checking, is_default) = match provider {
+        "codex" => (
+            "Codex CLI",
+            "codex/implement",
+            state.runtime_health.is_ready(),
+            matches!(state.runtime_health, CodexRuntimeHealth::Checking),
+            state.active_runtime_provider == "codex",
+        ),
+        _ => (
+            "Antigravity",
+            "antigravity/implement",
+            state.antigravity_health.is_ready(),
+            matches!(state.antigravity_health, AntigravityRuntimeHealth::Checking),
+            state.active_runtime_provider == "antigravity",
+        ),
+    };
+
+    let row_style = if selected {
+        theme.selection()
+    } else {
+        theme.text()
+    };
+    let dot_style = if ready {
+        theme.success()
+    } else if checking {
+        theme.muted()
+    } else {
+        theme.error()
+    };
+    let dot = if ready || checking {
+        marker_active()
+    } else {
+        marker_waiting()
+    };
+    let profile_id = if is_default {
+        state.active_profile_id.clone()
+    } else {
+        default_profile.to_owned()
+    };
+
+    let mut spans = vec![
+        Span::styled(if selected { "› " } else { "  " }, row_style),
+        Span::styled(format!("{dot} "), dot_style),
+        Span::styled(name.to_owned(), row_style),
+        Span::styled("   ", theme.muted()),
+        Span::styled(profile_id, theme.muted()),
+    ];
+    if is_default {
+        spans.push(Span::styled(" · default", theme.muted()));
+    }
+    Line::from(spans)
+}
+
+pub(crate) fn render_runtimes(frame: &mut Frame, state: &AppState, area: Rect) {
+    let theme = Theme::default();
+    let block = panel_block("RUNTIMES", &theme);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let selected = state.runtimes_list_index.min(RUNTIME_PROVIDERS.len() - 1);
+    let mut lines: Vec<Line> = RUNTIME_PROVIDERS
+        .iter()
+        .enumerate()
+        .map(|(i, provider)| runtime_row(state, provider, i == selected, &theme))
+        .collect();
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        format!("Default profile: {}", state.active_profile_id),
+        theme.muted(),
+    )));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+/// Runtime Detail as stacked bordered panels; tight vertical space lets the
+/// layout solver compress panels rather than lose their titles.
+pub(crate) fn render_runtime_detail(frame: &mut Frame, state: &AppState, area: Rect) {
+    let theme = Theme::default();
+
+    if state.runtime_detail_submenu.is_some() {
+        render_runtime_submenu(frame, state, area, &theme);
         return;
     }
 
-    let menu_items = [
-        "Change model",
-        "Change reasoning",
-        "Change profile",
-        "Test runtime",
-    ];
-    let mut menu_lines = String::new();
-    for (i, item) in menu_items.iter().enumerate() {
-        let cursor = if i == state.runtime_detail_menu_index {
-            ">"
-        } else {
-            " "
-        };
-        menu_lines.push_str(&format!("{cursor} {item}\n"));
+    let provider = state.runtime_detail_provider.as_deref().unwrap_or("codex");
+    let status_lines = status_panel_lines(state, provider, &theme);
+    let ai_lines = ai_panel_lines(state, provider, &theme);
+    let action_lines = action_menu_lines(state.runtime_detail_menu_index, &theme);
+    let capability_lines = capability_panel_lines(&theme);
+    let limits_lines = limits_panel_lines(&theme);
+
+    // Length constraints per panel (content + border); any leftover height is
+    // absorbed by the trailing filler so panel titles stay pinned to content.
+    let mut constraints: Vec<Constraint> =
+        [&status_lines, &ai_lines, &action_lines, &capability_lines]
+            .iter()
+            .map(|lines| Constraint::Length(lines.len() as u16 + 2))
+            .collect();
+    constraints.push(Constraint::Fill(1));
+
+    let panels = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    for ((title, lines), panel_area) in [
+        ("STATUS", &status_lines),
+        ("AI", &ai_lines),
+        ("ACTIONS", &action_lines),
+        ("CAPABILITIES", &capability_lines),
+        ("LIMITS", &limits_lines),
+    ]
+    .into_iter()
+    .zip(panels.iter())
+    {
+        render_panel(frame, title, lines, *panel_area, &theme);
+    }
+}
+
+fn render_panel(frame: &mut Frame, title: &str, lines: &[Line], area: Rect, theme: &Theme) {
+    let block = panel_block(title, theme);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+fn status_panel_lines(state: &AppState, provider: &str, theme: &Theme) -> Vec<Line<'static>> {
+    match provider {
+        "codex" => codex_status_lines(state, theme),
+        "antigravity" => vec![label_value_line(
+            "Status",
+            state.antigravity_health.display_status().to_owned(),
+            theme,
+        )],
+        other => vec![Line::from(Span::styled(
+            format!("Unknown runtime provider: {other}"),
+            theme.error(),
+        ))],
+    }
+}
+
+fn codex_status_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
+    let executable = CodexRuntime::default()
+        .resolve_executable()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "no supported executable resolved".to_owned());
+    let mut lines = vec![label_value_line("Executable", executable, theme)];
+
+    match &state.runtime_health {
+        CodexRuntimeHealth::Checking => {
+            lines.push(Line::from(Span::styled(
+                "Health: probe pending; Run remains blocked until verification completes",
+                theme.muted(),
+            )));
+        }
+        CodexRuntimeHealth::Available { version, .. } => {
+            lines.push(label_value_line("Version", version.clone(), theme));
+            lines.push(Line::from(Span::styled(
+                "✓ Codex authentication and exec compatibility",
+                theme.success(),
+            )));
+        }
+        CodexRuntimeHealth::NotAuthenticated { version, error } => {
+            lines.push(label_value_line(
+                "Version",
+                version
+                    .clone()
+                    .unwrap_or_else(|| "version unavailable".to_owned()),
+                theme,
+            ));
+            lines.push(Line::from(Span::styled(
+                format!("Authentication unavailable: {error}"),
+                theme.warning(),
+            )));
+        }
+        CodexRuntimeHealth::Incompatible { reason, .. } => {
+            lines.push(Line::from(Span::styled(
+                format!("Compatibility unavailable: {reason}"),
+                theme.warning(),
+            )));
+        }
+        CodexRuntimeHealth::NotInstalled { error }
+        | CodexRuntimeHealth::DiscoveryFailed { error } => {
+            lines.push(Line::from(Span::styled(error.clone(), theme.error())));
+        }
     }
 
-    let body = match provider {
-        "codex" => {
-            let health_detail =
-                codex_health_detail(&state.runtime_health, &CodexRuntime::default());
-            let account_info = state
-                .cached_codex_account
-                .as_deref()
-                .unwrap_or("Managed Codex login (no secrets displayed)");
+    let account = state
+        .cached_codex_account
+        .clone()
+        .unwrap_or_else(|| "Managed Codex login (no secrets displayed)".to_owned());
+    lines.push(label_value_line("Authentication", account, theme));
 
-            // Mirrors relay-runtime-codex transport selection: app-server is
-            // the DEFAULT; only an explicit `exec` opts out.
-            let interface = if std::env::var("RELAY_CODEX_TRANSPORT").as_deref() != Ok("exec") {
-                "App Server"
-            } else {
-                "Codex exec"
-            };
-            let approval = if interface == "App Server" {
-                "Live approval ✓"
-            } else {
-                "Pre-approved envelope"
-            };
-            format!(
-                "Runtime / Codex\n\nStatus\n{}\n\nAuthentication\n  {}\n\nInterface\n  {}\n\nActive profile\n  {}\n\nAI\n  Model: {}\n  Reasoning: {}\n\n{}\nPermissions\n  {}\n\nCapabilities\n  Workspace read: ✓\n  Workspace write: Configured\n  Commands: Configured\n  Network: ×\n  Commit: ×\n  Push: ×\n\nLimits\n  Duration: {} min\n  Repairs: {}",
-                health_detail,
-                account_info,
-                interface,
-                state.active_profile_id,
-                state.active_model.as_option().unwrap_or("provider default"),
+    // Mirrors relay-runtime-codex transport selection: app-server is the
+    // DEFAULT; only an explicit `exec` opts out.
+    let app_server = std::env::var("RELAY_CODEX_TRANSPORT").as_deref() != Ok("exec");
+    let (interface, approval) = if app_server {
+        ("App Server", "Live approval ✓")
+    } else {
+        ("Codex exec", "Pre-approved envelope")
+    };
+    lines.push(Line::from(vec![
+        Span::styled("Interface: ", theme.muted()),
+        Span::styled(interface.to_owned(), theme.text()),
+        Span::styled(format!(" — {approval}"), theme.muted()),
+    ]));
+    lines
+}
+
+fn ai_panel_lines(state: &AppState, provider: &str, theme: &Theme) -> Vec<Line<'static>> {
+    match provider {
+        "codex" => vec![
+            label_value_line("Profile", state.active_profile_id.clone(), theme),
+            label_value_line(
+                "Model",
+                state
+                    .active_model
+                    .as_option()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "provider default".to_owned()),
+                theme,
+            ),
+            label_value_line(
+                "Reasoning",
                 state
                     .active_reasoning_effort
                     .as_option()
                     .map(|effort| format!("{effort:?}"))
                     .unwrap_or_else(|| "profile default".to_owned()),
-                menu_lines,
-                approval,
-                app_execution_limits().max_duration.as_secs() / 60,
-                app_execution_limits().max_repair_attempts
-            )
-        }
-        "antigravity" => {
-            format!(
-                "Runtime / Antigravity\n\nStatus\n  {}\n\nActive profile\n  antigravity/implement\n\nAI\n  Model: Default\n  Effort: High\n\n{}\nCapabilities\n  Workspace read: ✓\n  Workspace write: Configured\n  Commands: Configured\n  Network: ×\n  Commit: ×\n  Push: ×",
-                state.antigravity_health.display_status(),
-                menu_lines
-            )
-        }
-        _ => format!("Unknown runtime provider: {provider}"),
+                theme,
+            ),
+        ],
+        _ => vec![
+            label_value_line("Profile", "antigravity/implement".to_owned(), theme),
+            label_value_line("Model", "Default".to_owned(), theme),
+            label_value_line("Effort", "High".to_owned(), theme),
+        ],
+    }
+}
+
+const RUNTIME_ACTIONS: [&str; 4] = [
+    "Change model",
+    "Change reasoning",
+    "Change profile",
+    "Test runtime",
+];
+
+fn action_menu_lines(selected: usize, theme: &Theme) -> Vec<Line<'static>> {
+    RUNTIME_ACTIONS
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let style = if i == selected {
+                theme.selection()
+            } else {
+                theme.text()
+            };
+            Line::from(vec![
+                Span::styled(if i == selected { "› " } else { "  " }, style),
+                Span::styled((*item).to_owned(), style),
+            ])
+        })
+        .collect()
+}
+
+enum CapabilityState {
+    Available,
+    Configured,
+    Unavailable,
+}
+
+fn capability_panel_lines(theme: &Theme) -> Vec<Line<'static>> {
+    [
+        ("Workspace read", CapabilityState::Available),
+        ("Workspace write", CapabilityState::Configured),
+        ("Commands", CapabilityState::Configured),
+        ("Network", CapabilityState::Unavailable),
+        ("Commit", CapabilityState::Unavailable),
+        ("Push", CapabilityState::Unavailable),
+    ]
+    .iter()
+    .map(|(label, state)| {
+        let (marker, style, suffix) = match state {
+            CapabilityState::Available => (marker_success(), theme.success(), ""),
+            CapabilityState::Configured => ("·", theme.muted(), " configured"),
+            CapabilityState::Unavailable => (marker_failure(), theme.error(), ""),
+        };
+        Line::from(vec![
+            Span::styled(format!("  {label:<16}"), theme.text()),
+            Span::styled(marker, style),
+            Span::styled(suffix.to_owned(), theme.muted()),
+        ])
+    })
+    .collect()
+}
+
+fn limits_panel_lines(theme: &Theme) -> Vec<Line<'static>> {
+    let limits = app_execution_limits();
+    vec![
+        label_value_line(
+            "Duration",
+            format!("{} min", limits.max_duration.as_secs() / 60),
+            theme,
+        ),
+        label_value_line("Repairs", format!("{}", limits.max_repair_attempts), theme),
+    ]
+}
+
+fn render_runtime_submenu(frame: &mut Frame, state: &AppState, area: Rect, theme: &Theme) {
+    let submenu = match state.runtime_detail_submenu {
+        Some(submenu) => submenu,
+        None => return,
     };
-    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), area);
+    let selected = state.runtime_detail_menu_index;
+
+    let (title, entries): (&str, Vec<String>) = match submenu {
+        RuntimeDetailSubmenu::ModelSelector => (
+            "MODEL",
+            state
+                .cached_model_catalog
+                .as_ref()
+                .map(|catalog| {
+                    catalog
+                        .available_models
+                        .iter()
+                        .map(|model| model.id.clone())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+        RuntimeDetailSubmenu::ReasoningSelector => (
+            "REASONING",
+            state
+                .reasoning_options_for_model(None)
+                .iter()
+                .map(|effort| reasoning_effort_label(*effort).to_owned())
+                .collect(),
+        ),
+        RuntimeDetailSubmenu::ProfileSelector => (
+            "PROFILE",
+            AppState::provider_profiles(
+                state.runtime_detail_provider.as_deref().unwrap_or("codex"),
+            )
+            .iter()
+            .map(|profile| format!("{} — {}", profile.id, profile.purpose))
+            .collect(),
+        ),
+    };
+
+    let lines: Vec<Line> = if entries.is_empty() {
+        vec![Line::from(Span::styled(
+            match submenu {
+                RuntimeDetailSubmenu::ModelSelector => "(No models available or loading...)",
+                RuntimeDetailSubmenu::ReasoningSelector => "(No supported reasoning efforts)",
+                RuntimeDetailSubmenu::ProfileSelector => "(No profiles available)",
+            },
+            theme.muted(),
+        ))]
+    } else {
+        entries
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                let style = if i == selected {
+                    theme.selection()
+                } else {
+                    theme.text()
+                };
+                Line::from(vec![
+                    Span::styled(if i == selected { "› " } else { "  " }, style),
+                    Span::styled(entry.clone(), style),
+                ])
+            })
+            .collect()
+    };
+
+    let block = panel_block(title, theme);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 pub(crate) fn render_settings(frame: &mut Frame, state: &AppState, area: Rect) {

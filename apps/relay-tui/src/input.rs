@@ -559,7 +559,30 @@ pub(crate) async fn handle_key(
             }
             _ => Ok(false),
         },
-        Screen::Runtimes | Screen::Doctor => match key.code {
+        Screen::Runtimes => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.select_previous_runtime();
+                Ok(false)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.select_next_runtime();
+                Ok(false)
+            }
+            KeyCode::Enter => {
+                state.open_selected_runtime();
+                Ok(false)
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                state.begin_health_refresh(true);
+                Ok(false)
+            }
+            KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => {
+                state.screen = Screen::Dashboard;
+                Ok(false)
+            }
+            _ => Ok(false),
+        },
+        Screen::Doctor => match key.code {
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 state.begin_health_refresh(true);
                 Ok(false)
@@ -630,10 +653,21 @@ pub(crate) async fn handle_key(
                 }
             }
             KeyCode::Up => {
-                state.runtime_detail_menu_index = state.runtime_detail_menu_index.saturating_sub(1);
+                // The four top-level actions wrap; submenu lists stay bounded
+                // so the filtered option count stays authoritative.
+                if state.runtime_detail_submenu.is_none() {
+                    state.runtime_detail_menu_index = (state.runtime_detail_menu_index + 3) % 4;
+                } else {
+                    state.runtime_detail_menu_index =
+                        state.runtime_detail_menu_index.saturating_sub(1);
+                }
                 Ok(false)
             }
             KeyCode::Down => {
+                if state.runtime_detail_submenu.is_none() {
+                    state.runtime_detail_menu_index = (state.runtime_detail_menu_index + 1) % 4;
+                    return Ok(false);
+                }
                 let max = match state.runtime_detail_submenu {
                     Some(RuntimeDetailSubmenu::ModelSelector) => state
                         .cached_model_catalog

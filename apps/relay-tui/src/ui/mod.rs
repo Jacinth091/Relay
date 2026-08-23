@@ -15,7 +15,7 @@ pub(crate) use tasks::{
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
@@ -108,16 +108,44 @@ fn render_top_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     let theme = Theme::default();
     let title = screen_title(state.screen);
     let (marker, marker_style) = active_provider_health(state);
-    let pad = (area.width as usize).saturating_sub(title.len() + marker.chars().count() + 10);
-    let line = Line::from(vec![
-        Span::styled("relay", theme.muted()),
-        Span::styled(" · ", theme.muted()),
-        Span::styled(title, theme.accent()),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(format!("{} ", state.active_runtime_provider), theme.muted()),
-        Span::styled(marker, marker_style),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+    // The right segment is sized to exactly fit its content so the provider
+    // name and health marker are never truncated; when space is tight the
+    // left title shortens instead.
+    let right_width =
+        (state.active_runtime_provider.chars().count() + 1 + marker.chars().count()) as u16;
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(right_width)])
+        .split(area);
+
+    let prefix_width = "relay · ".chars().count();
+    let title_budget = (columns[0].width as usize).saturating_sub(prefix_width);
+    let title_text: String = if title.chars().count() <= title_budget {
+        title.to_owned()
+    } else if title_budget == 0 {
+        String::new()
+    } else {
+        format!(
+            "{}…",
+            title.chars().take(title_budget - 1).collect::<String>()
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("relay", theme.muted()),
+            Span::styled(" · ", theme.muted()),
+            Span::styled(title_text, theme.accent()),
+        ])),
+        columns[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!("{} ", state.active_runtime_provider), theme.muted()),
+            Span::styled(marker, marker_style),
+        ]))
+        .alignment(Alignment::Right),
+        columns[1],
+    );
 }
 
 fn render_prompt_line(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -182,7 +210,13 @@ pub(crate) fn key_hints(state: &AppState) -> Vec<(String, String)> {
         Screen::Execution => execution_hints(state),
         Screen::Result => vec![("t", "tasks"), ("d", "dashboard"), ("n", "new handoff")],
         Screen::Diff | Screen::Logs => vec![("esc", "dashboard")],
-        Screen::Runtimes | Screen::Doctor => vec![("r", "re-check"), ("esc", "dashboard")],
+        Screen::Runtimes => vec![
+            ("↑/↓ j/k", "select"),
+            ("enter", "open"),
+            ("r", "re-check"),
+            ("esc", "dashboard"),
+        ],
+        Screen::Doctor => vec![("r", "re-check"), ("esc", "dashboard")],
         Screen::Settings => {
             if state.settings_form.editing {
                 vec![
@@ -204,7 +238,12 @@ pub(crate) fn key_hints(state: &AppState) -> Vec<(String, String)> {
             if state.runtime_detail_submenu.is_some() {
                 vec![("enter", "choose"), ("esc", "close")]
             } else {
-                vec![("enter", "select"), ("r", "re-check"), ("esc", "dashboard")]
+                vec![
+                    ("↑/↓", "select"),
+                    ("enter", "activate"),
+                    ("r", "re-check"),
+                    ("esc", "dashboard"),
+                ]
             }
         }
     }

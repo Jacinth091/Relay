@@ -16,6 +16,9 @@ const SUPPORTED_PROTOCOL_VERSION: u8 = 1;
 const MARKER_START: &str = "<!-- relay:task:start -->";
 const MARKER_END: &str = "<!-- relay:task:end -->";
 const DUPLICATE_KEY_PREFIX: &str = "duplicate JSON object key: ";
+const MAX_TITLE_CHARS: usize = 200;
+const MAX_GOAL_CHARS: usize = 8000;
+const MAX_BULLET_CHARS: usize = 2000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -43,6 +46,7 @@ impl HandoffTask {
 
         validate_non_empty("project", &self.project)?;
         validate_non_empty("title", &self.title)?;
+        validate_length("title", &self.title, MAX_TITLE_CHARS)?;
         if let Some(stack) = &self.stack {
             validate_logical_label("stack", stack)?;
         }
@@ -87,7 +91,18 @@ pub struct TaskSpec {
 
 impl TaskSpec {
     fn validate(&self) -> Result<(), ProtocolError> {
-        validate_non_empty("task.goal", &self.goal)
+        validate_non_empty("task.goal", &self.goal)?;
+        validate_length("task.goal", &self.goal, MAX_GOAL_CHARS)?;
+        for requirement in &self.requirements {
+            validate_length("task.requirements entry", requirement, MAX_BULLET_CHARS)?;
+        }
+        for constraint in &self.constraints {
+            validate_length("task.constraints entry", constraint, MAX_BULLET_CHARS)?;
+        }
+        for verification in &self.verification {
+            validate_length("task.verification entry", verification, MAX_BULLET_CHARS)?;
+        }
+        Ok(())
     }
 }
 
@@ -210,6 +225,17 @@ fn validate_non_empty(field: &str, value: &str) -> Result<(), ProtocolError> {
     if value.trim().is_empty() {
         Err(ProtocolError::InvalidTask(format!(
             "{field} cannot be empty"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_length(field: &str, value: &str, max_chars: usize) -> Result<(), ProtocolError> {
+    let char_count = value.chars().count();
+    if char_count > max_chars {
+        Err(ProtocolError::InvalidTask(format!(
+            "{field} is {char_count} characters, exceeding the maximum of {max_chars}"
         )))
     } else {
         Ok(())
@@ -550,6 +576,58 @@ mod tests {
             parse_handoff_task_json(&malformed_extensions),
             Err(ProtocolError::InvalidTask(_))
         ));
+    }
+
+    #[test]
+    fn rejects_overlong_title_goal_and_bullets() {
+        let long_title = MINIMAL.replace(
+            "Implement placement reassignment",
+            &"t".repeat(MAX_TITLE_CHARS + 1),
+        );
+        assert!(matches!(
+            parse_handoff_task_json(&long_title),
+            Err(ProtocolError::InvalidTask(message)) if message.contains("title is 201 characters")
+        ));
+
+        let long_goal = MINIMAL.replace(
+            "Implement approved behavior.",
+            &"g".repeat(MAX_GOAL_CHARS + 1),
+        );
+        assert!(matches!(
+            parse_handoff_task_json(&long_goal),
+            Err(ProtocolError::InvalidTask(message))
+                if message.contains("task.goal is 8001 characters")
+        ));
+
+        let long_requirement = FULL.replace(
+            "\"requirements\": [\"Preserve history.\"]",
+            &format!(
+                "\"requirements\": [\"{}\"]",
+                "r".repeat(MAX_BULLET_CHARS + 1)
+            ),
+        );
+        assert!(matches!(
+            parse_handoff_task_json(&long_requirement),
+            Err(ProtocolError::InvalidTask(message))
+                if message.contains("task.requirements entry")
+        ));
+    }
+
+    #[test]
+    fn accepts_fields_at_exact_length_caps() {
+        let at_caps = FULL
+            .replace(
+                "Implement placement reassignment",
+                &"t".repeat(MAX_TITLE_CHARS),
+            )
+            .replace("Implement approved behavior.", &"g".repeat(MAX_GOAL_CHARS))
+            .replace("Preserve history.", &"r".repeat(MAX_BULLET_CHARS));
+
+        let task = parse_handoff_task_json(&at_caps).unwrap();
+
+        assert_eq!(task.title.chars().count(), MAX_TITLE_CHARS);
+        assert_eq!(task.task.goal.chars().count(), MAX_GOAL_CHARS);
+        assert_eq!(task.task.requirements[0].chars().count(), MAX_BULLET_CHARS);
     }
 
     #[test]

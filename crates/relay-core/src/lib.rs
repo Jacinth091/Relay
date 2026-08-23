@@ -17,7 +17,8 @@ pub use relay_runtime::{
 
 pub use durable_state::{
     SqliteStore, StoredTask, TaskPersistenceError, TaskState, default_database_path,
-    get_stored_task, list_stored_tasks, update_stored_task_state,
+    get_stored_task, list_stored_tasks, list_stored_tasks_with_quarantined,
+    update_stored_task_state,
 };
 pub use execution::{
     BoundedOutputSnapshot, CoreExecutionEvent, ExecutionLimits, ExecutionReport,
@@ -34,7 +35,8 @@ pub use repository_safety::{
     inspect_trusted_project_repository,
 };
 pub use task_ingress::{
-    ImportedTask, SubmissionTransport, TaskId, TaskImportCandidate, TaskIngressError,
+    ImportedTask, MAX_LOCAL_TASK_INPUT_BYTES, SubmissionTransport, TaskId, TaskImportCandidate,
+    TaskIngressError,
 };
 
 /// Minimal Relay application state.

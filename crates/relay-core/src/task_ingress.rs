@@ -1,4 +1,4 @@
-use std::{fmt, fs, path::Path};
+use std::{fmt, fs, io::Read, path::Path};
 
 use relay_protocol::{
     HandoffTask, ProtocolError, parse_handoff_task_json, parse_handoff_task_markdown,
@@ -8,6 +8,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{ProjectKey, ProjectRegistryError, Relay};
+
+/// Maximum accepted local task input size, in bytes, for both files and pastes.
+pub const MAX_LOCAL_TASK_INPUT_BYTES: u64 = 512 * 1024;
 
 /// Relay-owned task identity, separate from all planner and transport IDs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -130,6 +133,15 @@ pub enum TaskIngressError {
         path: String,
         source: std::io::Error,
     },
+    #[error("local task file '{path}' is not valid UTF-8")]
+    FileNotUtf8 {
+        path: String,
+        source: std::string::FromUtf8Error,
+    },
+    #[error(
+        "local task input is {actual} bytes, exceeding the maximum of {limit} bytes; reject rather than truncate"
+    )]
+    InputTooLarge { limit: u64, actual: u64 },
     #[error("{0}")]
     Protocol(#[from] ProtocolError),
     #[error("{0}")]
@@ -141,6 +153,7 @@ impl Relay {
         &self,
         input: &str,
     ) -> Result<TaskImportCandidate, TaskIngressError> {
+        ensure_input_within_size_limit(input.len(), MAX_LOCAL_TASK_INPUT_BYTES)?;
         let handoff = parse_handoff_task_text(input)?;
         self.task_import_candidate(handoff, SubmissionTransport::LocalPaste)
     }
@@ -151,10 +164,7 @@ impl Relay {
     ) -> Result<TaskImportCandidate, TaskIngressError> {
         let path = path.as_ref();
         ensure_supported_local_task_extension(path)?;
-        let input = fs::read_to_string(path).map_err(|source| TaskIngressError::FileRead {
-            path: path.display().to_string(),
-            source,
-        })?;
+        let input = read_local_task_file(path)?;
         let handoff = parse_file_content(path, &input)?;
         self.task_import_candidate(handoff, SubmissionTransport::LocalFile)
     }
@@ -189,6 +199,38 @@ impl Relay {
             submission_transport,
         })
     }
+}
+
+fn ensure_input_within_size_limit(actual: usize, limit: u64) -> Result<(), TaskIngressError> {
+    let actual = actual as u64;
+    if actual > limit {
+        Err(TaskIngressError::InputTooLarge { limit, actual })
+    } else {
+        Ok(())
+    }
+}
+
+fn read_local_task_file(path: &Path) -> Result<String, TaskIngressError> {
+    let display = path.display().to_string();
+    let read_error = |source| TaskIngressError::FileRead {
+        path: display.clone(),
+        source,
+    };
+    let mut file = fs::File::open(path).map_err(read_error)?;
+    let metadata = file.metadata().map_err(read_error)?;
+    ensure_input_within_size_limit(metadata.len() as usize, MAX_LOCAL_TASK_INPUT_BYTES)?;
+
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(MAX_LOCAL_TASK_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(read_error)?;
+    ensure_input_within_size_limit(bytes.len(), MAX_LOCAL_TASK_INPUT_BYTES)?;
+
+    String::from_utf8(bytes).map_err(|source| TaskIngressError::FileNotUtf8 {
+        path: display,
+        source,
+    })
 }
 
 fn ensure_supported_local_task_extension(path: &Path) -> Result<(), TaskIngressError> {
@@ -393,6 +435,49 @@ mod tests {
 
         assert_eq!(candidate.project_key().as_str(), "relay");
         assert!(relay.inspect_project_repository("relay").is_ok());
+    }
+
+    #[test]
+    fn oversized_paste_fails_closed_without_truncation() {
+        let relay = relay_with_project("relay");
+        let padding = "x".repeat(MAX_LOCAL_TASK_INPUT_BYTES as usize);
+        let json = TASK_JSON.replace("Do not mutate Git.", &padding);
+        assert!(json.len() as u64 > MAX_LOCAL_TASK_INPUT_BYTES);
+
+        let error = relay.preview_local_paste(&json).unwrap_err();
+
+        assert!(matches!(
+            error,
+            TaskIngressError::InputTooLarge { limit, actual }
+                if limit == MAX_LOCAL_TASK_INPUT_BYTES && actual == json.len() as u64
+        ));
+    }
+
+    #[test]
+    fn paste_exactly_at_size_limit_is_accepted() {
+        let relay = relay_with_project("relay");
+        let padding = " ".repeat((MAX_LOCAL_TASK_INPUT_BYTES as usize) - TASK_JSON.len());
+        let padded = format!("{padding}{TASK_JSON}");
+        assert_eq!(padded.len() as u64, MAX_LOCAL_TASK_INPUT_BYTES);
+
+        let candidate = relay.preview_local_paste(&padded).unwrap();
+
+        assert_eq!(candidate.project_key().as_str(), "relay");
+    }
+
+    #[test]
+    fn oversized_local_file_fails_closed() {
+        let relay = relay_with_project("relay");
+        let file = temp_path("oversized.relay.json");
+        fs::write(&file, vec![b' '; (MAX_LOCAL_TASK_INPUT_BYTES + 1) as usize]).unwrap();
+
+        let error = relay.preview_local_file(&file).unwrap_err();
+
+        assert!(matches!(
+            error,
+            TaskIngressError::InputTooLarge { limit, .. }
+                if limit == MAX_LOCAL_TASK_INPUT_BYTES
+        ));
     }
 
     fn relay_with_project(key: &str) -> Relay {

@@ -6,6 +6,22 @@ Use this document to recontextualize a new human or AI conversation.
 
 Relay is one local handoff engine for developers who want to plan collaboratively in a conversational AI surface and deliberately choose when implementation work is delegated to a coding agent.
 
+Its architectural aim: accept handoffs; distribute approved implementation work to a chosen or multiple coding-runtime providers; supervise deterministically; aggregate and verify results within approved scope; relay outcomes and structured escalations back to the human. Distribution beyond one chosen provider is design intent, not shipped capability — see [ADR-0018](../docs/adr/0018-provider-distribution-model.md) and [docs/status](../docs/status-2026-08.md) for what works today.
+
+### Manager / Sub-worker Mapping
+
+Relay's role maps onto a manager-and-sub-workers model, applied to coding runtimes rather than to LLM subagents:
+
+```text
+manager                 -> Relay Core (deterministic)
+sub-workers             -> coding runtimes reached via RuntimeRouter
+work assignment         -> approved handoff tasks under ExecutionRunPolicy
+consolidation           -> execution reports + activity normalization
+verification relay-back -> DONE/FAILED outcomes or NEEDS_* packets
+```
+
+The manager role is strictly deterministic. Relay never becomes the reasoning manager: it does not decide intent, split work semantically, or judge results beyond configured verification. Planning stays with humans and planner surfaces ([ADR-0017](../docs/adr/0017-relay-identity-deterministic-handoff-engine.md)).
+
 Core flow:
 
 ```text

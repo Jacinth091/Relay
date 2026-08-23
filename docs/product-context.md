@@ -76,6 +76,8 @@ escalate only when intent must change
 
 A secondary product aim is **usage efficiency**: avoid spending limited coding-agent capacity on planning work that can happen before the handoff.
 
+As an architectural aim, Relay acts as the deterministic manager of coding-runtime providers: it accepts handoffs, distributes approved implementation work to a chosen or multiple providers, supervises execution within approved scope, aggregates results, and relays outcomes or structured escalations back to the human. Relay itself is not an LLM and does not decide intent ([ADR-0017](adr/0017-relay-identity-deterministic-handoff-engine.md), [ADR-0018](adr/0018-provider-distribution-model.md)).
+
 ## Primary User
 
 Initially:

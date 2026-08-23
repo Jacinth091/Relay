@@ -21,3 +21,6 @@ Current decisions:
 - [0014 — Host-Native Planner Adapters with Shared Conformance](0014-host-native-planner-adapters.md)
 
 - `0015-canonical-local-state-optional-external-bindings.md` — keep Relay local state canonical and external records optional.
+- `0016-mcp-first-submission-and-v0-1-local-descope.md` — Relay Direct/MCP is the first automatic submission transport; GitHub ingress descoped from v0.1.
+- `0017-relay-identity-deterministic-handoff-engine.md` — Relay is a deterministic handoff engine: execution orchestration only, never intent orchestration.
+- `0018-provider-distribution-model.md` — deterministic provider distribution posture with exists-today/partial/planned status labels.

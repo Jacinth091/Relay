@@ -31,7 +31,8 @@ use relay_core::{
     ExecutionScheduler, GitHubRepositoryMetadata, HandoffTask, ProjectKey, RegisterProject, Relay,
     RepositoryEligibility, RepositoryInspection, RepositorySafetyFailure, SchedulerSnapshot,
     SchedulerTaskStatus, SqliteStore, StoredTask, TaskId, TaskImportCandidate, TaskState,
-    default_config_path, default_database_path, list_stored_tasks,
+    TrustedProject, default_config_path, default_database_path, inspect_trusted_project_repository,
+    list_stored_tasks,
 };
 mod events;
 mod markdown;
@@ -968,10 +969,12 @@ fn render_execution(frame: &mut Frame, state: &AppState, area: Rect) {
         let task = state.durable_tasks.iter().find(|task| task.id == id);
         let output = view.output.iter().cloned().collect::<Vec<_>>().join("");
 
-        if let Some((task_id, request)) = &state.pending_permission {
-            if *task_id == id {
-                permission_popup = Some(request.clone());
-            }
+        if let Some((_, request)) = state
+            .pending_permissions
+            .iter()
+            .find(|(pending_task, _)| pending_task == &id)
+        {
+            permission_popup = Some(request.clone());
         }
 
         format!("Task: {id}\nProject: {}\nRuntime: {}\nModel: {}\nReasoning: {}\nScheduler: {}\nPhase: {}\nRepair: {}\nElapsed: {}s\n{}\n\nOutput:\n{}\n\nTry:\n  /cancel\n  /diff\n  /logs\n  /tasks",
@@ -1064,7 +1067,11 @@ fn render_execution(frame: &mut Frame, state: &AppState, area: Rect) {
 fn render_result(frame: &mut Frame, state: &AppState, area: Rect) {
     let body = state.selected_stored_task().map(|task| {
         let report = state.last_reports.get(&task.id);
-        let repository = state.relay.inspect_project_repository(task.project_key.as_str()).ok().map(|i| repository_inspection_line(&i.eligibility, &i.status)).unwrap_or_else(|| "unavailable".to_owned());
+        let repository = state
+            .repository_inspections
+            .get(&task.project_key)
+            .map(|i| repository_inspection_line(&i.eligibility, &i.status))
+            .unwrap_or_else(|| "unavailable".to_owned());
 
         let task_id = &task.id;
         let project = &task.project_key;
@@ -1096,6 +1103,9 @@ fn render_result(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn Error>> {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Ok(true);
+    }
     if state.command_mode {
         let suggs = state.get_current_suggestions();
         let sugg_count = suggs.len();
@@ -1126,6 +1136,22 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
                 return Ok(false);
             }
             KeyCode::Enter => {
+                let typed = state.command_input.trim().to_owned();
+                let typed_match = if typed.is_empty() {
+                    None
+                } else {
+                    suggs.iter().find(|sugg| {
+                        sugg.executable && sugg.completion.eq_ignore_ascii_case(&typed)
+                    })
+                };
+                if let Some(matched) = typed_match {
+                    // Execute the command the user fully typed (canonicalized),
+                    // never a different highlighted suggestion.
+                    let command = matched.completion.clone();
+                    state.command_mode = false;
+                    state.command_selected_index = 0;
+                    return execute_relay_command(state, &command).await;
+                }
                 if !suggs.is_empty() {
                     let idx = state.command_selected_index.min(sugg_count - 1);
                     let sel = &suggs[idx];
@@ -1417,9 +1443,11 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
             | KeyCode::Char('n')
             | KeyCode::Char('N')
             | KeyCode::Esc
-                if state.pending_permission.is_some() =>
+                if !state.pending_permissions.is_empty() =>
             {
-                if let Some((task_id, request)) = state.pending_permission.take() {
+                if let Some((task_id, request)) = (!state.pending_permissions.is_empty())
+                    .then(|| state.pending_permissions.remove(0))
+                {
                     let decision = match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
                             RuntimePermissionDecision::AllowOnce
@@ -1444,9 +1472,22 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<bool, Box<dyn
                         granted_paths: request.requested.paths.clone(),
                     };
                     if let Some(scheduler) = state.scheduler.clone() {
-                        let _ = scheduler
-                            .resolve_permission(task_id, request.request_id, grant)
-                            .await;
+                        match scheduler
+                            .resolve_permission(task_id, request.request_id.clone(), grant)
+                            .await
+                        {
+                            Ok(()) => {}
+                            Err(error) => {
+                                state.feedback =
+                                    format!("Failed to deliver permission decision: {error}");
+                                state.pending_permissions.push((task_id, request));
+                            }
+                        }
+                    } else {
+                        state.feedback =
+                            "No active scheduler; permission decision was not delivered."
+                                .to_owned();
+                        state.pending_permissions.push((task_id, request));
                     }
                 }
                 Ok(false)
@@ -1924,10 +1965,15 @@ async fn execute_relay_command(state: &mut AppState, input: &str) -> Result<bool
             let diff = match state.selected_stored_task() {
                 Some(task) => match state.relay.resolve_project(task.project_key.as_str()) {
                     Ok(project) => {
-                        match std::process::Command::new("git")
+                        let mut command = TokioCommand::new("git");
+                        #[cfg(windows)]
+                        command.creation_flags(0x08000000);
+                        match command
                             .args(["diff", "--no-ext-diff", "--no-color", "--unified=3"])
                             .current_dir(project.local_path())
+                            .kill_on_drop(true)
                             .output()
+                            .await
                         {
                             Ok(output) => {
                                 let out = String::from_utf8_lossy(&output.stdout).to_string();
@@ -2192,6 +2238,20 @@ fn durable_task_listing(tasks: &[StoredTask], feedback: &str) -> String {
     format!("{lines}\n\n{feedback}")
 }
 
+/// Blocking git inspection for a single trusted project; intended to run on
+/// a blocking thread via `spawn_blocking`.
+fn repository_preflight_status(project: &TrustedProject) -> String {
+    let inspection = inspect_trusted_project_repository(project);
+    if inspection.eligibility == RepositoryEligibility::Eligible {
+        "eligible".to_owned()
+    } else {
+        format!(
+            "unavailable: {}",
+            repository_inspection_line(&inspection.eligibility, &inspection.status)
+        )
+    }
+}
+
 fn repository_inspection_line(
     eligibility: &RepositoryEligibility,
     status: &Option<relay_core::RepositoryStatus>,
@@ -2445,8 +2505,11 @@ struct AppState {
     task_candidate: Option<TaskImportCandidate>,
     new_task_option: usize,
     repository_inspections: BTreeMap<ProjectKey, RepositoryInspection>,
+    inspection_refresh: Option<JoinHandle<BTreeMap<ProjectKey, RepositoryInspection>>>,
+    preflight_cache: HashMap<TaskId, (String, Instant)>,
+    preflight_refreshes: HashMap<TaskId, JoinHandle<String>>,
     feedback: String,
-    pending_permission: Option<(TaskId, RuntimePermissionRequest)>,
+    pending_permissions: Vec<(TaskId, RuntimePermissionRequest)>,
     cached_model_catalog: Option<relay_runtime::RuntimeModelCatalog>,
     runtime_detail_menu_index: usize,
     runtime_detail_submenu: Option<RuntimeDetailSubmenu>,
@@ -2491,6 +2554,7 @@ struct HealthSnapshot {
 }
 
 const UI_OUTPUT_BYTE_LIMIT: usize = 16 * 1024;
+const PREFLIGHT_CACHE_TTL: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ToolHealth {
@@ -2543,25 +2607,40 @@ impl AppState {
             return;
         }
         let task = self.health_refresh.take().expect("health task exists");
-        if let Ok(snapshot) = task.await {
-            self.git_health = snapshot.git_health;
-            if snapshot.runtime_health != CodexRuntimeHealth::Checking {
-                if let CodexRuntimeHealth::Available { ref account, .. } = snapshot.runtime_health {
-                    self.cached_codex_account = account.clone();
+        match task.await {
+            Ok(snapshot) => {
+                self.git_health = snapshot.git_health;
+                if snapshot.runtime_health != CodexRuntimeHealth::Checking {
+                    if let CodexRuntimeHealth::Available { ref account, .. } =
+                        snapshot.runtime_health
+                    {
+                        self.cached_codex_account = account.clone();
+                    }
+                    self.runtime_health = snapshot.runtime_health;
                 }
-                self.runtime_health = snapshot.runtime_health;
-            }
-            if snapshot.antigravity_health != AntigravityRuntimeHealth::Checking {
-                self.antigravity_health = snapshot.antigravity_health;
-            }
-            self.github_cli_health = snapshot.github_cli_health;
+                if snapshot.antigravity_health != AntigravityRuntimeHealth::Checking {
+                    self.antigravity_health = snapshot.antigravity_health;
+                }
+                self.github_cli_health = snapshot.github_cli_health;
 
-            let provider = self
-                .runtime_detail_provider
-                .as_deref()
-                .unwrap_or(&self.active_runtime_provider);
-            if let Some(integration) = build_runtime_router().integration(provider) {
-                self.cached_model_catalog = Some(integration.models().await);
+                let provider = self
+                    .runtime_detail_provider
+                    .as_deref()
+                    .unwrap_or(&self.active_runtime_provider);
+                if let Some(integration) = build_runtime_router().integration(provider) {
+                    self.cached_model_catalog = Some(integration.models().await);
+                }
+            }
+            Err(_) => {
+                self.git_health = ToolHealth::Unavailable("health probe failed".to_owned());
+                self.runtime_health = CodexRuntimeHealth::NotInstalled {
+                    error: "health probe failed".to_owned(),
+                };
+                self.antigravity_health = AntigravityRuntimeHealth::NotInstalled {
+                    error: "health probe failed".to_owned(),
+                };
+                self.github_cli_health = "health probe failed".to_owned();
+                self.feedback = "Health probe failed; statuses marked unavailable.".to_owned();
             }
         }
     }
@@ -2909,8 +2988,11 @@ impl AppState {
             task_candidate: None,
             new_task_option: 0,
             repository_inspections: BTreeMap::new(),
+            inspection_refresh: None,
+            preflight_cache: HashMap::new(),
+            preflight_refreshes: HashMap::new(),
             feedback,
-            pending_permission: None,
+            pending_permissions: Vec::new(),
             cached_model_catalog: None,
             runtime_detail_menu_index: 0,
             runtime_detail_submenu: None,
@@ -3021,16 +3103,21 @@ impl AppState {
             self.result_scroll = 0;
             Screen::Result
         } else {
+            self.begin_preflight_refresh(task.id);
             Screen::TaskReview
         };
     }
 
-    fn ui_preflight(&self, task: &StoredTask) -> String {
+    /// Local-only preflight checks that never shell out to git.
+    /// Returns `Some(reason)` when the task is unavailable for reasons other
+    /// than repository eligibility; `None` means the repository inspection
+    /// decides the outcome.
+    fn preflight_without_repository(&self, task: &StoredTask) -> Option<String> {
         if task.state != TaskState::Ready {
-            return "unavailable: task is not READY".to_owned();
+            return Some("unavailable: task is not READY".to_owned());
         }
         if self.scheduler.is_none() {
-            return "unavailable: local runtime or store is unavailable".to_owned();
+            return Some("unavailable: local runtime or store is unavailable".to_owned());
         }
         let provider = self.active_profile_id.split('/').next().unwrap_or_default();
         let health_ready = match provider {
@@ -3042,28 +3129,95 @@ impl AppState {
             _ => false,
         };
         if !health_ready {
-            return format!("unavailable: runtime provider '{provider}' is not ready");
+            return Some(format!(
+                "unavailable: runtime provider '{provider}' is not ready"
+            ));
         }
         match self.effective_stack(task) {
             Ok("chatgpt-codex" | "codex" | "antigravity" | "agy") => {}
-            Ok(stack) => return format!("unavailable: unsupported runtime stack '{stack}'"),
-            Err(error) => return format!("unavailable: {error}"),
+            Ok(stack) => return Some(format!("unavailable: unsupported runtime stack '{stack}'")),
+            Err(error) => return Some(format!("unavailable: {error}")),
         }
         if !task.handoff.extensions.is_empty() {
-            return "unavailable: unsupported task extensions".to_owned();
+            return Some("unavailable: unsupported task extensions".to_owned());
         }
-        match self
-            .relay
-            .inspect_project_repository(task.project_key.as_str())
-        {
-            Ok(inspection) if inspection.eligibility == RepositoryEligibility::Eligible => {
-                "eligible".to_owned()
+        None
+    }
+
+    /// Cached, render-safe preflight status. Reads only from the preflight
+    /// cache; git inspection happens asynchronously via `begin_preflight_refresh`.
+    fn ui_preflight(&self, task: &StoredTask) -> String {
+        if let Some(reason) = self.preflight_without_repository(task) {
+            return reason;
+        }
+        match self.preflight_cache.get(&task.id) {
+            Some((status, refreshed_at)) if refreshed_at.elapsed() <= PREFLIGHT_CACHE_TTL => {
+                status.clone()
             }
-            Ok(inspection) => format!(
-                "unavailable: {}",
-                repository_inspection_line(&inspection.eligibility, &inspection.status)
-            ),
-            Err(error) => format!("unavailable: project missing ({error})"),
+            _ => "checking repository…".to_owned(),
+        }
+    }
+
+    /// Authoritative preflight check for run gating; performs the repository
+    /// inspection off the UI thread and refreshes the cache.
+    async fn fresh_ui_preflight(&mut self, task: &StoredTask) -> String {
+        if let Some(reason) = self.preflight_without_repository(task) {
+            return reason;
+        }
+        let Ok(project) = self.relay.resolve_project(task.project_key.as_str()) else {
+            return "unavailable: project missing".to_owned();
+        };
+        let project = project.clone();
+        let status = tokio::task::spawn_blocking(move || repository_preflight_status(&project))
+            .await
+            .unwrap_or_else(|_| "unavailable: repository inspection failed".to_owned());
+        self.preflight_cache
+            .insert(task.id, (status.clone(), Instant::now()));
+        status
+    }
+
+    fn begin_preflight_refresh(&mut self, task_id: TaskId) {
+        if self.preflight_refreshes.contains_key(&task_id) {
+            return;
+        }
+        let Some(task) = self.durable_tasks.iter().find(|task| task.id == task_id) else {
+            return;
+        };
+        if let Some(reason) = self.preflight_without_repository(task) {
+            self.preflight_cache
+                .insert(task_id, (reason, Instant::now()));
+            return;
+        }
+        let Ok(project) = self.relay.resolve_project(task.project_key.as_str()) else {
+            self.preflight_cache.insert(
+                task_id,
+                ("unavailable: project missing".to_owned(), Instant::now()),
+            );
+            return;
+        };
+        let project = project.clone();
+        let handle = tokio::task::spawn_blocking(move || repository_preflight_status(&project));
+        self.preflight_refreshes.insert(task_id, handle);
+    }
+
+    async fn poll_preflight_refreshes(&mut self) {
+        let finished: Vec<TaskId> = self
+            .preflight_refreshes
+            .iter()
+            .filter(|(_, handle)| handle.is_finished())
+            .map(|(task_id, _)| *task_id)
+            .collect();
+        for task_id in finished {
+            let handle = self
+                .preflight_refreshes
+                .remove(&task_id)
+                .expect("preflight handle exists");
+            if let Ok(status) = handle.await {
+                self.preflight_cache
+                    .insert(task_id, (status, Instant::now()));
+            } else {
+                self.preflight_cache.remove(&task_id);
+            }
         }
     }
 
@@ -3108,8 +3262,9 @@ impl AppState {
             self.feedback = "Run is available only once for a durable READY task.".to_owned();
             return;
         }
-        if self.ui_preflight(&task) != "eligible" {
-            self.feedback = format!("Run unavailable: {}", self.ui_preflight(&task));
+        let preflight = self.fresh_ui_preflight(&task).await;
+        if preflight != "eligible" {
+            self.feedback = format!("Run unavailable: {preflight}");
             return;
         }
         let Some(scheduler) = self.scheduler.clone() else {
@@ -3411,6 +3566,20 @@ impl AppState {
 
     async fn tick(&mut self) {
         self.poll_health_refresh().await;
+        self.poll_preflight_refreshes().await;
+        self.poll_repository_inspection_refresh().await;
+        if self.screen == Screen::TaskReview
+            && let Some(task_id) = self.selected_task
+        {
+            let needs_refresh = self
+                .preflight_cache
+                .get(&task_id)
+                .map(|(_, refreshed_at)| refreshed_at.elapsed() > PREFLIGHT_CACHE_TTL)
+                .unwrap_or(true);
+            if needs_refresh {
+                self.begin_preflight_refresh(task_id);
+            }
+        }
         self.reap_finished_scheduler_driver().await;
         let mut reload = false;
         let mut lagged = false;
@@ -3492,7 +3661,15 @@ impl AppState {
                 let view = self.execution_views.entry(task_id).or_default();
                 view.scheduler_status = Some(SchedulerTaskStatus::WaitingPermission);
                 self.feedback = format!("Permission requested: {:?}", request.kind);
-                self.pending_permission = Some((task_id, request));
+                if !self
+                    .pending_permissions
+                    .iter()
+                    .any(|(pending_task, pending_request)| {
+                        pending_task == &task_id && pending_request.request_id == request.request_id
+                    })
+                {
+                    self.pending_permissions.push((task_id, request));
+                }
                 return true;
             }
             CoreExecutionEvent::VerificationStarted { task_id, .. } => {
@@ -3667,17 +3844,45 @@ impl AppState {
             .to_string()
     }
 
-    fn refresh_repository_inspections(&mut self) {
-        self.repository_inspections = self
+    fn begin_repository_inspection_refresh(&mut self) {
+        if self.inspection_refresh.is_some() {
+            return;
+        }
+        let projects: Vec<TrustedProject> = self
             .relay
             .list_projects()
-            .filter_map(|project| {
-                self.relay
-                    .inspect_project_repository(project.key().as_str())
-                    .ok()
-                    .map(|inspection| (project.key().clone(), inspection))
-            })
+            .map(TrustedProject::clone)
             .collect();
+        self.inspection_refresh = Some(tokio::task::spawn_blocking(move || {
+            projects
+                .into_iter()
+                .map(|project| {
+                    let inspection = inspect_trusted_project_repository(&project);
+                    (project.key().clone(), inspection)
+                })
+                .collect::<BTreeMap<_, _>>()
+        }));
+    }
+
+    async fn poll_repository_inspection_refresh(&mut self) {
+        let Some(handle) = &self.inspection_refresh else {
+            return;
+        };
+        if !handle.is_finished() {
+            return;
+        }
+        let handle = self
+            .inspection_refresh
+            .take()
+            .expect("inspection handle exists");
+        if let Ok(inspections) = handle.await {
+            self.repository_inspections = inspections;
+        }
+    }
+
+    /// Requests a repository inspection refresh; results land on a later tick.
+    fn refresh_repository_inspections(&mut self) {
+        self.begin_repository_inspection_refresh();
     }
 
     fn try_start_add_project(&mut self) {
@@ -4240,6 +4445,121 @@ mod tests {
             .unwrap();
         assert!(!state.command_mode);
         assert!(state.command_input.is_empty());
+    }
+
+    #[tokio::test]
+    async fn enter_executes_fully_typed_command_over_highlighted_suggestion() {
+        let mut state = app_state_with_eligible_project_with_store().await;
+        state.command_mode = true;
+        // Fully typed, valid command; the palette highlights it but the typed
+        // text must win over any other highlighted completion.
+        state.command_input = "/TASKS".to_owned();
+
+        let suggs = state.get_current_suggestions();
+        assert!(suggs.iter().any(|sugg| sugg.executable));
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.screen, Screen::Tasks);
+    }
+
+    #[tokio::test]
+    async fn enter_still_executes_highlighted_suggestion_for_partial_input() {
+        let mut state = app_state_with_eligible_project_with_store().await;
+        state.command_mode = true;
+        // Partial input is not a valid command; the highlighted executable
+        // suggestion should still run.
+        state.command_input = "/ta".to_owned();
+
+        let suggs = state.get_current_suggestions();
+        assert!(
+            suggs.first().map(|sugg| sugg.executable).unwrap_or(false),
+            "expected an executable top suggestion"
+        );
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.screen, Screen::Tasks);
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_quits_from_command_and_normal_modes() {
+        let mut state = app_state_with_eligible_project_with_store().await;
+
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let quit_normal = handle_key(&mut state, ctrl_c).await.unwrap();
+        assert!(quit_normal);
+
+        state.command_mode = true;
+        state.command_input = "/run".to_owned();
+        let quit_command = handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        )
+        .await
+        .unwrap();
+        assert!(quit_command);
+    }
+
+    #[tokio::test]
+    async fn health_probe_join_failure_marks_tools_unavailable() {
+        let mut state = app_state_with_eligible_project_with_store().await;
+        state.health_refresh = Some(tokio::spawn(async {
+            panic!("simulated probe crash");
+        }));
+        tokio::task::yield_now().await;
+        state.poll_health_refresh().await;
+
+        assert!(matches!(
+            state.git_health,
+            ToolHealth::Unavailable(ref message) if message.contains("health probe failed")
+        ));
+        assert!(matches!(
+            state.runtime_health,
+            CodexRuntimeHealth::NotInstalled { ref error } if error.contains("health probe failed")
+        ));
+        assert!(matches!(
+            state.antigravity_health,
+            AntigravityRuntimeHealth::NotInstalled { ref error } if error.contains("health probe failed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn ui_preflight_reads_from_cache_and_refreshes_asynchronously() {
+        let mut state = app_state_with_eligible_project_with_store().await;
+        state.start_paste_task();
+        state.paste_text = task_json();
+        state.submit_paste_task();
+        state.confirm_task_import().await;
+
+        // Entering review starts an asynchronous repository inspection.
+        state.open_selected_task();
+        assert_eq!(state.screen, Screen::TaskReview);
+
+        // Render-side reads never block on git: empty cache reports checking.
+        let task = state.selected_stored_task().unwrap();
+        assert_eq!(state.ui_preflight(task), "checking repository…");
+
+        for _ in 0..100 {
+            state.tick().await;
+            let task = state.selected_stored_task().unwrap();
+            if state.ui_preflight(task) != "checking repository…" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let task = state.selected_stored_task().unwrap();
+        assert_eq!(state.ui_preflight(task), "eligible");
     }
 
     #[tokio::test]

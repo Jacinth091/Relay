@@ -3270,11 +3270,6 @@ impl AppState {
         let Some(scheduler) = self.scheduler.clone() else {
             return;
         };
-        let max_duration = std::cmp::min(
-            std::time::Duration::from_secs(1800),
-            scheduler.limits().max_duration,
-        );
-        let max_repair_attempts = std::cmp::min(2, scheduler.limits().max_repair_attempts);
         let one_run_effort = match self.one_run_reasoning_override.as_deref() {
             None => None,
             Some("low") => Some(relay_core::ReasoningEffort::Low),
@@ -3292,72 +3287,34 @@ impl AppState {
             .as_deref()
             .filter(|model| *model != "default")
             .map(str::to_owned);
-        if one_run_model.is_some() || one_run_effort.is_some() {
-            let provider = self.active_profile_id.split('/').next().unwrap_or_default();
-            if let Some(integration) = build_runtime_router().integration(provider) {
-                let catalog = integration.models().await;
-                if let Some(model) = one_run_model.as_deref()
-                    && !catalog.available_models.is_empty()
-                    && !catalog
-                        .available_models
-                        .iter()
-                        .any(|candidate| candidate.id == model)
-                {
-                    self.feedback = format!(
-                        "One-run model '{model}' is not available from provider '{provider}'."
-                    );
-                    return;
-                }
-                if let Some(effort) = one_run_effort {
-                    let model_id = one_run_model
-                        .as_deref()
-                        .unwrap_or(catalog.default_model.as_str());
-                    if let Some(model_info) = catalog
-                        .available_models
-                        .iter()
-                        .find(|model| model.id == model_id)
-                        && !model_info.supported_reasoning_efforts.is_empty()
-                        && !model_info.supported_reasoning_efforts.contains(&effort)
-                    {
-                        self.feedback = format!(
-                            "One-run reasoning '{:?}' is not supported by model '{model_id}'.",
-                            effort
-                        );
-                        return;
-                    }
-                }
+        // User intent only; Relay Core owns all execution policy decisions.
+        let intent = relay_core::ExecutionPlanIntent {
+            preferred_profile_id: Some(self.active_profile_id.clone()),
+            preferred_model: one_run_model
+                .or_else(|| self.active_model.as_option().map(str::to_owned)),
+            preferred_reasoning_effort: one_run_effort.or(self.active_reasoning_effort.as_option()),
+        };
+        let mut environment = relay_core::ExecutionPlanEnvironment::default();
+        if let Some(integration) = build_runtime_router()
+            .integration(self.active_profile_id.split('/').next().unwrap_or_default())
+        {
+            environment.effective_profile =
+                integration.resolve_profile(&self.active_profile_id).ok();
+            if intent.preferred_model.is_some() || intent.preferred_reasoning_effort.is_some() {
+                environment.model_catalog = Some(integration.models().await);
             }
         }
-        let selection = self.runtime_settings.resolve_selection(
-            Some(task.project_key.as_str()),
-            Some(&self.active_profile_id),
-            one_run_model.as_deref().or(self.active_model.as_option()),
-            one_run_effort.or(self.active_reasoning_effort.as_option()),
-        );
-        let trusted_workspace = self
-            .relay
-            .resolve_project(task.project_key.as_str())
-            .ok()
-            .map(|project| project.local_path().to_path_buf());
-        let permission_envelope = build_runtime_router()
-            .integration(selection.profile_id.split('/').next().unwrap_or_default())
-            .and_then(|integration| integration.resolve_profile(&selection.profile_id).ok())
-            .map(|effective| relay_runtime::RuntimePermissionEnvelope {
-                trusted_workspace,
-                workspace_write: matches!(
-                    effective.profile.filesystem,
-                    relay_runtime::FilesystemCapability::WorkspaceWrite
-                ),
-                network: effective.profile.network,
-                additional_writable_roots: effective.profile.extra_writable_roots,
-            })
-            .unwrap_or_default();
-        let policy = relay_core::ExecutionRunPolicy {
-            runtime_selection: selection,
-            permission_envelope,
-            max_duration,
-            max_repair_attempts,
+        let plan = match scheduler
+            .plan_execution(task.id, intent, &environment)
+            .await
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.feedback = format!("Run unavailable: {error}");
+                return;
+            }
         };
+        let policy = plan.policy;
         self.execution_views
             .entry(task.id)
             .or_default()

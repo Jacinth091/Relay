@@ -296,6 +296,37 @@ impl<R: Runtime> ExecutionScheduler<R> {
         &self.limits
     }
 
+    /// Deterministically plans an execution run from user intent.
+    ///
+    /// Loads the stored task and registered project, then delegates all policy
+    /// decisions (profile resolution, stack validation, limit clamping,
+    /// permission envelope construction) to [`crate::build_execution_plan`].
+    pub async fn plan_execution(
+        &self,
+        task_id: TaskId,
+        intent: crate::ExecutionPlanIntent,
+        environment: &crate::ExecutionPlanEnvironment,
+    ) -> Result<crate::ExecutionPlan, crate::ExecutionPlanningError> {
+        let stored = get_stored_task(&self.store, task_id)
+            .await?
+            .ok_or(crate::ExecutionPlanningError::TaskNotFound { task_id })?;
+        let project = self
+            .relay
+            .resolve_project(stored.project_key.as_str())
+            .map_err(|_| crate::ExecutionPlanningError::ProjectNotRegistered {
+                project_key: stored.project_key.as_str().to_owned(),
+            })?;
+        let fallback_profile_id = self.runtime.identity().profile_id.clone();
+        crate::build_execution_plan(
+            &stored,
+            project,
+            intent,
+            &self.limits,
+            environment,
+            &fallback_profile_id,
+        )
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<CoreExecutionEvent> {
         self.event_tx.subscribe()
     }

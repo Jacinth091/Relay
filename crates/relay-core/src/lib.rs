@@ -4,6 +4,7 @@
 
 mod durable_state;
 mod execution;
+mod execution_planning;
 mod project_registry;
 mod repository_safety;
 mod task_ingress;
@@ -24,6 +25,10 @@ pub use execution::{
     BoundedOutputSnapshot, CoreExecutionEvent, ExecutionLimits, ExecutionReport,
     ExecutionRunPolicy, ExecutionScheduler, ExecutionSchedulerError, PreflightFailure,
     RetainedOutputChunk, SchedulerSnapshot, SchedulerTaskSnapshot, SchedulerTaskStatus,
+};
+pub use execution_planning::{
+    ExecutionPlan, ExecutionPlanEnvironment, ExecutionPlanIntent, ExecutionPlanningError,
+    PLANNED_MAX_DURATION, PLANNED_MAX_REPAIR_ATTEMPTS, build_execution_plan,
 };
 pub use project_registry::{
     ExpectedRemote, GitHubRepositoryMetadata, ProjectKey, ProjectRegistry, ProjectRegistryError,

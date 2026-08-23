@@ -657,6 +657,7 @@ Start here:
 - [`docs/github-integration.md`](docs/github-integration.md) — local GitHub detection, compatibility ingress, and optional bindings.
 - [`docs/github-mailbox-setup.md`](docs/github-mailbox-setup.md) — user-owned private bootstrap mailbox setup and routing behavior.
 - [`docs/submission-and-bindings.md`](docs/submission-and-bindings.md) — submission transports, canonical local state, and optional external bindings.
+- [`docs/planner-hosts/`](docs/planner-hosts/) — per-host recipes for registering `relay serve-mcp` as an MCP planner door (Claude Code, OpenCode, Codex CLI).
 - [`docs/clarification-protocol.md`](docs/clarification-protocol.md)
 - [`docs/runtime-stack-model.md`](docs/runtime-stack-model.md)
 - [`docs/security-model.md`](docs/security-model.md)

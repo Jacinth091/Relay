@@ -72,12 +72,14 @@ The planner-to-Relay submission choice is separate from optional external bindin
 Conceptual choices:
 
 ```text
-Relay Direct / MCP          preferred when available
-GitHub compatibility        useful for the v0.1 reference workflow
+Relay Direct / MCP          preferred when available (`relay serve-mcp`; implemented in M9)
+GitHub compatibility        useful for the v0.1 reference workflow (descoped, not started)
 Local file / paste          universal fallback
 ```
 
 If Relay Direct is unavailable, setup should not fail. Local file/paste remains usable.
+
+To enable Relay Direct/MCP from a planner host, register `relay serve-mcp` as a local stdio MCP server in that host; per-host recipes live under [docs/planner-hosts/](planner-hosts/).
 
 ### GitHub mailbox setup
 

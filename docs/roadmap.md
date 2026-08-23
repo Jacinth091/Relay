@@ -39,7 +39,10 @@ Not started, despite appearing in older plans:
   remains an optional future compatibility path whose issue-writer must be
   host-agnostic. It currently appears only as expected-remote metadata in
   repository safety checks.
-- Relay Direct / MCP submission transport: **next up — M9**. See
+- Relay Direct / MCP submission transport: **implemented (M9) on
+  `feat/m9-relay-direct-mcp`, pending merge**. `relay serve-mcp` provides the
+  MCP stdio submission transport (`submit_handoff`); host recipes under
+  [docs/planner-hosts/](planner-hosts/). See
   [docs/M9_PACK](M9_PACK/RELAY_M9_MCP_DIRECT_IMPLEMENTATION_PACK/00-IMPLEMENTATION-SEQUENCE.md).
 - Executable planner-adapter conformance harness: **planned, not started**.
   The conformance cases exist only as documentation
@@ -54,8 +57,9 @@ ChatGPT -> local file/paste ingress -> Relay -> Codex CLI
 ```
 
 The originally documented primary stack assumed a GitHub compatibility
-transport. That leg is planned but not started; today the only working
-end-to-end ingress is local file/paste.
+transport. That leg is planned but not started; the working end-to-end ingresses
+today are local file/paste plus the M9 `relay serve-mcp` MCP submission
+transport (on `feat/m9-relay-direct-mcp`, pending merge).
 
 Must include:
 
@@ -145,7 +149,8 @@ Optional, not promises:
 
 - Tauri desktop client;
 - local Axum server/browser client;
-- Relay Direct/MCP submission (currently planned, not started — see build-plan Phase 12);
+- Relay Direct/MCP submission (implemented in M9 on
+  `feat/m9-relay-direct-mcp`);
 - optional external binding configuration independent of submission transport;
 - multiple execution lanes;
 - remote Relay node;

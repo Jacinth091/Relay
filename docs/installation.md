@@ -39,6 +39,19 @@ See `first-run-setup.md`.
 
 If the user selects the GitHub mailbox bootstrap transport, setup should also guide them to create or select their own private Relay mailbox repository. See `github-mailbox-setup.md`. Direct/MCP users do not need a mailbox.
 
+## Planner submission transport (`relay serve-mcp`)
+
+Relay ships a headless MCP stdio server alongside the TUI:
+
+```text
+relay serve-mcp
+```
+
+Planner hosts that speak MCP register this command as a local stdio MCP
+server to submit handoffs directly (one tool: `submit_handoff`). Per-host
+registration recipes live under `planner-hosts/`. Submission only persists the
+task in Ready state; execution still requires explicit Run approval in the TUI.
+
 ## Troubleshooting commands
 
 A small optional CLI surface is still useful:

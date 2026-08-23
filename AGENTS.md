@@ -31,8 +31,9 @@ Milestone ladder actually tracked by development: M2 registry → M3 repo safety
 |---|---|
 | M2–M7 | Done, merged to main |
 | **M8 / M8.1** | **Done on `feat/m8-codex-runtime`, pending merge** (branch is ahead of main by ~40 commits) |
-| Working end-to-end path today | Local paste/file import → TUI review → explicit Run approval → Codex (`app-server` transport default) → events/diff/logs/history |
-| Ingress reality | **Local file/paste only.** GitHub ingress descoped from v0.1 by ADR-0016; Relay Direct/MCP is next (M9 pack written, not implemented) |
+| **M9 (Relay Direct/MCP)** | **Done on `feat/m9-relay-direct-mcp`, pending merge** — clap CLI entry point, `relay serve-mcp` MCP stdio server (`submit_handoff`), store concurrency hardening, conformance tests + host docs |
+| Working end-to-end path today | Local paste/file import → TUI review → explicit Run approval → Codex (`app-server` transport default) → events/diff/logs/history; plus MCP submission via `relay serve-mcp` on the M9 branch |
+| Ingress reality | Local file/paste plus `relay serve-mcp` (M9 branch). GitHub ingress descoped from v0.1 by ADR-0016 |
 | Provider distribution | Route-to-chosen-provider and slot-bounded concurrent executions exist; fan-out to multiple providers, health-aware routing, cross-provider aggregation are design intent only (ADR-0018) |
 | Planner adapters | Documentation/skill documents in `integrations/planners/`; no executable code, no conformance harness yet |
 
@@ -84,7 +85,7 @@ Use:
 - JSON for canonical task/clarification wire formats.
 - TOML for local configuration.
 - SQLite + SQLx for durable local state.
-- clap for command-line flags/subcommands (not yet wired into the binary entry point — arrives with M9 phase 01).
+- clap for command-line flags/subcommands (wired into the binary entry point since M9 phase 01; default invocation still starts the TUI).
 - tracing for diagnostics.
 - thiserror for library/domain errors.
 - anyhow only at application boundaries.
@@ -227,7 +228,7 @@ Deep detail: `docs/security-model.md`.
 | Scheduler/lifecycle/repair changes | `crates/relay-core/src/execution.rs`; M6 semantics are FROZEN — additive amendments only |
 | New user-facing UI copy/screens | `apps/relay-tui/src/ui/`, `docs/tui-ux.md`, ADR-0017 language rules |
 | Runtime/provider work | `crates/relay-runtime/src/lib.rs` (trait + permission/catalog types), relevant runtime crate, `docs/runtime-stack-model.md` |
-| Submission transports / MCP | `docs/adr/0016-*.md`, `docs/M9_PACK/...` (phase order is mandatory), `docs/submission-and-bindings.md` |
+| Submission transports / MCP | `docs/adr/0016-*.md`, `docs/M9_PACK/...`, `docs/planner-hosts/` (host registration recipes), `docs/submission-and-bindings.md` |
 | Multi-provider distribution / fan-out ideas | `docs/adr/0018-*.md` — fan-out is PLANNED, not built; do not present as shipped |
 | Planning surfaces / ChatGPT skill | `integrations/planners/relay-handoff/`, `docs/planner-integrations.md` |
 | Persistence/store changes | `crates/relay-store/`, `docs/data-persistence.md`; two-process access (TUI + future serve-mcp) hardening is an M9 gate |
@@ -266,5 +267,5 @@ Add focused integration tests for process boundaries, repository safety, recover
 
 1. Close M8.1 leftovers (items 04–05 partials: provider-neutral Markdown rendering, scrollable execution/result polish) — see `docs/M8_1_PACK/`.
 2. Merge `feat/m8-codex-runtime` through staging to main.
-3. Implement M9 (`docs/M9_PACK/`) in strict phase order: 01 CLI/process model → 02 store concurrency (hard gate) → 03 MCP protocol + `submit_handoff` → 04 conformance + host docs.
+3. Merge `feat/m9-relay-direct-mcp` through staging to main — M9 is implemented (01 CLI/process model, 02 store concurrency, 03 MCP protocol + `submit_handoff`, 04 conformance tests + host docs under `docs/planner-hosts/`).
 4. Later (ADR-0018 intent): provider fan-out, health-aware routing, cross-provider aggregation — design first, label honestly.

@@ -1242,3 +1242,81 @@ fn settings_key_bar_shows_edit_mode_hints_only_while_editing() {
     assert!(editing.iter().any(|(_, label)| label == "cancel edit"));
     assert!(!editing.iter().any(|(key, _)| key == "0-9"));
 }
+
+fn render_dashboard_text(state: &AppState) -> String {
+    let backend = ratatui::backend::TestBackend::new(80, 25);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| crate::ui::render_dashboard(frame, state, frame.area()))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.height)
+        .flat_map(|y| {
+            let mut line = String::new();
+            for x in 0..buffer.area.width {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            line.push('\n');
+            line.chars().collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+async fn ready_task_state_with_queue() -> (AppState, relay_core::SchedulerTaskSnapshot) {
+    let mut state = app_state_with_project_with_store().await;
+    state.start_paste_task();
+    state.paste_text = task_json();
+    state.submit_paste_task();
+    state.confirm_task_import().await;
+    let task_id = state.selected_task.unwrap();
+    (
+        state,
+        relay_core::SchedulerTaskSnapshot {
+            task_id,
+            project_key: ProjectKey::parse("relay").unwrap(),
+            status: SchedulerTaskStatus::QueuedReady,
+        },
+    )
+}
+
+#[tokio::test]
+async fn dashboard_projection_lists_ready_task_when_slot_free() {
+    let (mut state, queued) = ready_task_state_with_queue().await;
+    state.scheduler_snapshot = SchedulerSnapshot {
+        tasks: vec![queued],
+    };
+
+    let body = render_dashboard_text(&state);
+    assert!(
+        body.contains("next: Implement local ingress -> Codex"),
+        "expected queue projection row, got:\n{body}"
+    );
+    assert!(
+        !body.contains("waiting for execution slot"),
+        "slot-free projection must not show waiting line, got:\n{body}"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_projection_shows_waiting_line_when_slots_full() {
+    let (mut state, queued) = ready_task_state_with_queue().await;
+    state.execution_limits.max_parallel = 1;
+    state.execution_limits.per_project_max_parallel = 1;
+    let running = relay_core::SchedulerTaskSnapshot {
+        status: SchedulerTaskStatus::Running,
+        ..queued.clone()
+    };
+    state.scheduler_snapshot = SchedulerSnapshot {
+        tasks: vec![running, queued],
+    };
+
+    let body = render_dashboard_text(&state);
+    assert!(
+        body.contains("next: Implement local ingress -> Codex"),
+        "expected queued handoff still projected, got:\n{body}"
+    );
+    assert!(
+        body.contains("waiting for execution slot (1/1 active)"),
+        "expected waiting-for-slot line, got:\n{body}"
+    );
+}

@@ -106,7 +106,7 @@ async fn collect_health(
                 Err(_) => format!("available but auth check timed out ({version})"),
             }
         }
-        Err(_) => "not installed (optional M10 prerequisite)".to_owned(),
+        Err(_) => "not installed (optional integration)".to_owned(),
     };
     HealthSnapshot {
         git_health,
@@ -211,6 +211,9 @@ pub(crate) struct AppState {
     pub(crate) scheduler: Option<Arc<ExecutionScheduler<RuntimeRouter>>>,
     pub(crate) runtime_health: CodexRuntimeHealth,
     pub(crate) git_health: ToolHealth,
+    // GitHub CLI is an optional integration; GitHub ingress is descoped from
+    // v0.1 (ADR-0016), so nothing currently renders this.
+    #[allow(dead_code)]
     pub(crate) github_cli_health: String,
     pub(crate) antigravity_health: AntigravityRuntimeHealth,
     pub(crate) active_runtime_provider: String,
@@ -303,6 +306,9 @@ pub(crate) struct HealthSnapshot {
     git_health: ToolHealth,
     runtime_health: CodexRuntimeHealth,
     antigravity_health: AntigravityRuntimeHealth,
+    // GitHub CLI remains an optional integration only; GitHub ingress is
+    // descoped from v0.1 (ADR-0016), so nothing currently renders this.
+    #[allow(dead_code)]
     github_cli_health: String,
 }
 
@@ -336,7 +342,7 @@ impl AppState {
             self.antigravity_health = AntigravityRuntimeHealth::Checking;
         }
         self.git_health = ToolHealth::Checking;
-        self.github_cli_health = "checking (optional M10 prerequisite)".to_owned();
+        self.github_cli_health = "checking (optional integration)".to_owned();
         let provider = self.active_runtime_provider.clone();
         self.health_refresh = Some(tokio::spawn(collect_health(provider, full_probe, None)));
     }
@@ -695,7 +701,7 @@ impl AppState {
             scheduler,
             runtime_health: CodexRuntimeHealth::Checking,
             git_health: ToolHealth::Checking,
-            github_cli_health: "not checked (optional M10 prerequisite)".to_owned(),
+            github_cli_health: "not checked (optional integration)".to_owned(),
             antigravity_health: AntigravityRuntimeHealth::Checking,
             active_runtime_provider: default_profile
                 .split('/')

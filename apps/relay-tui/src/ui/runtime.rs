@@ -281,7 +281,7 @@ pub(crate) fn render_doctor(frame: &mut Frame, state: &AppState, area: Rect) {
     };
 
     let body = format!(
-        "{status_header}\n\nCurrent execution requirements\n\n{}\n{} Relay config\n{} SQLite\n{}\n  {}\n{}\n  {}\n\nFuture integrations\n{}\nGitHub Issue ingress: not implemented until M10\nRelay Direct / MCP: not implemented until M12",
+        "{status_header}\n\nCurrent execution requirements\n\n{}\n{} Relay config\n{} SQLite\n{}\n  {}\n{}\n  {}\n\nSubmission transports\nRelay Direct / MCP: implemented (`relay serve-mcp`)",
         git_health_marker(&state.git_health),
         if state.registry_writable { "✓" } else { "×" },
         if state.store.is_some() { "✓" } else { "×" },
@@ -296,8 +296,7 @@ pub(crate) fn render_doctor(frame: &mut Frame, state: &AppState, area: Rect) {
         } else {
             "× Antigravity"
         },
-        state.antigravity_health.display_status(),
-        state.github_cli_health
+        state.antigravity_health.display_status()
     );
     frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: true }), area);
 }

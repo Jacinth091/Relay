@@ -227,15 +227,17 @@ pub(crate) fn escalated_tasks(state: &AppState) -> Vec<&StoredTask> {
         .collect()
 }
 
-pub(crate) fn distribution_rows(state: &AppState) -> Vec<String> {
-    let profile_for_task = |task_id: TaskId| -> String {
-        state
-            .execution_records
-            .get(&task_id)
-            .map(|record| record.runtime_profile.clone())
-            .unwrap_or_else(|| state.active_profile_id.clone())
-    };
+/// Runtime profile associated with a task: the persisted execution record's
+/// profile when one exists, otherwise the app's active profile.
+pub(crate) fn runtime_profile_for_task(state: &AppState, task_id: TaskId) -> String {
+    state
+        .execution_records
+        .get(&task_id)
+        .map(|record| record.runtime_profile.clone())
+        .unwrap_or_else(|| state.active_profile_id.clone())
+}
 
+pub(crate) fn distribution_rows(state: &AppState) -> Vec<String> {
     let mut counts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     for snapshot in state
         .scheduler_snapshot
@@ -244,7 +246,7 @@ pub(crate) fn distribution_rows(state: &AppState) -> Vec<String> {
         .filter(|snapshot| matches!(snapshot.status, SchedulerTaskStatus::Running))
     {
         counts
-            .entry(profile_for_task(snapshot.task_id))
+            .entry(runtime_profile_for_task(state, snapshot.task_id))
             .or_default()
             .0 += 1;
     }
@@ -253,7 +255,10 @@ pub(crate) fn distribution_rows(state: &AppState) -> Vec<String> {
         .iter()
         .filter(|task| matches!(task.state, TaskState::Done))
     {
-        counts.entry(profile_for_task(task.id)).or_default().1 += 1;
+        counts
+            .entry(runtime_profile_for_task(state, task.id))
+            .or_default()
+            .1 += 1;
     }
 
     counts

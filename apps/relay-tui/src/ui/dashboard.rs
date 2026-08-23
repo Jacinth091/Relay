@@ -8,7 +8,9 @@ use relay_core::{SchedulerTaskStatus, TaskState};
 
 use crate::state::AppState;
 use crate::theme::{Theme, marker_waiting};
-use crate::util::{distribution_rows, escalated_tasks};
+use crate::util::{
+    distribution_rows, escalated_tasks, provider_label_for_profile, runtime_profile_for_task,
+};
 
 /// Dashboard as calm bordered panels. Wide terminals show all three side by
 /// side; narrow terminals stack them in priority order: escalations, then
@@ -159,6 +161,88 @@ fn render_distribution_panel(frame: &mut Frame, rows: &[String], area: Rect, the
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
+/// Handoff tasks that are approved and waiting to run, in scheduler order.
+fn pending_handoffs(state: &AppState) -> Vec<&relay_core::SchedulerTaskSnapshot> {
+    state
+        .scheduler_snapshot
+        .tasks
+        .iter()
+        .filter(|snapshot| {
+            matches!(
+                snapshot.status,
+                SchedulerTaskStatus::QueuedReady
+                    | SchedulerTaskStatus::QueuedGlobal
+                    | SchedulerTaskStatus::QueuedProject
+            )
+        })
+        .collect()
+}
+
+/// Executions currently occupying a concurrency slot (running or paused for a
+/// permission decision).
+fn slot_occupancy(state: &AppState) -> impl Iterator<Item = &relay_core::SchedulerTaskSnapshot> {
+    state.scheduler_snapshot.tasks.iter().filter(|snapshot| {
+        matches!(
+            snapshot.status,
+            SchedulerTaskStatus::Running | SchedulerTaskStatus::WaitingPermission
+        )
+    })
+}
+
+/// Deterministic queue projection: what Relay will do next. Purely derived
+/// from the scheduler snapshot, durable tasks, and execution limits.
+fn queue_projection_lines(state: &AppState, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let pending = pending_handoffs(state);
+    if pending.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    for snapshot in pending.iter().take(3) {
+        let title = state
+            .durable_tasks
+            .iter()
+            .find(|task| task.id == snapshot.task_id)
+            .map(|task| task.handoff.title.as_str())
+            .unwrap_or("handoff task");
+        let provider =
+            provider_label_for_profile(&runtime_profile_for_task(state, snapshot.task_id));
+        lines.push(Line::from(vec![
+            Span::styled("next: ", theme.muted()),
+            Span::styled(truncate(title, width.saturating_sub(18)), theme.text()),
+            Span::styled(format!(" -> {provider}"), theme.muted()),
+        ]));
+    }
+
+    let limits_max = state.execution_limits.max_parallel;
+    let global_active = slot_occupancy(state).count();
+    if global_active >= limits_max {
+        lines.push(Line::from(Span::styled(
+            format!("waiting for execution slot ({global_active}/{limits_max} active)"),
+            theme.muted(),
+        )));
+        return lines;
+    }
+
+    // Global slots remain; the head of the queue may still be blocked by its
+    // project's own concurrency cap.
+    let head_project = &pending[0].project_key;
+    let per_project_max = state.execution_limits.per_project_max_parallel;
+    let project_active = slot_occupancy(state)
+        .filter(|snapshot| &snapshot.project_key == head_project)
+        .count();
+    if project_active >= per_project_max {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "waiting for project slot on {} ({project_active}/{per_project_max} active)",
+                head_project.as_str(),
+            ),
+            theme.muted(),
+        )));
+    }
+    lines
+}
+
 fn render_active_panel(
     frame: &mut Frame,
     state: &AppState,
@@ -232,6 +316,8 @@ fn render_active_panel(
             theme.muted(),
         )));
     }
+
+    lines.extend(queue_projection_lines(state, width, theme));
 
     for task in escalations {
         let id = task.id.to_string();

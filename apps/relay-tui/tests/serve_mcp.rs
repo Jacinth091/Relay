@@ -427,6 +427,87 @@ fn wire_error_cases_return_structured_errors_and_server_survives() {
     assert_eq!(tasks[0].id.to_string(), task_id_text);
 }
 
+/// One modern-era request line: required `_meta` protocol version attached.
+fn modern_request(id: i64, method: &str, extra_params: serde_json::Value) -> String {
+    let mut params = serde_json::json!({
+        "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28" }
+    });
+    if let (Some(object), Some(extra)) = (params.as_object_mut(), extra_params.as_object()) {
+        for (key, value) in extra {
+            object.insert(key.clone(), value.clone());
+        }
+    }
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params,
+    })
+    .to_string()
+}
+
+#[test]
+fn modern_stateless_session_discovers_and_submits_without_any_handshake() {
+    let (config_path, database_path) = make_isolated_paths("conformance-modern");
+    let mut server = spawn_interactive(&config_path, &database_path);
+
+    // server/discover first — the stdio backward-compatibility probe.
+    server.send_line(&modern_request(1, "server/discover", serde_json::json!({})));
+    let discover = server.next_response("server/discover");
+    assert_eq!(discover["id"], 1);
+    let versions = discover["result"]["supportedVersions"]
+        .as_array()
+        .expect("discover result lists supportedVersions");
+    assert_eq!(versions[0], "2026-07-28");
+    assert!(
+        versions.iter().any(|version| version == "2025-11-25"),
+        "legacy baseline must be advertised for downgrade clients"
+    );
+    assert_eq!(
+        discover["result"]["capabilities"]["tools"],
+        serde_json::json!({})
+    );
+    assert_eq!(
+        discover["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "relay"
+    );
+
+    // tools/list statelessly, with no initialize exchange whatsoever.
+    server.send_line(&modern_request(2, "tools/list", serde_json::json!({})));
+    let listing = server.next_response("modern tools/list");
+    assert_eq!(listing["result"]["resultType"], "complete");
+    assert_eq!(listing["result"]["tools"][0]["name"], "submit_handoff");
+
+    // Submit the conformance task through the modern path.
+    let modern_call = modern_request(
+        3,
+        "tools/call",
+        serde_json::json!({
+            "name": "submit_handoff",
+            "arguments": serde_json::from_str::<serde_json::Value>(CONFORMANCE_TASK_JSON)
+                .expect("conformance task is valid JSON"),
+        }),
+    );
+    server.send_line(&modern_call);
+    let response = server.next_response("modern tools/call submit_handoff");
+    assert_eq!(response["result"]["resultType"], "complete");
+    assert_eq!(response["result"]["isError"], false);
+    let structured = &response["result"]["structuredContent"];
+    let task_id_text = structured["task_id"].as_str().expect("task_id present");
+    assert_eq!(structured["state"], "Ready");
+
+    server.shutdown_expect_exit_zero("modern session");
+
+    // Durability proof identical to the legacy path.
+    let store =
+        block_on_store(relay_core::SqliteStore::open(&database_path)).expect("reopen database");
+    let tasks = block_on_store(relay_core::list_stored_tasks(&store)).expect("list stored tasks");
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].state, relay_core::TaskState::Ready);
+    assert_eq!(tasks[0].submission_transport.as_str(), "relay-mcp");
+    assert_eq!(tasks[0].id.to_string(), task_id_text);
+}
+
 #[test]
 fn lifecycle_two_sequential_sessions_share_one_database() {
     let (config_path, database_path) = make_isolated_paths("conformance-lifecycle");

@@ -2,9 +2,9 @@
 //!
 //! This layer is deliberately blind to the protocol era: both modern
 //! stateless requests and legacy handshake-era requests converge here, so
-//! there is exactly ONE Relay submission implementation (handoff Â§5.1).
-//! It owns the tool catalog, the `submit_handoff` pipeline (size cap â†’
-//! ingress preview â†’ durable persistence), and the stable error-code
+//! there is exactly ONE Relay submission implementation (handoff §5.1).
+//! It owns the tool catalog, the `submit_handoff` pipeline (size cap →
+//! ingress preview → durable persistence), and the stable error-code
 //! mapping tables.
 //!
 //! Structural guard: this module depends on NO execution or scheduler
@@ -104,7 +104,7 @@ struct ToolCallParams<'a> {
 
 /// Runs one `submit_handoff` call end to end against the given raw
 /// `tools/call` params JSON. Returns the Relay-owned task id on durable
-/// success, or a final `(error code, message)` pair â€” every failure branch
+/// success, or a final `(error code, message)` pair — every failure branch
 /// leaves nothing persisted.
 pub(crate) async fn execute_submit_handoff(
     relay: &mut Relay,

@@ -509,6 +509,36 @@ fn modern_stateless_session_discovers_and_submits_without_any_handshake() {
 }
 
 #[test]
+fn oversized_frame_is_rejected_without_breaking_framing() {
+    // The cap lives in the read loop (MAX_FRAME_BYTES = 2 * 512 KiB payload
+    // cap + envelope headroom), so an over-limit line must produce exactly
+    // one structured error and leave the stream aligned for the next message.
+    const INVALID_REQUEST: i64 = -32600;
+
+    let (config_path, database_path) = make_isolated_paths("conformance-frame-cap");
+    let mut server = spawn_interactive(&config_path, &database_path);
+
+    initialize_handshake(&mut server, "2025-06-18", 1);
+
+    let padding = "x".repeat(1_200_000);
+    server.send_line(&format!(r#"{{"j":"{padding}"}}"#));
+    let error_response = server.next_response("oversized frame");
+    assert_eq!(error_response["error"]["code"], INVALID_REQUEST);
+
+    // Framing survived the drain: a normal request still round-trips.
+    let (task_id_text, state) = submit_valid_task_over_the_wire(&mut server, 20);
+    assert_eq!(state, "Ready");
+
+    server.shutdown_expect_exit_zero("frame cap");
+
+    let store =
+        block_on_store(relay_core::SqliteStore::open(&database_path)).expect("reopen database");
+    let tasks = block_on_store(relay_core::list_stored_tasks(&store)).expect("list stored tasks");
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].id.to_string(), task_id_text);
+}
+
+#[test]
 fn lifecycle_two_sequential_sessions_share_one_database() {
     let (config_path, database_path) = make_isolated_paths("conformance-lifecycle");
     let first_config = config_path.clone();

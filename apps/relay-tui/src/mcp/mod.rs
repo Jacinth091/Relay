@@ -495,11 +495,10 @@ where
             let available = reader.fill_buf().await?;
             if available.is_empty() {
                 // EOF: an unterminated final frame is still delivered if it
-                // has content; otherwise the session is over.
+                // has content. It can never be over cap here: the Trip path
+                // never extends `frame`, so frame.len() <= cap always holds.
                 return Ok(if frame.is_empty() {
                     CappedLine::Eof
-                } else if frame.len() > cap {
-                    CappedLine::TooLarge(frame.len())
                 } else {
                     CappedLine::Line(String::from_utf8_lossy(&frame).into_owned())
                 });

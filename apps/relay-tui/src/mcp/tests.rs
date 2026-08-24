@@ -293,12 +293,13 @@ async fn missing_jsonrpc_member_is_rejected_structured_and_server_survives() {
         );
     }
 
-    // Notifications are held to the same strictness.
+    // A notification without jsonrpc is dropped silently — JSON-RPC forbids
+    // replying to notifications, malformed or not (see the dedicated test).
     assert!(
         exchange(&mut server, r#"{"method":"notifications/initialized"}"#)
             .await
-            .is_some(),
-        "a notification without jsonrpc must still be rejected"
+            .is_none(),
+        "a malformed notification must never be answered"
     );
 
     assert_still_responsive(&mut server).await;
@@ -452,6 +453,64 @@ async fn initialized_notification_advances_lifecycle_state_silently() {
         .await
         .is_none()
     );
+}
+
+#[tokio::test]
+async fn ping_answers_empty_result_in_both_eras() {
+    let mut server = test_server().await;
+
+    // Legacy era.
+    let response = exchange(&mut server, r#"{"jsonrpc":"2.0","id":50,"method":"ping"}"#)
+        .await
+        .unwrap();
+    assert_eq!(response["result"], json!({}));
+
+    // Modern era.
+    let response = exchange(&mut server, &modern_line(51, "ping", ""))
+        .await
+        .unwrap();
+    assert_eq!(response["result"], json!({}));
+}
+
+#[tokio::test]
+async fn malformed_notifications_never_receive_a_reply() {
+    let mut server = test_server().await;
+
+    // A notification (no id member) with a missing jsonrpc member must be
+    // dropped silently: replying to notifications is forbidden, and replying
+    // to a garbage stream would generate unbounded outbound traffic.
+    for raw in [
+        r#"{"method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"1.0","method":"notifications/whatever"}"#,
+    ] {
+        assert!(
+            exchange(&mut server, raw).await.is_none(),
+            "notification must not be answered: {raw}"
+        );
+    }
+
+    // The session remains fully usable afterwards.
+    assert_still_responsive(&mut server).await;
+}
+
+#[tokio::test]
+async fn explicit_null_request_id_is_answered_as_invalid_request() {
+    let mut server = test_server().await;
+
+    let response = exchange(
+        &mut server,
+        r#"{"jsonrpc":"2.0","id":null,"method":"tools/list"}"#,
+    )
+    .await
+    .unwrap();
+    // JSON-RPC 2.0 reserves null ids for error responses; a request carrying
+    // one is invalid and answered with id null — never silently dropped as a
+    // notification.
+    assert!(response.get("error").is_some());
+    assert_eq!(response["error"]["code"], protocol::INVALID_REQUEST);
+    assert!(response["id"].is_null());
+
+    assert_still_responsive(&mut server).await;
 }
 
 #[tokio::test]

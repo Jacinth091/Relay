@@ -32,21 +32,26 @@ The wire format stays byte-compatible. HandoffTask v1 structurally accepts an `e
    - Each fan-out leg becomes a sibling *execution record* with a Relay-generated child identifier, persisted in `relay-store` with a `parent_task_id` column referencing the canonical task. Siblings are executions, not tasks: they do not appear as independent entries in task listing, review, or ingress.
    - The parent task's durable `TaskState` becomes a deterministic rollup of sibling outcomes (rule in requirement 5). Per-sibling outcome detail lives in execution records/reports.
 2. **Per-sibling plan derivation reuses `plan_execution`.** Each sibling gets its own `ExecutionRunPolicy` produced by calling `plan_execution` once per requested profile with the same approved task, same project, same permission envelope rules. Cross-provider model leakage rejection already prevents one provider's model from traveling to another sibling. If any sibling's plan fails validation, the entire fan-out fails closed before anything starts; partial fan-outs are never launched.
-3. **Slot accounting.** Every sibling consumes global and per-project slots exactly like a standalone execution. No sibling bypasses `ExecutionLimits`; no new slot class ships in M10 (per ADR-0018 consequences, provider-scoped limits remain additive-later). Consequence stated plainly: with default limits (`max_parallel = 2`, `per_project_max_parallel = 1`), a two-way fan-out runs one sibling immediately and queues the other. Operators who want simultaneous comparison must raise limits explicitly. Document this in the Run approval copy.
-4. **Cancellation semantics.** Cancelling the parent task cancels all siblings deterministically: the scheduler fans cancellation to every live sibling token and records each cancelled sibling individually. Cancelling one sibling alone is permitted for operators (it is just an execution), but does not change the parent rollup rule below. Queued-but-unstarted siblings cancel cleanly like queued executions do today.
-5. **Sibling disagreement handling (deterministic, no verdict invention).**
+3. **Slot accounting.** Every sibling consumes global and per-project slots exactly like a standalone execution. No sibling bypasses `ExecutionLimits`; no new slot class ships in M10 (per ADR-0018 consequences, provider-scoped limits remain additive-later). Consequence stated plainly: with default limits (`max_parallel = 2`, `per_project_max_parallel = 1`), a two-way fan-out runs one sibling immediately and queues the other.
+4. **Isolated candidate workspaces are a HARD prerequisite for overlapping siblings.** Two runtime executions against the SAME Git checkout produce invalid or nondeterministic results: serialized siblings contaminate each other (the second starts from the first's candidate changes), and concurrent siblings corrupt each other's writes — both violate repository isolation and deterministic governance. Therefore:
+   - While `per_project_max_parallel` serializes siblings of one task (the M10 default), siblings execute sequentially against the registered checkout exactly as standalone runs do today. Sequential fan-out does NOT require new workspace machinery.
+   - Any configuration that allows two siblings of the same parent to run OVERLAPPING in time MUST first give each sibling its own candidate workspace derived from an immutable base revision (git worktrees are the leading candidate; validate the isolation implementation before relying on it). Until that isolation layer exists and is tested, raising limits must NOT be presented as a way to "compare providers simultaneously" — Run approval copy must not promise simultaneous comparison.
+   - This prerequisite also serves later WorkGraph workers, verifier/repair loops, and merge/integration nodes.
+5. **Cancellation semantics.** Cancelling the parent task cancels all siblings deterministically: the scheduler fans cancellation to every live sibling token and records each cancelled sibling individually. Cancelling one sibling alone is permitted for operators (it is just an execution), but does not change the parent rollup rule below. Queued-but-unstarted siblings cancel cleanly like queued executions do today.
+6. **Sibling disagreement handling (deterministic, no verdict invention).**
    - All siblings DONE -> parent DONE.
    - Any sibling escalates (NEEDS_CLARIFICATION / NEEDS_DECISION) -> parent takes that escalation state; the packet names the offending sibling(s).
    - Mixed DONE/FAILED with no escalation -> parent NEEDS_DECISION, because choosing which output survives is a material decision a human owns (invariant 5). The packet lists per-sibling outcomes.
    - All FAILED -> parent FAILED.
    - Repair remains bounded per sibling exactly as today; repair bounds do not multiply across siblings beyond each policy's clamped values.
-6. **Tests:** fake-runtime fan-out of N=2 and N=3; fail-closed when one sibling profile cannot be planned; slot serialization under default limits; parent-cancel cancels running and queued siblings; every rollup branch in requirement 5.
+7. **Tests:** fake-runtime fan-out of N=2 and N=3; fail-closed when one sibling profile cannot be planned; slot serialization under default limits; parent-cancel cancels running and queued siblings; every rollup branch in requirement 6; a test proving overlapping same-checkout siblings cannot be scheduled while the isolation prerequisite is unmet.
 
 ## Boundaries
 
 - Presentation may display sibling rows but owns no fan-out policy.
 - No aggregation logic in this phase; reports remain per-execution until phase 03.
 - Scheduler changes stay additive to frozen M6 semantics.
+- No same-worktree provider comparison: overlapping siblings without isolated candidate workspaces fail closed rather than sharing a checkout.
 
 ## Done when
 

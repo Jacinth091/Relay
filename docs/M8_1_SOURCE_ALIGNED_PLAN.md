@@ -79,7 +79,7 @@ relay-knowledge/
   30-REVIEW/M8-REVIEW.md
 
 Relay/
-  docs/adr/0009-multi-runtime-orchestration.md
+  docs/adr/0019-multi-runtime-orchestration.md
   docs/RUNTIME_ORCHESTRATION_CONTEXT.md
 
   crates/relay-core/src/execution.rs

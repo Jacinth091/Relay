@@ -156,6 +156,9 @@ Optional, not promises:
 - remote Relay node;
 - team task sources;
 - richer source-control workflows;
-- optional autonomous planning stacks.
+- optional autonomous planning stacks — meaning external planner/runtime
+  integrations consumed by Relay as clients (ADR-0014). This does NOT mean
+  Relay Core embeds autonomous planning or strategy generation; that would
+  conflict with ADR-0017 and require a new architectural decision.
 
 Autonomous planning may be added as an option, but must not replace human-directed planning as Relay's default philosophy.

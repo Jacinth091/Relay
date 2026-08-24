@@ -583,6 +583,33 @@ pub(crate) async fn handle_key(
             _ => Ok(false),
         },
         Screen::Doctor => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.select_previous_doctor_check();
+                Ok(false)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.select_next_doctor_check();
+                Ok(false)
+            }
+            // Provider rows re-probe only that provider; git/config/sqlite
+            // are probed together, so they re-run the full refresh.
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                state.recheck_doctor_selection();
+                Ok(false)
+            }
+            // Fix-it action: provider rows open their runtime detail screen;
+            // local-state rows surface remediation guidance.
+            KeyCode::Enter => {
+                state.doctor_primary_action();
+                Ok(false)
+            }
+            KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('D') => {
+                state.screen = Screen::Dashboard;
+                Ok(false)
+            }
+            _ => Ok(false),
+        },
+        Screen::Updates => match key.code {
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 state.begin_health_refresh(true);
                 Ok(false)
@@ -604,12 +631,13 @@ pub(crate) async fn handle_key(
                     }
                     Ok(false)
                 }
-                // Browse mode: select a field, then start editing it.
-                KeyCode::Up if !editing => {
+                // Browse mode: move across every section's rows. Edit entry
+                // is a no-op on read-only rows (policy/storage/runtime).
+                KeyCode::Up | KeyCode::Char('k') if !editing => {
                     state.settings_form.select_previous();
                     Ok(false)
                 }
-                KeyCode::Down if !editing => {
+                KeyCode::Down | KeyCode::Char('j') if !editing => {
                     state.settings_form.select_next();
                     Ok(false)
                 }
@@ -784,5 +812,6 @@ pub(crate) fn command_mode_available(screen: Screen) -> bool {
             | Screen::Logs
             | Screen::Settings
             | Screen::Doctor
+            | Screen::Updates
     )
 }

@@ -29,6 +29,10 @@ pub(crate) async fn execute_relay_command(
             state.screen = Screen::Doctor;
             state.begin_health_refresh(true);
         }
+        RelayCommand::Updates => {
+            state.screen = Screen::Updates;
+            state.begin_health_refresh(true);
+        }
         RelayCommand::Help => {
             state.screen = Screen::Dashboard;
             state.feedback = command::COMMANDS.join("\n");

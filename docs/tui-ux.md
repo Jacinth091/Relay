@@ -114,7 +114,7 @@ Settings is an interactive, validated form (`ui/runtime.rs`; form logic in `stat
 ### Sections shown
 
 - **Execution** — the four editable fields: `Max parallel`, `Per-project max parallel`, `Max repair attempts`, `Max duration (minutes)`.
-- **Safety** — read-only invariants: explicit Run approval On, automatic commit Off, automatic push Off.
+- **Safety** — locked invariants: explicit Run approval On, automatic commit Off, automatic push Off. These rows render a `[locked]` tag (warning color) and use `#` as their cursor marker; they are browsable and explained via inline hints but never enter edit mode. This is deliberate: explicit local Run approval and never-auto-push are product invariants 13/14, not user preferences.
 - **Storage** — config file path and SQLite database path.
 - **Runtime** — active provider, profile, and health status.
 - A reserved status line at the panel bottom shows an inline validation error (error color), a muted `Saved.`, or nothing.
@@ -158,7 +158,8 @@ On successful save the value is written to the runtime settings TOML file **and*
 | Runtimes | Provider list with health markers and profiles | `/runtimes` |
 | Runtime Detail | Provider detail, model/reasoning selectors, test runtime | `/runtime <provider>` plus `use`, `model`, `reasoning`, `test` subcommands |
 | Settings | Interactive execution-limit form (§5) | `/settings` |
-| Doctor | System diagnostics: git health, config writability, SQLite, Codex CLI detail (executable, version, auth), Antigravity status; also reports Relay Direct / MCP (`relay serve-mcp`) as implemented | `/doctor` |
+| Doctor | System diagnostics: git health, config writability, SQLite, Codex CLI detail (executable, version, auth), Antigravity status; also reports Relay Direct / MCP (`relay serve-mcp`) as implemented. Enter on a provider row opens that runtime's detail screen; Enter on a git/config/sqlite row surfaces remediation guidance in the feedback line | `/doctor` |
+| Updates | Installed component versions (Relay itself, Codex CLI, Antigravity CLI, Git) from local probes only — Relay never phones home — plus update guidance per component; `r` re-runs the probes | `/updates` |
 
 Global keys: Ctrl+C quits from anywhere; Esc navigates back per screen; `/` opens command mode on most screens.
 

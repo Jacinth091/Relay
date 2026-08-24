@@ -7,7 +7,9 @@ pub(crate) mod tasks;
 pub(crate) use dashboard::render_dashboard;
 pub(crate) use execution::{render_diff, render_execution, render_logs, render_result};
 pub(crate) use projects::{render_add_project, render_projects};
-pub(crate) use runtime::{render_doctor, render_runtime_detail, render_runtimes, render_settings};
+pub(crate) use runtime::{
+    render_doctor, render_runtime_detail, render_runtimes, render_settings, render_updates,
+};
 pub(crate) use tasks::{
     render_import_file, render_new_task, render_paste_task, render_task_preview,
     render_task_review, render_tasks,
@@ -24,7 +26,7 @@ use relay_runtime_antigravity::AntigravityRuntimeHealth;
 use relay_runtime_codex::CodexRuntimeHealth;
 
 use crate::input::command_mode_available;
-use crate::state::{AppState, Screen};
+use crate::state::{AppState, DOCTOR_CHECKS, Screen};
 use crate::theme::*;
 use relay_core::TaskState;
 
@@ -59,6 +61,7 @@ pub(crate) fn render(frame: &mut Frame, state: &AppState) {
         Screen::Logs => render_logs(frame, state, areas[1]),
         Screen::Settings => render_settings(frame, state, areas[1]),
         Screen::Doctor => render_doctor(frame, state, areas[1]),
+        Screen::Updates => render_updates(frame, state, areas[1]),
     }
 
     render_prompt_line(frame, state, areas[2]);
@@ -88,6 +91,7 @@ fn screen_title(screen: Screen) -> &'static str {
         Screen::Logs => "logs",
         Screen::Settings => "settings",
         Screen::Doctor => "doctor",
+        Screen::Updates => "updates",
     }
 }
 
@@ -216,7 +220,13 @@ pub(crate) fn key_hints(state: &AppState) -> Vec<(String, String)> {
             ("r", "re-check"),
             ("esc", "dashboard"),
         ],
-        Screen::Doctor => vec![("r", "re-check"), ("esc", "dashboard")],
+        Screen::Doctor => vec![
+            ("↑/↓ j/k", "select"),
+            ("enter", doctor_enter_label(state)),
+            ("r", doctor_recheck_label(state)),
+            ("esc", "dashboard"),
+        ],
+        Screen::Updates => vec![("r", "refresh versions"), ("esc", "dashboard")],
         Screen::Settings => {
             if state.settings_form.editing {
                 vec![
@@ -226,7 +236,7 @@ pub(crate) fn key_hints(state: &AppState) -> Vec<(String, String)> {
                 ]
             } else {
                 vec![
-                    ("up/down", "select"),
+                    ("↑/↓ j/k", "select"),
                     ("enter/←→", "edit"),
                     ("0-9", "set value"),
                     ("r", "re-check"),
@@ -255,6 +265,34 @@ pub(crate) fn key_hints(state: &AppState) -> Vec<(String, String)> {
         hints.push(("/".to_owned(), "commands".to_owned()));
     }
     hints
+}
+
+/// Mirrors `AppState::recheck_doctor_selection`: provider rows have targeted
+/// re-probes, everything else re-runs the full diagnostics refresh.
+fn doctor_recheck_label(state: &AppState) -> &'static str {
+    let selected = DOCTOR_CHECKS
+        .get(state.doctor_selected_index)
+        .copied()
+        .unwrap_or("git");
+    if matches!(selected, "codex" | "antigravity") {
+        "re-check"
+    } else {
+        "re-check all"
+    }
+}
+
+/// Mirrors `AppState::doctor_primary_action`: provider rows navigate to their
+/// runtime detail screen; local-state rows surface remediation guidance.
+fn doctor_enter_label(state: &AppState) -> &'static str {
+    let selected = DOCTOR_CHECKS
+        .get(state.doctor_selected_index)
+        .copied()
+        .unwrap_or("git");
+    if matches!(selected, "codex" | "antigravity") {
+        "open runtime"
+    } else {
+        "fix / details"
+    }
 }
 
 /// Mirrors the `Screen::TaskReview` arms in `input.rs`, including submenu state.

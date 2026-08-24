@@ -265,6 +265,8 @@ pub(crate) struct AppState {
     pub(crate) runtime_detail_submenu: Option<RuntimeDetailSubmenu>,
     /// Selected row on the Runtimes screen (index into `RUNTIME_PROVIDERS`).
     pub(crate) runtimes_list_index: usize,
+    /// Selected row on the Doctor screen (index into `DOCTOR_CHECKS`).
+    pub(crate) doctor_selected_index: usize,
     pub(crate) task_review_menu_index: usize,
     pub(crate) task_review_submenu: Option<TaskReviewSubmenu>,
     pub(crate) cached_codex_account: Option<String>,
@@ -326,11 +328,61 @@ pub(crate) enum ToolHealth {
     Unavailable(String),
 }
 
-pub(crate) fn git_health_marker(health: &ToolHealth) -> &'static str {
-    match health {
-        ToolHealth::Checking => "… Git — checking",
-        ToolHealth::Available(_) => "✓ Git",
-        ToolHealth::Unavailable(_) => "× Git",
+/// Outcome of a single Doctor diagnostic row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DoctorCheckStatus {
+    Pending,
+    Ok(String),
+    Failed(String),
+}
+
+/// Doctor checks in selectable display order. `codex` and `antigravity` have
+/// targeted re-probes (`begin_provider_health_refresh`); the others are probed
+/// together with the full diagnostics refresh.
+pub(crate) const DOCTOR_CHECKS: [&str; 5] = ["git", "config", "sqlite", "codex", "antigravity"];
+
+/// Fix-it guidance shown when the user presses Enter on a local-state Doctor
+/// row (git / config / sqlite). Provider rows navigate instead of using this.
+fn doctor_remediation_hint(check: &str, state: &AppState) -> String {
+    match check {
+        "git" => match &state.git_health {
+            ToolHealth::Available(version) => {
+                format!("Git is healthy ({version}). Nothing to fix.")
+            }
+            ToolHealth::Unavailable(error) => format!(
+                "Git is unavailable: {error}. Install Git and make sure 'git' is on PATH, \
+then press r to re-check."
+            ),
+            ToolHealth::Checking => {
+                "Git probe still running; press r to re-check in a moment.".to_owned()
+            }
+        },
+        "config" => {
+            let path = state.config_path.display().to_string();
+            if state.registry_writable {
+                format!(
+                    "Config loaded from {path}. Edit it with a text editor; restart Relay to apply."
+                )
+            } else {
+                format!(
+                    "Config at {path} could not be loaded or written. Check the file for parse \
+errors or permission problems, fix it externally, then press r to re-check."
+                )
+            }
+        }
+        "sqlite" => {
+            let path = state.database_path.display().to_string();
+            if state.store.is_some() {
+                format!("Local state database opened from {path}. Nothing to fix.")
+            } else {
+                format!(
+                    "Local state database at {path} could not be opened. Check disk space and \
+file permissions, then press r to re-check. Relay fails closed without durable state."
+                )
+            }
+        }
+        _ => "Select a row and press Enter for guidance; provider rows open their runtime screen."
+            .to_owned(),
     }
 }
 
@@ -370,6 +422,108 @@ impl AppState {
             true,
             Some(provider),
         )));
+    }
+
+    /// Status of one Doctor check row, derived from already-probed state.
+    pub(crate) fn doctor_check_status(&self, check: &str) -> DoctorCheckStatus {
+        match check {
+            "git" => match &self.git_health {
+                ToolHealth::Checking => DoctorCheckStatus::Pending,
+                ToolHealth::Available(version) => DoctorCheckStatus::Ok(version.clone()),
+                ToolHealth::Unavailable(error) => DoctorCheckStatus::Failed(error.clone()),
+            },
+            "config" => {
+                let path = self.config_path.display().to_string();
+                if self.registry_writable {
+                    DoctorCheckStatus::Ok(path)
+                } else {
+                    DoctorCheckStatus::Failed(path)
+                }
+            }
+            "sqlite" => {
+                let path = self.database_path.display().to_string();
+                if self.store.is_some() {
+                    DoctorCheckStatus::Ok(path)
+                } else {
+                    DoctorCheckStatus::Failed(path)
+                }
+            }
+            "codex" => match &self.runtime_health {
+                CodexRuntimeHealth::Checking => DoctorCheckStatus::Pending,
+                CodexRuntimeHealth::Available { version, .. } => {
+                    DoctorCheckStatus::Ok(version.clone())
+                }
+                CodexRuntimeHealth::NotAuthenticated { .. } => {
+                    DoctorCheckStatus::Failed("authentication unavailable".to_owned())
+                }
+                CodexRuntimeHealth::Incompatible { reason, .. } => {
+                    DoctorCheckStatus::Failed(reason.clone())
+                }
+                CodexRuntimeHealth::NotInstalled { error }
+                | CodexRuntimeHealth::DiscoveryFailed { error } => {
+                    DoctorCheckStatus::Failed(error.clone())
+                }
+            },
+            "antigravity" => {
+                if matches!(self.antigravity_health, AntigravityRuntimeHealth::Checking) {
+                    DoctorCheckStatus::Pending
+                } else if self.antigravity_health.is_ready() {
+                    DoctorCheckStatus::Ok(self.antigravity_health.display_status().to_owned())
+                } else {
+                    DoctorCheckStatus::Failed(self.antigravity_health.display_status().to_owned())
+                }
+            }
+            _ => DoctorCheckStatus::Pending,
+        }
+    }
+
+    pub(crate) fn select_next_doctor_check(&mut self) {
+        self.doctor_selected_index = (self.doctor_selected_index + 1) % DOCTOR_CHECKS.len();
+    }
+
+    pub(crate) fn select_previous_doctor_check(&mut self) {
+        self.doctor_selected_index =
+            (self.doctor_selected_index + DOCTOR_CHECKS.len() - 1) % DOCTOR_CHECKS.len();
+    }
+
+    /// Re-runs the selected check. Provider rows use their targeted
+    /// re-probe; git/config/sqlite are probed together at startup, so those
+    /// rows re-run the full diagnostics refresh.
+    pub(crate) fn recheck_doctor_selection(&mut self) {
+        let check = DOCTOR_CHECKS
+            .get(self.doctor_selected_index)
+            .copied()
+            .unwrap_or("git");
+        match check {
+            "codex" | "antigravity" => {
+                if check == "codex" {
+                    self.runtime_health = CodexRuntimeHealth::Checking;
+                } else {
+                    self.antigravity_health = AntigravityRuntimeHealth::Checking;
+                }
+                self.begin_provider_health_refresh(check.to_owned());
+            }
+            _ => self.begin_health_refresh(true),
+        }
+    }
+
+    /// Runs the primary fix-it action for the selected Doctor row. Provider
+    /// rows jump straight to that runtime's detail screen, where profile,
+    /// model, and executable overrides live; local-state rows surface
+    /// remediation guidance in the feedback line instead of navigating.
+    pub(crate) fn doctor_primary_action(&mut self) {
+        let check = DOCTOR_CHECKS
+            .get(self.doctor_selected_index)
+            .copied()
+            .unwrap_or("git");
+        match check {
+            "codex" | "antigravity" => {
+                self.runtime_detail_provider = Some(check.to_owned());
+                self.screen = Screen::RuntimeDetail;
+                self.begin_health_refresh(true);
+            }
+            _ => self.feedback = doctor_remediation_hint(check, self),
+        }
     }
 
     pub(crate) async fn poll_health_refresh(&mut self) {
@@ -479,6 +633,7 @@ impl AppState {
         let antigravity_available = matches!(
             self.antigravity_health,
             AntigravityRuntimeHealth::Available { .. }
+                | AntigravityRuntimeHealth::AuthUnverifiable { .. }
         );
         let providers = vec![
             command_completion::ProviderCompletion {
@@ -868,6 +1023,7 @@ impl AppState {
             runtime_detail_menu_index: 0,
             runtime_detail_submenu: None,
             runtimes_list_index: 0,
+            doctor_selected_index: 0,
             task_review_menu_index: 0,
             task_review_submenu: None,
             cached_codex_account: None,
@@ -902,16 +1058,17 @@ impl AppState {
                 | Screen::Projects
                 | Screen::NewTask
                 | Screen::Runtimes
-                | Screen::RuntimeDetail => events::InputContext::Selection,
+                | Screen::RuntimeDetail
+                | Screen::Settings
+                | Screen::Doctor => events::InputContext::Selection,
                 Screen::TaskReview => events::InputContext::Confirmation,
                 Screen::Dashboard
                 | Screen::TaskPreview
                 | Screen::Execution
                 | Screen::Result
                 | Screen::Diff
-                | Screen::Logs
-                | Screen::Settings
-                | Screen::Doctor => events::InputContext::PassiveView,
+                | Screen::Logs => events::InputContext::PassiveView,
+                Screen::Updates => events::InputContext::PassiveView,
             }
         }
     }
@@ -1019,6 +1176,7 @@ impl AppState {
             "antigravity" => matches!(
                 self.antigravity_health,
                 AntigravityRuntimeHealth::Available { .. }
+                    | AntigravityRuntimeHealth::AuthUnverifiable { .. }
             ),
             _ => false,
         };
@@ -1380,10 +1538,13 @@ impl AppState {
         }
     }
 
-    /// Starts editing the selected field. `initial_digit` seeds the buffer when
-    /// the user starts editing by typing a digit directly.
+    /// Starts editing the selected field. Read-only rows (safety policy,
+    /// storage, runtime status) never enter edit mode. `initial_digit` seeds
+    /// the buffer when the user starts editing by typing a digit directly.
     pub(crate) fn begin_settings_edit(&mut self, initial_digit: Option<char>) {
-        let field = self.settings_form.selected;
+        let Some(field) = self.settings_form.selected.editable_field() else {
+            return;
+        };
         self.settings_form.editing = true;
         self.settings_form.error = None;
         self.settings_form.saved = false;
@@ -1403,7 +1564,9 @@ impl AppState {
     /// relay-core's execution-limit rules, persists through the runtime
     /// settings TOML path, and only then adopts the new value in memory.
     pub(crate) fn commit_settings_edit(&mut self) {
-        let field = self.settings_form.selected;
+        let Some(field) = self.settings_form.selected.editable_field() else {
+            return;
+        };
         let raw = self.settings_form.buffer.trim().to_owned();
         let value = match raw.parse::<u64>() {
             Ok(value) if value > 0 => value,
@@ -2033,24 +2196,17 @@ pub(crate) enum Screen {
     Logs,
     Settings,
     Doctor,
+    Updates,
 }
 
-/// Editable rows of the Settings form, in display order.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Editable rows of the Settings form, in display order within EXECUTION.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettingsField {
-    #[default]
     MaxParallel,
     PerProjectMaxParallel,
     MaxRepairAttempts,
     MaxDurationMinutes,
 }
-
-pub(crate) const SETTINGS_FIELDS: [SettingsField; 4] = [
-    SettingsField::MaxParallel,
-    SettingsField::PerProjectMaxParallel,
-    SettingsField::MaxRepairAttempts,
-    SettingsField::MaxDurationMinutes,
-];
 
 impl SettingsField {
     pub(crate) fn label(self) -> &'static str {
@@ -2061,16 +2217,111 @@ impl SettingsField {
             Self::MaxDurationMinutes => "Maximum execution (minutes)",
         }
     }
+}
 
-    fn next(self) -> Self {
-        let index = SETTINGS_FIELDS.iter().position(|f| *f == self).unwrap_or(0);
-        SETTINGS_FIELDS[(index + 1) % SETTINGS_FIELDS.len()]
+/// Every selectable row of the Settings screen, in display order across all
+/// sections (EXECUTION / SAFETY / STORAGE / RUNTIME). Read-only policy and
+/// storage rows are browsable but never enter edit mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingsRow {
+    Execution(SettingsField),
+    PolicyApproval,
+    PolicyCommit,
+    PolicyPush,
+    StorageConfigPath,
+    StorageSqlitePath,
+    RuntimeStatus,
+}
+
+pub(crate) const SETTINGS_ROWS: [SettingsRow; 10] = [
+    SettingsRow::Execution(SettingsField::MaxParallel),
+    SettingsRow::Execution(SettingsField::PerProjectMaxParallel),
+    SettingsRow::Execution(SettingsField::MaxRepairAttempts),
+    SettingsRow::Execution(SettingsField::MaxDurationMinutes),
+    SettingsRow::PolicyApproval,
+    SettingsRow::PolicyCommit,
+    SettingsRow::PolicyPush,
+    SettingsRow::StorageConfigPath,
+    SettingsRow::StorageSqlitePath,
+    SettingsRow::RuntimeStatus,
+];
+
+impl Default for SettingsRow {
+    fn default() -> Self {
+        Self::Execution(SettingsField::MaxParallel)
+    }
+}
+
+impl SettingsRow {
+    /// Section header this row renders under, in display order.
+    pub(crate) fn section(self) -> &'static str {
+        match self {
+            Self::Execution(_) => "EXECUTION",
+            Self::PolicyApproval | Self::PolicyCommit | Self::PolicyPush => "SAFETY",
+            Self::StorageConfigPath | Self::StorageSqlitePath => "STORAGE",
+            Self::RuntimeStatus => "RUNTIME",
+        }
     }
 
-    fn previous(self) -> Self {
-        let index = SETTINGS_FIELDS.iter().position(|f| *f == self).unwrap_or(0);
-        let previous = (index + SETTINGS_FIELDS.len() - 1) % SETTINGS_FIELDS.len();
-        SETTINGS_FIELDS[previous]
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Execution(field) => field.label(),
+            Self::PolicyApproval => "Explicit Run approval",
+            Self::PolicyCommit => "Automatic commit",
+            Self::PolicyPush => "Automatic push",
+            Self::StorageConfigPath => "Config",
+            Self::StorageSqlitePath => "SQLite",
+            Self::RuntimeStatus => "Provider / profile",
+        }
+    }
+
+    /// The editable field behind a row, if any. Read-only rows return `None`
+    /// so they can never enter edit mode.
+    pub(crate) fn editable_field(self) -> Option<SettingsField> {
+        match self {
+            Self::Execution(field) => Some(field),
+            _ => None,
+        }
+    }
+
+    /// Fixed value shown for read-only rows; editable fields render through
+    /// `AppState::settings_field_value` instead.
+    pub(crate) fn readonly_value(self, state: &AppState) -> Option<String> {
+        match self {
+            Self::PolicyApproval => Some("On".to_owned()),
+            Self::PolicyCommit => Some("Off".to_owned()),
+            Self::PolicyPush => Some("Off".to_owned()),
+            Self::StorageConfigPath => Some(state.config_path.display().to_string()),
+            Self::StorageSqlitePath => Some(state.database_path.display().to_string()),
+            Self::RuntimeStatus => Some(format!(
+                "{} · {} · {}",
+                state.active_runtime_provider,
+                state.active_profile_id,
+                state.runtime_health.display_status()
+            )),
+            Self::Execution(_) => None,
+        }
+    }
+
+    /// True for safety-policy rows that are fixed by Relay's product
+    /// invariants (explicit approval required; never auto-commit/push).
+    /// They are browsable and explained but never editable.
+    pub(crate) fn locked(self) -> bool {
+        matches!(
+            self,
+            Self::PolicyApproval | Self::PolicyCommit | Self::PolicyPush
+        )
+    }
+
+    /// Muted inline hint shown while a read-only row is selected.
+    pub(crate) fn hint(self) -> Option<&'static str> {
+        match self {
+            Self::PolicyApproval => Some("fixed by policy (v0.1 requires explicit approval)"),
+            Self::PolicyCommit => Some("fixed by policy (v0.1 never commits automatically)"),
+            Self::PolicyPush => Some("fixed by policy (v0.1 never pushes automatically)"),
+            Self::RuntimeStatus => Some("change via /runtimes"),
+            _ => None,
+        }
     }
 }
 
@@ -2078,7 +2329,7 @@ impl SettingsField {
 /// `buffer`; committed values live in `AppState::execution_limits`.
 #[derive(Debug, Default)]
 pub(crate) struct SettingsForm {
-    pub(crate) selected: SettingsField,
+    pub(crate) selected: SettingsRow,
     pub(crate) editing: bool,
     pub(crate) buffer: String,
     pub(crate) error: Option<String>,
@@ -2087,12 +2338,20 @@ pub(crate) struct SettingsForm {
 
 impl SettingsForm {
     pub(crate) fn select_previous(&mut self) {
-        self.selected = self.selected.previous();
+        let index = SETTINGS_ROWS
+            .iter()
+            .position(|row| *row == self.selected)
+            .unwrap_or(0);
+        self.selected = SETTINGS_ROWS[(index + SETTINGS_ROWS.len() - 1) % SETTINGS_ROWS.len()];
         self.saved = false;
     }
 
     pub(crate) fn select_next(&mut self) {
-        self.selected = self.selected.next();
+        let index = SETTINGS_ROWS
+            .iter()
+            .position(|row| *row == self.selected)
+            .unwrap_or(0);
+        self.selected = SETTINGS_ROWS[(index + 1) % SETTINGS_ROWS.len()];
         self.saved = false;
     }
 }

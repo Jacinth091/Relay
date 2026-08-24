@@ -9,8 +9,8 @@ use relay_runtime_antigravity::AntigravityRuntimeHealth;
 use relay_runtime_codex::{CodexRuntime, CodexRuntimeHealth};
 
 use crate::state::{
-    AppState, RUNTIME_PROVIDERS, RuntimeDetailSubmenu, SETTINGS_FIELDS, SettingsField,
-    git_health_marker, reasoning_effort_label,
+    AppState, DOCTOR_CHECKS, DoctorCheckStatus, RUNTIME_PROVIDERS, RuntimeDetailSubmenu,
+    SETTINGS_ROWS, SettingsRow, reasoning_effort_label,
 };
 use crate::theme::{Theme, marker_active, marker_failure, marker_success, marker_waiting};
 use crate::util::app_execution_limits;
@@ -420,47 +420,18 @@ pub(crate) fn render_settings(frame: &mut Frame, state: &AppState, area: Rect) {
     let theme = Theme::default();
     let form = &state.settings_form;
 
-    let mut lines: Vec<Line> = vec![Line::from(Span::styled("Execution", theme.header()))];
-
-    for field in SETTINGS_FIELDS {
-        settings_field_line(&mut lines, state, field);
+    let mut lines: Vec<Line> = Vec::new();
+    let mut current_section: Option<&'static str> = None;
+    for row in SETTINGS_ROWS {
+        if Some(row.section()) != current_section {
+            if current_section.is_some() {
+                lines.push(Line::default());
+            }
+            lines.push(Line::from(Span::styled(row.section(), theme.header())));
+            current_section = Some(row.section());
+        }
+        settings_row_line(&mut lines, state, row);
     }
-
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled("Safety", theme.header())));
-    for entry in [
-        "Explicit Run approval: On",
-        "Automatic commit: Off",
-        "Automatic push: Off",
-    ] {
-        lines.push(Line::from(Span::styled(
-            format!("  {entry}"),
-            theme.muted(),
-        )));
-    }
-
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled("Storage", theme.header())));
-    lines.push(Line::from(Span::styled(
-        format!("  Config: {}", state.config_path.display()),
-        theme.muted(),
-    )));
-    lines.push(Line::from(Span::styled(
-        format!("  SQLite: {}", state.database_path.display()),
-        theme.muted(),
-    )));
-
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled("Runtime", theme.header())));
-    lines.push(Line::from(Span::styled(
-        format!(
-            "  Provider: {} · Profile: {} · Status: {}",
-            state.active_runtime_provider,
-            state.active_profile_id,
-            state.runtime_health.display_status()
-        ),
-        theme.muted(),
-    )));
 
     // Reserved status line at the panel bottom: inline error (theme error
     // color) or muted "saved" feedback; blank when neither applies.
@@ -470,26 +441,23 @@ pub(crate) fn render_settings(frame: &mut Frame, state: &AppState, area: Rect) {
         (None, false) => Line::default(),
     });
 
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(theme.muted())
-                .title(" SETTINGS "),
-        ),
-        area,
-    );
+    let block = panel_block("SETTINGS", &theme);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn settings_field_line(lines: &mut Vec<Line<'static>>, state: &AppState, field: SettingsField) {
+/// One Settings row across any section: "›" cursor on the selected row,
+/// muted label / bright value; a selected read-only row appends its policy
+/// hint inline instead of an edit affordance.
+fn settings_row_line(lines: &mut Vec<Line<'static>>, state: &AppState, row: SettingsRow) {
     let theme = Theme::default();
     let form = &state.settings_form;
-    let selected = form.selected == field;
-    let marker = if selected { "> " } else { "  " };
-    let value = if selected && form.editing {
-        format!("{}_", form.buffer)
+    let selected = form.selected == row;
+    let marker_style = if selected {
+        theme.selection()
     } else {
-        state.settings_field_value(field)
+        theme.muted()
     };
     let label_style = if selected {
         theme.selection()
@@ -501,61 +469,262 @@ fn settings_field_line(lines: &mut Vec<Line<'static>>, state: &AppState, field: 
     } else {
         theme.text()
     };
-    lines.push(Line::from(vec![
-        Span::raw(marker),
-        Span::styled(format!("{}: ", field.label()), label_style),
-        Span::styled(value, value_style),
-    ]));
+
+    match row.editable_field() {
+        Some(field) => {
+            let value = if selected && form.editing {
+                format!("{}_", form.buffer)
+            } else {
+                state.settings_field_value(field)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(if selected { "› " } else { "  " }, marker_style),
+                Span::styled(format!("{}: ", field.label()), label_style),
+                Span::styled(value, value_style),
+            ]));
+        }
+        None => {
+            let locked = row.locked();
+            let mut spans = vec![
+                Span::styled(
+                    if selected {
+                        if locked { "# " } else { "› " }
+                    } else {
+                        "  "
+                    },
+                    marker_style,
+                ),
+                Span::styled(format!("{}: ", row.label()), label_style),
+                Span::styled(row.readonly_value(state).unwrap_or_default(), value_style),
+            ];
+            if locked {
+                spans.push(Span::styled("  [locked]", theme.warning()));
+            }
+            if selected && let Some(hint) = row.hint() {
+                spans.push(Span::styled(format!("  — {hint}"), theme.muted()));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
 }
 
 pub(crate) fn render_doctor(frame: &mut Frame, state: &AppState, area: Rect) {
-    let status_header = if state.health_refresh.is_some() {
-        "Relay Doctor — [Checking system diagnostics...]"
-    } else {
-        "Relay Doctor — [Diagnostics ready]"
-    };
+    let theme = Theme::default();
 
-    let body = format!(
-        "{status_header}\n\nCurrent execution requirements\n\n{}\n{} Relay config\n{} SQLite\n{}\n  {}\n{}\n  {}\n\nSubmission transports\nRelay Direct / MCP: implemented (`relay serve-mcp`)",
-        git_health_marker(&state.git_health),
-        if state.registry_writable { "✓" } else { "×" },
-        if state.store.is_some() { "✓" } else { "×" },
-        if state.runtime_health.is_ready() {
-            "✓ Codex CLI"
-        } else {
-            "× Codex CLI"
-        },
-        codex_health_detail(&state.runtime_health, &CodexRuntime::default()),
-        if state.antigravity_health.is_ready() {
-            "✓ Antigravity"
-        } else {
-            "× Antigravity"
-        },
-        state.antigravity_health.display_status()
+    let check_lines: Vec<Line> = DOCTOR_CHECKS
+        .iter()
+        .enumerate()
+        .map(|(i, check)| doctor_check_line(state, i, check, &theme))
+        .collect();
+    let banner = doctor_banner_line(state, &theme);
+    let transport_lines: Vec<Line> = vec![Line::from(vec![
+        Span::styled("Relay Direct / MCP: ", theme.muted()),
+        Span::styled("implemented (`relay serve-mcp`)", theme.text()),
+    ])];
+
+    let panels = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(check_lines.len() as u16 + 2),
+            Constraint::Length(1),
+            Constraint::Length(transport_lines.len() as u16 + 2),
+            Constraint::Fill(1),
+        ])
+        .split(area);
+
+    let block = panel_block("DIAGNOSTICS", &theme);
+    let inner = block.inner(panels[0]);
+    frame.render_widget(block, panels[0]);
+    frame.render_widget(
+        Paragraph::new(check_lines).wrap(Wrap { trim: false }),
+        inner,
     );
-    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: true }), area);
+
+    frame.render_widget(banner, panels[1]);
+
+    let block = panel_block("SUBMISSION TRANSPORTS", &theme);
+    let inner = block.inner(panels[2]);
+    frame.render_widget(block, panels[2]);
+    frame.render_widget(
+        Paragraph::new(transport_lines).wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
-fn codex_health_detail(health: &CodexRuntimeHealth, runtime: &CodexRuntime) -> String {
-    let executable = runtime
-        .resolve_executable()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|_| "no supported executable resolved".to_owned());
-    match health {
-        CodexRuntimeHealth::Checking => {
-            "  health probe pending; Run remains blocked until verification completes".to_owned()
-        }
-        CodexRuntimeHealth::Available { version, .. } => {
-            format!("  {executable}\n  {version}\n✓ Codex authentication and exec compatibility")
-        }
-        CodexRuntimeHealth::NotAuthenticated { version, error } => format!(
-            "  {executable}\n  {}\n  authentication unavailable: {error}",
-            version.as_deref().unwrap_or("version unavailable")
+/// One Doctor check row: status glyph colored by state-only rules
+/// (✓ success / × error / … checking), bright name, muted detail.
+fn doctor_check_line(state: &AppState, index: usize, check: &str, theme: &Theme) -> Line<'static> {
+    let name = match check {
+        "git" => "Git",
+        "config" => "Config",
+        "sqlite" => "SQLite",
+        "codex" => "Codex CLI",
+        _ => "Antigravity",
+    };
+    let status = state.doctor_check_status(check);
+    let (glyph, glyph_style, detail) = match &status {
+        DoctorCheckStatus::Pending => ("…", theme.muted(), "checking".to_owned()),
+        DoctorCheckStatus::Ok(detail) => (marker_success(), theme.success(), detail.clone()),
+        DoctorCheckStatus::Failed(detail) => (marker_failure(), theme.error(), detail.clone()),
+    };
+    let selected = index == state.doctor_selected_index.min(DOCTOR_CHECKS.len() - 1);
+    let name_style = if selected {
+        theme.selection()
+    } else {
+        theme.text()
+    };
+    Line::from(vec![
+        Span::styled(
+            if selected { "› " } else { "  " },
+            if selected {
+                theme.selection()
+            } else {
+                theme.muted()
+            },
         ),
-        CodexRuntimeHealth::Incompatible { reason, .. } => {
-            format!("  {executable}\n  compatibility unavailable: {reason}")
-        }
-        CodexRuntimeHealth::NotInstalled { error }
-        | CodexRuntimeHealth::DiscoveryFailed { error } => format!("  {executable}\n  {error}"),
+        Span::styled(format!("{glyph} "), glyph_style),
+        Span::styled(format!("{name:<12}"), name_style),
+        Span::styled(detail, theme.muted()),
+    ])
+}
+
+/// Overall diagnostics banner between the panels: warning while probes are
+/// pending, otherwise a ready summary colored by outcome.
+fn doctor_banner_line(state: &AppState, theme: &Theme) -> Paragraph<'static> {
+    let pending = state.health_refresh.is_some()
+        || DOCTOR_CHECKS
+            .iter()
+            .any(|check| matches!(state.doctor_check_status(check), DoctorCheckStatus::Pending));
+    let failed = !pending
+        && DOCTOR_CHECKS.iter().any(|check| {
+            matches!(
+                state.doctor_check_status(check),
+                DoctorCheckStatus::Failed(_)
+            )
+        });
+    let (text, style) = if pending {
+        ("Checking system diagnostics…", theme.warning())
+    } else if failed {
+        ("Diagnostics ready — attention required", theme.warning())
+    } else {
+        ("Diagnostics ready — all checks passed", theme.success())
+    };
+    Paragraph::new(Line::from(Span::styled(text.to_owned(), style)))
+}
+
+/// Version reported by a probed runtime health, if the CLI answered
+/// `--version` at any point during discovery.
+fn codex_version(health: &CodexRuntimeHealth) -> Option<String> {
+    match health {
+        CodexRuntimeHealth::Available { version, .. }
+        | CodexRuntimeHealth::Incompatible { version, .. } => Some(version.clone()),
+        CodexRuntimeHealth::NotAuthenticated { version, .. } => version.clone(),
+        _ => None,
     }
+}
+
+fn antigravity_version(health: &AntigravityRuntimeHealth) -> Option<String> {
+    match health {
+        AntigravityRuntimeHealth::Available { version }
+        | AntigravityRuntimeHealth::Incompatible { version, .. }
+        | AntigravityRuntimeHealth::AuthUnverifiable { version } => Some(version.clone()),
+        AntigravityRuntimeHealth::NotAuthenticated { version, .. } => version.clone(),
+        _ => None,
+    }
+}
+
+/// Updates screen: local component versions plus honest update guidance.
+/// Relay never phones home; every value comes from local probes already in
+/// app state, so "refresh versions" just re-runs those probes.
+pub(crate) fn render_updates(frame: &mut Frame, state: &AppState, area: Rect) {
+    let theme = Theme::default();
+
+    let relay_lines = vec![
+        label_value_line("Relay", format!("v{}", env!("CARGO_PKG_VERSION")), &theme),
+        label_value_line("Config", state.config_path.display().to_string(), &theme),
+        label_value_line(
+            "Local state",
+            state.database_path.display().to_string(),
+            &theme,
+        ),
+    ];
+
+    let component_line = |name: &str, version: Option<String>, status: String| {
+        let value = match version {
+            Some(version) => format!("{version} — {status}"),
+            None => status,
+        };
+        Line::from(vec![
+            Span::styled(format!("{name:<14}"), theme.text()),
+            Span::styled(value, theme.muted()),
+        ])
+    };
+    let component_lines = vec![
+        component_line(
+            "Codex CLI",
+            codex_version(&state.runtime_health),
+            state.runtime_health.display_status().to_owned(),
+        ),
+        component_line(
+            "Antigravity",
+            antigravity_version(&state.antigravity_health),
+            state.antigravity_health.display_status().to_owned(),
+        ),
+        component_line(
+            "Git",
+            match &state.git_health {
+                crate::state::ToolHealth::Checking => None,
+                crate::state::ToolHealth::Available(version) => Some(version.clone()),
+                crate::state::ToolHealth::Unavailable(_) => None,
+            },
+            match &state.git_health {
+                crate::state::ToolHealth::Checking => "checking".to_owned(),
+                crate::state::ToolHealth::Available(_) => "git available".to_owned(),
+                crate::state::ToolHealth::Unavailable(error) => error.clone(),
+            },
+        ),
+    ];
+
+    let guidance_lines: Vec<Line> = [
+        "Relay does not check for updates online; press r to re-probe local components.",
+        "Relay: pull this repository, then cargo install --path apps/relay-tui.",
+        "Codex CLI: update through your install channel (npm/brew), verify with /doctor.",
+        "Antigravity CLI: update via its installer, verify with /doctor.",
+    ]
+    .into_iter()
+    .map(|text| Line::from(Span::styled(text.to_owned(), theme.muted())))
+    .collect();
+
+    let panels = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(relay_lines.len() as u16 + 2),
+            Constraint::Length(component_lines.len() as u16 + 2),
+            Constraint::Fill(1),
+        ])
+        .split(area);
+
+    let block = panel_block("INSTALLED", &theme);
+    let inner = block.inner(panels[0]);
+    frame.render_widget(block, panels[0]);
+    frame.render_widget(
+        Paragraph::new(relay_lines).wrap(Wrap { trim: false }),
+        inner,
+    );
+
+    let block = panel_block("COMPONENTS", &theme);
+    let inner = block.inner(panels[1]);
+    frame.render_widget(block, panels[1]);
+    frame.render_widget(
+        Paragraph::new(component_lines).wrap(Wrap { trim: false }),
+        inner,
+    );
+
+    let block = panel_block("HOW TO UPDATE", &theme);
+    let inner = block.inner(panels[2]);
+    frame.render_widget(block, panels[2]);
+    frame.render_widget(
+        Paragraph::new(guidance_lines).wrap(Wrap { trim: false }),
+        inner,
+    );
 }

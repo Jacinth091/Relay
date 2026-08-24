@@ -19,8 +19,8 @@ use relay_runtime_codex::CodexRuntimeHealth;
 use crate::commands::execute_relay_command;
 use crate::input::{command_mode_available, handle_key};
 use crate::state::{
-    AddProjectForm, AppState, RuntimeDetailSubmenu, Screen, TaskReviewSubmenu, ToolHealth,
-    git_health_marker,
+    AddProjectForm, AppState, DoctorCheckStatus, RuntimeDetailSubmenu, Screen, TaskReviewSubmenu,
+    ToolHealth,
 };
 use crate::ui::execution::{render_execution, render_result};
 use crate::util::{
@@ -732,16 +732,219 @@ fn add_project_does_not_overwrite_invalid_existing_config() {
 }
 
 #[test]
-fn doctor_marks_git_pending_until_probe_finishes() {
-    assert_eq!(git_health_marker(&ToolHealth::Checking), "… Git — checking");
+fn doctor_checks_report_pending_ok_and_failed_states() {
+    let mut state = app_state_with_project();
     assert_eq!(
-        git_health_marker(&ToolHealth::Available("git version test".to_owned())),
-        "✓ Git"
+        state.doctor_check_status("git"),
+        DoctorCheckStatus::Pending,
+        "git stays pending until the probe finishes"
     );
+    state.git_health = ToolHealth::Available("git version test".to_owned());
     assert_eq!(
-        git_health_marker(&ToolHealth::Unavailable("missing".to_owned())),
-        "× Git"
+        state.doctor_check_status("git"),
+        DoctorCheckStatus::Ok("git version test".to_owned())
     );
+    state.git_health = ToolHealth::Unavailable("missing".to_owned());
+    assert_eq!(
+        state.doctor_check_status("git"),
+        DoctorCheckStatus::Failed("missing".to_owned())
+    );
+
+    // Config and SQLite derive from local state, not from async probes.
+    assert!(matches!(
+        state.doctor_check_status("config"),
+        DoctorCheckStatus::Ok(_)
+    ));
+}
+
+#[test]
+fn doctor_screen_renders_selectable_checks_and_key_hints_match_keys() {
+    let mut state = app_state_with_project();
+    state.screen = Screen::Doctor;
+
+    let text = render_main_area_text(&state);
+    for name in ["Git", "Config", "SQLite", "Codex CLI", "Antigravity"] {
+        assert!(text.contains(name), "doctor should render check row {name}");
+    }
+    assert!(text.contains("DIAGNOSTICS"));
+    // Submission transports info block stays below the panel.
+    assert!(text.contains("serve-mcp"));
+
+    // Key bar mirrors input.rs exactly: provider rows re-check a single
+    // target, local-state rows re-run the whole refresh.
+    assert_eq!(state.doctor_selected_index, 0);
+    let hints = key_hints(&state);
+    assert!(
+        hints
+            .iter()
+            .any(|(key, label)| key == "↑/↓ j/k" && label == "select")
+    );
+    assert!(
+        hints
+            .iter()
+            .any(|(key, label)| key == "r" && label == "re-check all")
+    );
+
+    // Selecting down to a provider row flips the r hint to the targeted one.
+    for _ in 0..3 {
+        state.select_next_doctor_check();
+    }
+    assert_eq!(
+        key_hints(&state)
+            .into_iter()
+            .find(|(key, _)| key == "r")
+            .map(|(_, label)| label),
+        Some("re-check".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn doctor_r_key_uses_targeted_reprobe_for_provider_rows() {
+    use crate::state::DOCTOR_CHECKS;
+
+    let mut state = app_state_with_project();
+    state.screen = Screen::Doctor;
+
+    // Row 2 is Codex: pressing r must reset only that probe to Checking.
+    while DOCTOR_CHECKS[state.doctor_selected_index] != "codex" {
+        state.select_next_doctor_check();
+    }
+    state.git_health = ToolHealth::Available("git version test".to_owned());
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(state.runtime_health, CodexRuntimeHealth::Checking));
+    assert_eq!(
+        state.doctor_check_status("git"),
+        DoctorCheckStatus::Ok("git version test".to_owned()),
+        "targeted provider re-probe must leave other checks untouched"
+    );
+    if let Some(task) = state.health_refresh.take() {
+        task.abort();
+    }
+
+    // Row 0 (git) has no targeted probe; r re-runs the full refresh.
+    while state.doctor_selected_index != 0 {
+        state.select_previous_doctor_check();
+    }
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(state.git_health, ToolHealth::Checking));
+    if let Some(task) = state.health_refresh.take() {
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn doctor_enter_navigates_provider_rows_and_guides_local_rows() {
+    use crate::state::DOCTOR_CHECKS;
+
+    let mut state = app_state_with_project();
+    state.screen = Screen::Doctor;
+
+    // Provider row: Enter jumps to that runtime's detail screen.
+    while DOCTOR_CHECKS[state.doctor_selected_index] != "antigravity" {
+        state.select_next_doctor_check();
+    }
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(state.screen, Screen::RuntimeDetail);
+    assert_eq!(
+        state.runtime_detail_provider.as_deref(),
+        Some("antigravity")
+    );
+    if let Some(task) = state.health_refresh.take() {
+        task.abort();
+    }
+
+    // Local-state row: Enter keeps the screen and surfaces remediation text.
+    state.screen = Screen::Doctor;
+    while DOCTOR_CHECKS[state.doctor_selected_index] != "git" {
+        state.select_previous_doctor_check();
+    }
+    state.git_health = ToolHealth::Unavailable("git not found".to_owned());
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(state.screen, Screen::Doctor);
+    assert!(
+        state.feedback.contains("Install Git"),
+        "failed git check should explain remediation, got: {}",
+        state.feedback
+    );
+}
+
+#[test]
+fn updates_screen_renders_versions_and_guidance_with_matching_hints() {
+    let mut state = app_state_with_project();
+    state.screen = Screen::Updates;
+    state.antigravity_health = AntigravityRuntimeHealth::Available {
+        version: "agy test".to_owned(),
+    };
+    state.git_health = ToolHealth::Available("git version test".to_owned());
+
+    let text = render_main_area_text(&state);
+    for expected in [
+        "INSTALLED",
+        "COMPONENTS",
+        "HOW TO UPDATE",
+        env!("CARGO_PKG_VERSION"),
+        "test runtime",
+        "agy test",
+        "cargo install --path apps/relay-tui",
+    ] {
+        assert!(text.contains(expected), "updates should render {expected}");
+    }
+
+    // Key bar mirrors input.rs: r refreshes probes, esc returns to dashboard.
+    let hints = key_hints(&state);
+    assert!(
+        hints
+            .iter()
+            .any(|(key, label)| key == "r" && label == "refresh versions")
+    );
+    assert!(
+        hints
+            .iter()
+            .any(|(key, label)| key == "esc" && label == "dashboard")
+    );
+}
+
+#[tokio::test]
+async fn updates_command_opens_updates_screen_and_r_refreshes_probes() {
+    let mut state = app_state_with_project();
+    execute_relay_command(&mut state, "/updates").await.unwrap();
+    assert_eq!(state.screen, Screen::Updates);
+    assert!(matches!(state.runtime_health, CodexRuntimeHealth::Checking));
+
+    state.runtime_health = CodexRuntimeHealth::Available {
+        version: "test runtime".to_owned(),
+        account: None,
+    };
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(state.runtime_health, CodexRuntimeHealth::Checking));
+    if let Some(task) = state.health_refresh.take() {
+        task.abort();
+    }
 }
 
 #[tokio::test]
@@ -1090,7 +1293,7 @@ fn unique_temp_path(name: &str) -> PathBuf {
 // --- Settings form -------------------------------------------------------
 
 use crate::runtime_settings::RuntimeSettings;
-use crate::state::SettingsField;
+use crate::state::{SETTINGS_ROWS, SettingsField, SettingsRow};
 use crate::ui::key_hints;
 
 fn settings_test_state() -> AppState {
@@ -1116,19 +1319,22 @@ async fn settings_key(state: &mut AppState, code: KeyCode) {
 #[tokio::test]
 async fn settings_selection_and_edit_updates_pending_buffer() {
     let mut state = settings_test_state();
-    assert_eq!(state.settings_form.selected, SettingsField::MaxParallel);
+    assert_eq!(
+        state.settings_form.selected,
+        SettingsRow::Execution(SettingsField::MaxParallel)
+    );
     assert!(state.settings_form.buffer.is_empty());
 
     settings_key(&mut state, KeyCode::Down).await;
     assert_eq!(
         state.settings_form.selected,
-        SettingsField::PerProjectMaxParallel
+        SettingsRow::Execution(SettingsField::PerProjectMaxParallel)
     );
-    settings_key(&mut state, KeyCode::Up).await;
-    settings_key(&mut state, KeyCode::Up).await;
+    settings_key(&mut state, KeyCode::Down).await;
+    settings_key(&mut state, KeyCode::Down).await;
     assert_eq!(
         state.settings_form.selected,
-        SettingsField::MaxDurationMinutes
+        SettingsRow::Execution(SettingsField::MaxDurationMinutes)
     );
 
     // Enter begins editing prefilled with the current value.
@@ -1209,11 +1415,14 @@ async fn settings_valid_save_persists_through_runtime_settings_toml() {
     assert!(state.settings_form.error.is_none());
     assert_eq!(state.execution_limits.max_parallel, 4);
 
-    // Duration: select via wrap-around previous, then type a fresh value.
-    settings_key(&mut state, KeyCode::Up).await;
+    // Duration: walk down through the remaining EXECUTION rows (selection
+    // now spans every section), then type a fresh value.
+    settings_key(&mut state, KeyCode::Down).await;
+    settings_key(&mut state, KeyCode::Down).await;
+    settings_key(&mut state, KeyCode::Down).await;
     assert_eq!(
         state.settings_form.selected,
-        SettingsField::MaxDurationMinutes
+        SettingsRow::Execution(SettingsField::MaxDurationMinutes)
     );
     settings_key(&mut state, KeyCode::Char('9')).await;
     settings_key(&mut state, KeyCode::Char('0')).await;
@@ -1246,6 +1455,86 @@ fn settings_key_bar_shows_edit_mode_hints_only_while_editing() {
     assert!(!editing.iter().any(|(key, _)| key == "0-9"));
 }
 
+#[tokio::test]
+async fn settings_selection_traverses_all_sections_and_wraps() {
+    let mut state = settings_test_state();
+
+    // Walking Down visits every row across EXECUTION, SAFETY, STORAGE, and
+    // RUNTIME, then wraps back to the first row.
+    let expected_labels = [
+        "Global parallelism",
+        "Per-project parallelism",
+        "Repair attempts",
+        "Maximum execution (minutes)",
+        "Explicit Run approval",
+        "Automatic commit",
+        "Automatic push",
+        "Config",
+        "SQLite",
+        "Provider / profile",
+    ];
+    for label in expected_labels {
+        assert_eq!(state.settings_form.selected.label(), label);
+        settings_key(&mut state, KeyCode::Down).await;
+    }
+    assert_eq!(
+        state.settings_form.selected, SETTINGS_ROWS[0],
+        "Down from the last row wraps to the first"
+    );
+
+    // Up from the first row wraps to the last row of the last section.
+    settings_key(&mut state, KeyCode::Up).await;
+    assert_eq!(state.settings_form.selected.label(), "Provider / profile");
+
+    // j/k mirror Down/Up across sections too.
+    settings_key(&mut state, KeyCode::Char('k')).await;
+    assert_eq!(state.settings_form.selected.label(), "SQLite");
+    settings_key(&mut state, KeyCode::Char('j')).await;
+    assert_eq!(state.settings_form.selected.label(), "Provider / profile");
+}
+
+#[tokio::test]
+async fn read_only_settings_row_shows_fixed_policy_hint_and_cannot_enter_edit() {
+    let mut state = settings_test_state();
+
+    // Move to the SAFETY section's Explicit Run approval row.
+    for _ in 0..4 {
+        settings_key(&mut state, KeyCode::Down).await;
+    }
+    assert_eq!(state.settings_form.selected, SettingsRow::PolicyApproval);
+    assert_eq!(
+        state.settings_form.selected.hint(),
+        Some("fixed by policy (v0.1 requires explicit approval)")
+    );
+
+    // Enter and direct digits must never enter edit mode on a policy row.
+    settings_key(&mut state, KeyCode::Enter).await;
+    assert!(!state.settings_form.editing);
+    settings_key(&mut state, KeyCode::Char('5')).await;
+    assert!(!state.settings_form.editing);
+    assert!(state.settings_form.buffer.is_empty());
+    assert_eq!(state.screen, Screen::Settings);
+
+    // The hint renders inline only while the read-only row is selected.
+    state.screen = Screen::Settings;
+    let selected_text = render_main_area_text(&state);
+    assert!(
+        selected_text.contains("fixed by policy"),
+        "selected policy row should show its hint"
+    );
+
+    settings_key(&mut state, KeyCode::Up).await;
+    assert!(matches!(
+        state.settings_form.selected,
+        SettingsRow::Execution(SettingsField::MaxDurationMinutes)
+    ));
+    let unselected_text = render_main_area_text(&state);
+    assert!(
+        !unselected_text.contains("fixed by policy"),
+        "editable selection should hide the policy hint"
+    );
+}
+
 fn render_dashboard_text(state: &AppState) -> String {
     let backend = ratatui::backend::TestBackend::new(80, 25);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1263,6 +1552,25 @@ fn render_dashboard_text(state: &AppState) -> String {
             line.chars().collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// Renders only the main content area for the current screen so assertions
+/// can target panel text without top-bar/key-bar noise.
+fn render_main_area_text(state: &AppState) -> String {
+    let backend = ratatui::backend::TestBackend::new(140, 30);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| crate::ui::render(frame, state))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let mut text = String::new();
+    for y in 1..buffer.area.height.saturating_sub(2) {
+        for x in 0..buffer.area.width {
+            text.push_str(buffer[(x, y)].symbol());
+        }
+        text.push('\n');
+    }
+    text
 }
 
 async fn ready_task_state_with_queue() -> (AppState, relay_core::SchedulerTaskSnapshot) {

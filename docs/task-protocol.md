@@ -132,7 +132,9 @@ Those are local configuration concerns.
 
 ---
 
-## GitHub Issue Representation (Transport or Binding)
+## GitHub Issue Representation (Future Optional Transport or Binding)
+
+> Not implemented in v0.1 (ADR-0016 descope). Preserved as future design; the HandoffTask remains fully transport-neutral.
 
 When GitHub carries a task into Relay, the GitHub ingress should render/read a human-readable issue while retaining a canonical machine block. When GitHub is only an external binding, Relay may mirror the task and lifecycle there without making the Issue canonical.
 

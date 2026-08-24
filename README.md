@@ -122,8 +122,8 @@ Submission transports feed the same core:
 
 ChatGPT -> Relay Direct/MCP ----\
 Claude  -> Relay Direct/MCP -----+--> Relay Core
-Provider GitHub compatibility ---/
 Local file/paste ----------------/
+GitHub ingress (future optional) -
 ```
 
 After Relay accepts a task, local durable state is canonical. GitHub can remain an ingress and can also be an optional external binding, but it is not required for every Relay task.
@@ -269,7 +269,10 @@ Relay Handoff planner adapter (ChatGPT)
           |
           | Relay Handoff Planner Specification + Task Protocol
           v
-GitHub compatibility transport (v0.1 reference)
+Relay Direct / MCP (implemented; preferred when the planner host can connect)
+          |
+          v
+Local file / paste import (hard fallback; always available)
           |
           v
 Relay Core
@@ -290,15 +293,14 @@ Local Git repository
                                                    or NEEDS_DECISION
 ```
 
-The v0.1 reference workflow uses GitHub because it provides a practical durable bridge before Relay Direct is implemented. When this mailbox transport is used, each user/team configures its own repository; private visibility is the recommended default. Relay does not provide a maintainer-owned shared mailbox service.
+Submission transport reality (ADR-0016): **Relay Direct / MCP is the implemented first automatic submission transport** (`relay serve-mcp`, dual-era MCP over stdio). Local file/paste import remains the hard fallback and always works. GitHub ingress was descoped from v0.1 by ADR-0016 and survives only as a future optional compatibility path / external binding; it is not a v0.1 blocker and Relay does not provide any maintainer-owned mailbox service.
 
-When direct Relay MCP access is available, it becomes the preferred planner submission path:
+Relay Direct is preferred when the selected planner host can register and call the local Relay MCP server. Hosts without compatible custom-MCP access (including many ChatGPT deployments) use the same canonical HandoffTask through local file/paste — a host capability limitation, not a Relay limitation:
 
 ```text
-ChatGPT / Claude / OpenCode -> Relay MCP -> Relay Core
+Planner host with local stdio MCP support -> relay serve-mcp -> Relay Core
+Planner host without usable MCP access    -> canonical file / paste -> Relay Core
 ```
-
-GitHub may then be omitted or configured as an optional external binding. The rest of Relay does not change.
 
 ---
 
@@ -363,7 +365,7 @@ Ratatui is the first presentation layer, not the architecture.
 
               SUBMISSION TRANSPORT
 
-         Relay Direct/MCP / Provider GitHub / Local
+         Relay Direct/MCP / Local file-paste / future GitHub
                        |
                        v
 
@@ -569,7 +571,7 @@ It may eventually contain:
 ```text
 Planner specification   Relay Handoff Planner Specification
 Planner adapter         ChatGPT Skill (first adapter)
-Submission              GitHub compatibility for v0.1; Relay Direct preferred when available
+Submission              Relay Direct/MCP (`relay serve-mcp`) implemented; local file/paste is the hard fallback; GitHub ingress descoped from v0.1 (future optional compatibility)
 Runtime                 Codex
 Runtime transport       CLI
 Project instructions    AGENTS.md

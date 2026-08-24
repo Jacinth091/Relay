@@ -24,3 +24,4 @@ Current decisions:
 - `0016-mcp-first-submission-and-v0-1-local-descope.md` — Relay Direct/MCP is the first automatic submission transport; GitHub ingress descoped from v0.1.
 - `0017-relay-identity-deterministic-handoff-engine.md` — Relay is a deterministic handoff engine: execution orchestration only, never intent orchestration.
 - `0018-provider-distribution-model.md` — deterministic provider distribution posture with exists-today/partial/planned status labels.
+- `0019-multi-runtime-orchestration-architecture.md` — multi-runtime orchestration architecture. Renumbered from a duplicate `0009` file name; decision content unchanged.

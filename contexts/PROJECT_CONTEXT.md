@@ -41,11 +41,16 @@ The first supported path is:
 ChatGPT -> local file/paste ingress -> Relay -> Codex CLI -> local Git repo
 ```
 
-The originally planned first durable ingress bridge was the GitHub
-compatibility transport. That bridge is planned but not started; today local
-file/paste is the only ingress that works end to end.
+The supported submission transports today (ADR-0016):
 
-GitHub remains planned as an additional durable ingress bridge, not a second Relay implementation.
+```text
+Planner host with local stdio MCP support -> relay serve-mcp -> Relay
+Planner host without usable MCP access    -> local file/paste -> Relay
+```
+
+Relay Direct / MCP is implemented (M9: `submit_handoff` over `relay serve-mcp`, dual-era MCP protocol). Local file/paste remains the hard fallback that always works. The GitHub compatibility transport was descoped from v0.1 and is a future optional ingress/external-binding path, not current behavior.
+
+GitHub may return as an additional durable ingress bridge or optional external binding in a future decision; it would not be a second Relay implementation.
 
 The local ingress accepts canonical JSON files/paste, with optional Markdown wrappers containing the same JSON block, and it is the path that works end to end today.
 
@@ -207,8 +212,8 @@ Resolution Packet: approved answer used to resume/restart execution.
 - planner: normal ChatGPT conversation;
 - planner specification: Relay Handoff Planner Specification;
 - planner adapter: installable ChatGPT `relay-handoff` Skill;
-- v0.1 submission: local file/paste today; GitHub compatibility transport planned but not started;
-- future preferred submission: Relay Direct/MCP (planned, not started);
+- v0.1 submission: Relay Direct/MCP (`relay serve-mcp`, implemented) preferred when the host supports local MCP; local file/paste is the hard fallback;
+- GitHub ingress: descoped from v0.1; future optional compatibility path;
 - external binding: optional GitHub Issue;
 - runtime: Codex;
 - runtime transport: CLI;

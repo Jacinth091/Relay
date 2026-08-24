@@ -121,9 +121,14 @@ Database schema version and Relay protocol versions are separate.
 ## Multi-Process Access
 
 Relay supports concurrent access to the same local database file from exactly
-two writer classes: the TUI and a future `relay serve-mcp` process. Anything
-more (additional writer processes, networked/shared databases) is out of scope
-until re-examined.
+two writer classes: the TUI and the `relay serve-mcp` process (implemented,
+M9). Anything more (additional writer processes, networked/shared databases)
+is out of scope until re-examined.
+
+This two-process behavior is proven by tests: interleaved writes across two
+store handles on one database file, busy-timeout retry under contention, and
+compare-and-set loser rejection (M9 phase 02). It does not claim anything
+beyond what those tests cover.
 
 Every Relay connection sets:
 

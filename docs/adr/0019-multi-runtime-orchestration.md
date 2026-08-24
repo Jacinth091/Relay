@@ -1,10 +1,10 @@
-﻿# ADR-0019: Multi-Runtime Orchestration Architecture
+# ADR-0019: Multi-Runtime Orchestration Architecture
 
-> **Numbering note:** this ADR was originally filed as 0009-multi-runtime-orchestration.md, colliding with 0009-single-relay-ingress-model.md. It was renumbered to 0019 without any change to its decision content.
+> **Numbering note:** this ADR was originally filed as `0009-multi-runtime-orchestration.md`, colliding with `0009-single-relay-ingress-model.md`. It was renumbered to 0019 without any change to its decision content.
 
 **Status:** Proposed
 **Date:** 2026-08-15
-**Scope:** M8.1 â€” Multi-Runtime Orchestration + Terminal UX Overhaul
+**Scope:** M8.1 — Multi-Runtime Orchestration + Terminal UX Overhaul
 
 ## Context
 
@@ -23,11 +23,11 @@ The user cannot:
 
 Add a provider-neutral runtime management layer to `relay-runtime`:
 
-1. **`RuntimeProfile`** â€” A trusted local execution policy describing provider, model, reasoning effort, filesystem capability, network policy, duration, and repair budget.
-2. **`RuntimeIntegration`** trait â€” Separate from the execution `Runtime` trait. Provides discovery, health probing, profile listing, model catalog, profile resolution, and capability verification.
-3. **`RuntimeRouter`** â€” Routes execution requests to the appropriate provider runtime based on profile ID.
-4. **`RuntimeActivity`** â€” Provider-neutral normalized execution events (CommandStarted, FileChanged, VerificationCompleted, etc.) for TUI consumption.
-5. **`CapabilityStatus`** â€” Distinguishes Configured vs Verified vs Unknown vs Mismatch for honest capability reporting.
+1. **`RuntimeProfile`** — A trusted local execution policy describing provider, model, reasoning effort, filesystem capability, network policy, duration, and repair budget.
+2. **`RuntimeIntegration`** trait — Separate from the execution `Runtime` trait. Provides discovery, health probing, profile listing, model catalog, profile resolution, and capability verification.
+3. **`RuntimeRouter`** — Routes execution requests to the appropriate provider runtime based on profile ID.
+4. **`RuntimeActivity`** — Provider-neutral normalized execution events (CommandStarted, FileChanged, VerificationCompleted, etc.) for TUI consumption.
+5. **`CapabilityStatus`** — Distinguishes Configured vs Verified vs Unknown vs Mismatch for honest capability reporting.
 
 ### Provider Adapters
 
@@ -50,11 +50,11 @@ The TUI transitions from a debug dashboard to a command-first orchestration cons
 
 ```
 explicit one-run selection
-    â†“
+    ↓
 project default runtime profile
-    â†“
+    ↓
 Relay global default runtime profile
-    â†“
+    ↓
 fail closed if no safe profile resolves
 ```
 
@@ -76,5 +76,3 @@ This change preserves all accepted contracts:
 - Users can switch between providers without restart
 - Provider-specific settings stay in adapters, not in core
 - Runtime profiles are trusted local state (tasks cannot escalate permissions)
-
-

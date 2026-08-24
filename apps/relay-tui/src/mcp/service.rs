@@ -2,9 +2,9 @@
 //!
 //! This layer is deliberately blind to the protocol era: both modern
 //! stateless requests and legacy handshake-era requests converge here, so
-//! there is exactly ONE Relay submission implementation (handoff §5.1).
-//! It owns the tool catalog, the `submit_handoff` pipeline (size cap →
-//! ingress preview → durable persistence), and the stable error-code
+//! there is exactly ONE Relay submission implementation (handoff Â§5.1).
+//! It owns the tool catalog, the `submit_handoff` pipeline (size cap â†’
+//! ingress preview â†’ durable persistence), and the stable error-code
 //! mapping tables.
 //!
 //! Structural guard: this module depends on NO execution or scheduler
@@ -18,6 +18,8 @@ use relay_core::{
 use relay_protocol::ProtocolError;
 use serde::Deserialize;
 use serde_json::Value;
+
+use crate::mcp::protocol as p;
 
 pub(crate) const SUBMIT_HANDOFF_TOOL_NAME: &str = "submit_handoff";
 /// User-facing state label mandated by the M9 pack output contract.
@@ -102,20 +104,18 @@ struct ToolCallParams<'a> {
 
 /// Runs one `submit_handoff` call end to end against the given raw
 /// `tools/call` params JSON. Returns the Relay-owned task id on durable
-/// success, or a final `(error code, message)` pair — every failure branch
+/// success, or a final `(error code, message)` pair â€” every failure branch
 /// leaves nothing persisted.
 pub(crate) async fn execute_submit_handoff(
     relay: &mut Relay,
     store: &SqliteStore,
     raw_params_json: &str,
 ) -> Result<relay_core::TaskId, (i64, String)> {
-    use crate::mcp::protocol::INVALID_PARAMS;
-
     let envelope: ToolCallEnvelope<'_> = match serde_json::from_str(raw_params_json) {
         Ok(envelope) => envelope,
         Err(error) => {
             return Err((
-                INVALID_PARAMS,
+                p::INVALID_PARAMS,
                 format!("invalid tools/call params: {error}"),
             ));
         }
@@ -123,14 +123,14 @@ pub(crate) async fn execute_submit_handoff(
 
     let Some(call) = envelope.params else {
         return Err((
-            INVALID_PARAMS,
+            p::INVALID_PARAMS,
             "tools/call requires a params object with a tool name".to_owned(),
         ));
     };
 
     if call.name != SUBMIT_HANDOFF_TOOL_NAME {
         return Err((
-            INVALID_PARAMS,
+            p::INVALID_PARAMS,
             format!(
                 "unknown tool '{}'; available tools: {SUBMIT_HANDOFF_TOOL_NAME}",
                 call.name
@@ -140,7 +140,7 @@ pub(crate) async fn execute_submit_handoff(
 
     let Some(arguments) = call.arguments else {
         return Err((
-            INVALID_PARAMS,
+            p::INVALID_PARAMS,
             format!(
                 "tool '{SUBMIT_HANDOFF_TOOL_NAME}' requires 'arguments' containing one \
                  canonical HandoffTask v1 JSON object"
@@ -169,7 +169,7 @@ fn ensure_payload_within_size_cap(raw_payload: &str) -> Result<(), (i64, String)
     let actual = raw_payload.len() as u64;
     if actual > MAX_LOCAL_TASK_INPUT_BYTES {
         Err((
-            crate::mcp::protocol::INPUT_TOO_LARGE,
+            p::INPUT_TOO_LARGE,
             format!(
                 "submit_handoff arguments are {actual} bytes, exceeding the maximum of \
                  {MAX_LOCAL_TASK_INPUT_BYTES} bytes"
@@ -181,6 +181,11 @@ fn ensure_payload_within_size_cap(raw_payload: &str) -> Result<(), (i64, String)
 }
 
 /// Maps every validation failure branch to its stable JSON-RPC error code.
+///
+/// Local-filesystem error variants are scrubbed before reaching the wire:
+/// their `Display` text can embed absolute paths from the operator's machine,
+/// so the full detail goes to stderr diagnostics and the client receives a
+/// generic message (fail-closed information disclosure posture).
 pub(crate) fn map_ingress_error(error: &TaskIngressError) -> (i64, String) {
     use crate::mcp::protocol as p;
     match error {
@@ -193,7 +198,13 @@ pub(crate) fn map_ingress_error(error: &TaskIngressError) -> (i64, String) {
         TaskIngressError::ProjectRegistry(_) => (p::UNKNOWN_PROJECT, error.to_string()),
         TaskIngressError::UnsupportedFileExtension { .. }
         | TaskIngressError::FileRead { .. }
-        | TaskIngressError::FileNotUtf8 { .. } => (p::INTERNAL_ERROR, error.to_string()),
+        | TaskIngressError::FileNotUtf8 { .. } => {
+            tracing::warn!(%error, "local file ingress error surfaced over MCP");
+            (
+                p::INTERNAL_ERROR,
+                "task could not be read at the local ingress boundary".to_owned(),
+            )
+        }
     }
 }
 

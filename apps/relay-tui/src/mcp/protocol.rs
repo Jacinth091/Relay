@@ -5,16 +5,22 @@
 //! negotiation rules. Everything here is pure wire mechanics: Relay
 //! submission semantics live in [`super::service`] and are era-independent.
 //!
-//! Era model (MCP specification `2026-07-28`, "Versioning and Compatibility"):
+//! Era model — verified against the authoritative specification at
+//! `https://modelcontextprotocol.io/specification/2026-07-28/`:
 //!
 //! * **Modern** — per-request `_meta` carries
 //!   `io.modelcontextprotocol/protocolVersion`; there is no initialize
 //!   handshake; capability discovery is the `server/discover` RPC; version
-//!   mismatch answers [`MCP_UNSUPPORTED_PROTOCOL_VERSION`].
+//!   mismatch answers [`MCP_UNSUPPORTED_PROTOCOL_VERSION`] with a `supported`
+//!   list (`basic/versioning`). A dual-era stdio server selects behavior by
+//!   how the client opens: lifecycle methods select legacy; requests carrying
+//!   modern `_meta` select modern; requests carrying neither are served under
+//!   legacy semantics (`basic/transports/stdio#backward-compatibility`,
+//!   `basic/versioning#backward-compatibility-with-initialization-based-versions`).
 //! * **Legacy** — revisions through `2025-11-25`; session established by
 //!   `initialize` / `notifications/initialized`; an unsupported requested
 //!   version is answered by re-serving one of our supported versions, never
-//!   an error.
+//!   an error (`2025-06-18 basic/lifecycle`, Version Negotiation).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -38,8 +44,11 @@ pub(crate) const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32004;
 pub(crate) const INVALID_HANDOFF: i64 = -32005;
 
 /// MCP-standard modern-era error: a request whose per-request
-/// `_meta` protocol version is not supported (specification `2026-07-28`,
-/// Versioning). Distinct from Relay's application codes above.
+/// `_meta` protocol version is not supported. Wire shape per the
+/// authoritative `2026-07-28` specification, "Versioning and Compatibility"
+/// (modelcontextprotocol.io/specification/2026-07-28/basic/versioning):
+/// `{ code: -32022, message, data: { supported: [...], requested } }`.
+/// Distinct from Relay's application codes above.
 pub(crate) const MCP_UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 
 /// Current modern MCP revision served statelessly via per-request `_meta`.
@@ -117,22 +126,19 @@ pub(crate) fn classify_request(method: &str, params: Option<&Value>) -> RequestE
     }
 }
 
-/// Legacy version negotiation (specification `2025-06-18`, Lifecycle):
-/// echo the requested version when we support it, otherwise respond with
-/// another version we support — never an error. We answer with our latest
-/// legacy revision, as the specification recommends.
+/// Legacy version negotiation (verified against the authoritative
+/// specification, modelcontextprotocol.io/specification/2025-06-18/basic/
+/// lifecycle, "Version Negotiation"): echo the requested version when we
+/// support it; otherwise respond with another version we support — SHOULD be
+/// our latest legacy revision. Never an error.
 pub(crate) fn negotiate_legacy_version(requested: Option<&str>) -> &'static str {
-    match requested {
-        Some(version) if LEGACY_PROTOCOL_VERSIONS.contains(&version) => {
-            // Return the matched static entry so callers always hold a
-            // 'static version string.
-            LEGACY_PROTOCOL_VERSIONS
-                .iter()
-                .find(|candidate| **candidate == version)
-                .expect("matched entry exists")
-        }
-        _ => LATEST_LEGACY_PROTOCOL_VERSION,
-    }
+    let matched = requested.and_then(|version| {
+        LEGACY_PROTOCOL_VERSIONS
+            .iter()
+            .find(|candidate| **candidate == version)
+            .copied()
+    });
+    matched.unwrap_or(LATEST_LEGACY_PROTOCOL_VERSION)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -5,7 +5,6 @@
 //! `_meta`, and `resultType` results. The cross-era equivalence test proves
 //! both eras converge on identical Relay submission outcomes.
 
-#[allow(unused_imports)]
 use super::*;
 use relay_core::{
     MAX_LOCAL_TASK_INPUT_BYTES, ProjectRegistry, ProjectRegistryError, RegisterProject,
@@ -256,6 +255,22 @@ async fn persistence_store_failures_map_to_store_unavailable() {
     );
 }
 
+#[test]
+fn local_filesystem_ingress_errors_are_scrubbed_before_reaching_the_wire() {
+    // FileRead-family errors embed the operator's absolute paths in their
+    // Display text; that detail must stay on stderr, never reach MCP clients.
+    let leaky = TaskIngressError::FileNotUtf8 {
+        path: "C:\\Users\\someone\\secret\\task.md".to_owned(),
+        source: String::from_utf8(vec![0xFF, 0xFE]).unwrap_err(),
+    };
+    let (code, message) = service::map_ingress_error(&leaky);
+    assert_eq!(code, protocol::INTERNAL_ERROR);
+    assert!(
+        !message.contains("C:\\Users"),
+        "client-facing message must not carry local paths: {message}"
+    );
+}
+
 // ----------------------------------------------------------------------
 // Strict JSON-RPC 2.0 validation (handoff §7.4)
 // ----------------------------------------------------------------------
@@ -362,6 +377,25 @@ async fn every_retained_legacy_revision_initializes() {
     }
 
     assert_still_responsive(&mut server).await;
+}
+
+#[tokio::test]
+async fn no_mutually_supported_legacy_version_degrades_to_latest_and_client_decides() {
+    // MCP legacy negotiation has no error branch for "no mutual version":
+    // the server always answers with a revision it supports, and a client
+    // that cannot speak any of them is responsible for disconnecting
+    // (specification 2025-06-18, Version Negotiation). Assert exactly that
+    // contract so a future change cannot invent an error path silently.
+    let mut server = test_server().await;
+
+    let response = exchange(&mut server, &initialize_line("1900-01-01"))
+        .await
+        .unwrap();
+    assert!(response.get("error").is_none());
+    assert_eq!(
+        response["result"]["protocolVersion"],
+        protocol::LATEST_LEGACY_PROTOCOL_VERSION
+    );
 }
 
 #[tokio::test]

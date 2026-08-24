@@ -209,3 +209,15 @@ Future commit/push support requires a separate ADR.
 External-process extensions are preferred over in-process dynamic libraries.
 
 They remain untrusted processes and require explicit installation/configuration.
+
+---
+
+## MCP Submission Surface
+
+`relay serve-mcp` is ingress-only: it can validate and persist handoffs, never
+execute anything. Client-facing error messages are scrubbed of local
+filesystem paths; full detail goes to stderr diagnostics only. Legacy-era MCP
+requests are served leniently before `notifications/initialized` (the
+specifications do not gate client requests on initialize); the lifecycle state
+is tracked for diagnostics, and every submission still passes the same
+fail-closed validation as local import.

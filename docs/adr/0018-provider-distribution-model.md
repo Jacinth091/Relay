@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for Foundation v1.8.
+Partially superseded by [ADR-0020](0020-relay-architecture-v2.md) for Relay Architecture v2 (2026-09-17). Unimplemented provider fan-out and M10 provider-distribution directions are superseded by the v2 role-based workflow and attempt model. Historical v0.1 record preserved.
 
 ## Context
 

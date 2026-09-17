@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for Foundation v1.8.
+Superseded by [ADR-0020](0020-relay-architecture-v2.md) for Relay Architecture v2 (2026-09-17). Historical v0.1 record preserved.
 
 ## Context
 

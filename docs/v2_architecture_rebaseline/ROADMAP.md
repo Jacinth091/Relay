@@ -1,0 +1,59 @@
+# Relay Architecture v2 — Implementation Roadmap & Status
+
+**Architecture Generation:** v2  
+**Authority:** [ADR-0020: Relay Architecture v2](../adr/0020-relay-architecture-v2.md)  
+**Historical Lineage:** M0–M9 lineage frozen (branch `feat/m9-relay-direct-mcp` at commit `0d03bed`)  
+**Status Date:** 2026-09-18  
+
+---
+
+## 1. Baseline Preflight Evidence (Fixed Point)
+
+- **Parent branch:** `feat/m9-relay-direct-mcp`
+- **Fixed-point start commit:** `0d03bed` (`fix(mcp): repair comment encoding, tighten scrubbing doc, drop dead EOF branch`)
+- **Workspace Quality Gates:**
+  - `relay-core` (85 unit & integration tests): **PASS**
+  - `relay-protocol` (16 wire tests): **PASS**
+  - `relay-runtime` (5 tests): **PASS**
+  - `relay-runtime-antigravity` (3 tests): **PASS**
+  - `relay-runtime-fake` (recovery loop tests): **PASS**
+  - `relay-store` (SQLite concurrency & state machine): **PASS**
+  - `relay-tui` (124 tests): **PASS**
+  - `serve_mcp` integration tests (9 tests): **PASS**
+  - *Toolchain requirement:* Windows MSVC `link.exe` via Visual Studio Build Tools (`vcvarsall.bat x64`).
+
+---
+
+## 2. Implementation Sequence Status
+
+Per [02-IMPLEMENTATION-SEQUENCE.md](02-IMPLEMENTATION-SEQUENCE.md):
+
+| Phase | Description | Status | Evidence / Deliverables |
+|---|---|---|---|
+| **00** | **Governance Rebaseline & Historical Freeze** | **DONE** | ADR-0020 accepted, ADR-0017/0018 updated, M10 pack marked on-hold, v2 docs in-tree, roadmap established, preflight gates verified. |
+| **01** | **Canonical Daemon Ownership + Durable Effects / Events** | Pending | Single writer daemon process, client protocol, durable command IDs, `PendingEffect`/`EffectResult`, `EventRecord` monotonic sequencing. |
+| **02** | **Project / Checkout / Trust Foundation** | Pending | `DeclaredProjectIdentity`, `TrustedProjectRegistration`, `CheckoutId`, remote fingerprint, allowed worktree root. |
+| **03** | **Approved Intent, Execution Grant, Workflow, Roles, Policy** | Pending | `ApprovedIntent`, `ExecutionGrant`, `WorkflowRun`, `RoleInstance`, `RoleAttempt`, `ScopeExpansionRequest`, policy compiler. Legacy adapter for `HandoffTask v1`. |
+| **04** | **Repository / Worktree, Candidate, Lease, Artifact Foundation** | Pending | Isolated worktrees, `Candidate` generation with full repo fingerprint, monotonic `Lease` fencing tokens, immutable `Artifact` store. |
+| **05** | **Deterministic End-to-End Tracer Bullet (FakeBackplane)** | Pending | Implementer -> `Candidate 1` -> Verifier -> Remediation loop verified end-to-end without real providers or external backplanes. |
+| **06** | **RuntimeBackplane + LocalProcessBackplane** | Pending | Decoupled `RuntimeBackplane` seam (`provision`, `observe`, `send`, `interrupt`, `dispose`, `snapshot`, `reconcile`), `LocalProcessBackplane` implementation. |
+| **07** | **HerdrBackplane One-Role Vertical Slice** | Pending | Herdr transport adapter, private internal topology planner (Workspace/Tab/Pane), runtime binding persistence. |
+| **08** | **Provider Adapters, Execution Targets, Resolver, Fallback** | Pending | `ProviderAdapter` contract, deterministic resolver, immutable `ExecutionTarget`, provider retry/fallback. |
+| **09** | **Relay Exchange + Role-Session Capabilities** | Pending | Scoped role inbox, structured results, attempt-scoped ephemeral capability tokens, provenance-tracked artifacts. |
+| **10** | **Delegation, Consultation, Budgets, Deadlock Prevention** | Pending | Role dependency graph, cycle detection, execution budgets, bounded role spawning. |
+| **11** | **Multi-Project / Provider Scheduler v2** | Pending | Concurrent multi-project fairness, checkout write serialization, provider capacity tracking. |
+| **12** | **Web UI + Relay TUI as Daemon Clients** | Pending | Local Web operational dashboard, TUI daemon client, monotonic event synchronization. |
+| **13** | **Privileged Action Executor + Exact Approvals** | Pending | `ApprovalRequest`/`ApprovalGrant`, parameter hashing, replay protection, deterministic executor. |
+| **14** | **SemanticDecisionEngine + Optional Jev Shadow Mode** | Pending | Optional advisory engine interface (`Recommend \| Abstain \| Escalate`), shadow-mode evaluation, non-authoritative. |
+| **15** | **Integrated Recovery, Retention, Security Truthfulness, Docs Cutover** | Pending | End-to-end failure matrix, resource cleanup, documentation cutover. |
+
+---
+
+## 3. Preserved Invariants & Boundary Commitments
+
+1. `HandoffTask v1` wire compatibility is preserved through internal adaptation.
+2. `relay serve-mcp` (`submit_handoff`) continues to mean *validate -> resolve trusted project -> persist -> READY*. No auto-execution.
+3. Explicit human Run approval is mandatory before any workflow execution begins.
+4. No automatic Git push.
+5. Local trusted project registration is authoritative; remote tasks cannot provide arbitrary execution paths.
+6. Fail-closed safety for all unknown protocols, malformed inputs, or security mismatches.

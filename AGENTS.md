@@ -8,18 +8,17 @@ It is designed to be **self-sufficient**: an agent that reads only this file sho
 
 ## 1. Identity Snapshot
 
-**Relay is a deterministic handoff engine** — not an orchestrator of intent, not an LLM, not an MCP server (an MCP server is one door into it).
+**Relay Architecture v2 is a local-first, policy-governed orchestration control plane for user-approved software work** (ADR-0020, superseding ADR-0017).
 
-- It accepts user-approved implementation intent ("handoffs"), validates and persists them, routes execution to chosen coding-runtime providers (Codex CLI today), supervises runs, applies bounded repair, and escalates with structured packets when execution crosses back into planning territory.
-- It performs **execution orchestration only**: validate → route → persist → spawn → stream events → bounded repair → escalate. It never plans, reasons, or decides strategy (that belongs to humans and planner surfaces).
-- One-sentence anchor: *"Relay is the border checkpoint between conversation and execution — it stamps, routes, and logs; it never decides where anyone is going."*
+- **The human owns intent** and privileged decisions.
+- **Relay (Daemon)** owns durable tasks, approved intent, execution grants, workflows, roles, attempts, policy, provider resolution, artifacts, delegation, approvals, candidates, leases, scheduling, recovery, and user-facing semantic state.
+- **Runtime backplanes** host processes and sessions without owning tasks (Herdr is the reference interactive backplane; `LocalProcessBackplane` provides the minimal non-Herdr execution path; `FakeBackplane` provides deterministic testing).
+- **Provider adapters** translate provider-specific launch, readiness, and result behavior (Codex, Claude, AGY, OpenCode).
+- **Provider CLIs** perform assigned role attempts.
+- **Semantic decision engines** (e.g., Jev) are optional advisory helpers after deterministic filtering; they never create authority.
+- One-sentence anchor: *"The human owns intent. Relay owns controlled orchestration. Runtime backplanes host execution. Providers perform assigned roles."*
 
-Normative sources: `docs/adr/0017-relay-identity-deterministic-handoff-engine.md`, `docs/architecture.md` §"What Relay Is / Is Not". Read these before any work that feels identity-blurring.
-
-Classification test for any capability:
-1. Deterministic policy/lifecycle/persistence/validation → Relay Core.
-2. Data movement to/from external hosts/providers → edge crate.
-3. Intent or strategy decisions → does not belong in Relay.
+Normative sources: `docs/adr/0020-relay-architecture-v2.md`, `docs/v2_architecture_rebaseline/`.
 
 ---
 
@@ -265,7 +264,7 @@ Add focused integration tests for process boundaries, repository safety, recover
 
 ## 12. Next Up (so agents don't guess)
 
-1. Close M8.1 leftovers (items 04–05 partials: provider-neutral Markdown rendering, scrollable execution/result polish) — see `docs/M8_1_PACK/`.
-2. Merge `feat/m8-codex-runtime` through staging to main.
-3. Merge `feat/m9-relay-direct-mcp` through staging to main — M9 is implemented (01 CLI/process model, 02 store concurrency, 03 MCP protocol + `submit_handoff`, 04 conformance tests + host docs under `docs/planner-hosts/`).
-4. Later (ADR-0018 intent): provider fan-out, health-aware routing, cross-provider aggregation — design first, label honestly.
+1. **Relay Architecture v2 Rebaseline** — follow the 16-phase sequential implementation plan in `docs/v2_architecture_rebaseline/02-IMPLEMENTATION-SEQUENCE.md` and track via `docs/v2_architecture_rebaseline/ROADMAP.md`.
+2. **Phase 00 (DONE)**: ADR-0020 accepted, historical freeze recorded, rebaseline specifications tracked in-tree.
+3. **Phase 01 (Next)**: Canonical Daemon Ownership + Durable Effects / Events (`PendingEffect`, `EffectResult`, monotonic `EventRecord` sequencing).
+4. **Subsequent Phases**: Domain contracts (Phase 03), Repository/Candidate/Leases (Phase 04), Deterministic Tracer Bullet (Phase 05), Backplane Seam (Phase 06), Herdr Backplane (Phase 07), Provider Adapters (Phase 08).

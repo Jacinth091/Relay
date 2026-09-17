@@ -542,6 +542,22 @@ impl RoleInstance {
             ended_at: None,
         })
     }
+
+    /// Accepts an artifact as the required result of this role instance, completing it.
+    pub fn accept_result(&mut self, artifact_id: String) {
+        self.state = RoleInstanceState::Completed;
+        self.accepted_result_artifact = Some(artifact_id);
+    }
+
+    /// Marks the role instance as failed when attempts are exhausted or execution is blocked.
+    pub fn fail(&mut self) {
+        self.state = RoleInstanceState::Failed;
+    }
+
+    /// Marks the role instance as cancelled.
+    pub fn cancel(&mut self) {
+        self.state = RoleInstanceState::Cancelled;
+    }
 }
 
 // ---------------------------------------------------------------------------

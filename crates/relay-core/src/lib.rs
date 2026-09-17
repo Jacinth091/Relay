@@ -6,6 +6,8 @@ pub mod daemon;
 mod durable_state;
 mod execution;
 mod execution_planning;
+pub mod portable_config;
+pub mod project_identity;
 mod project_registry;
 mod repository_safety;
 mod task_ingress;
@@ -35,6 +37,14 @@ pub use execution::{
 pub use execution_planning::{
     ExecutionPlan, ExecutionPlanEnvironment, ExecutionPlanIntent, ExecutionPlanningError,
     PLANNED_MAX_DURATION, PLANNED_MAX_REPAIR_ATTEMPTS, build_execution_plan,
+};
+pub use portable_config::{
+    POLICIES_CONFIG_FILE, PROJECT_CONFIG_FILE, PortableConfigError, PortableRepositoryConfig,
+    RELAY_DIR, RawPoliciesToml, RawRestrictionsSection, TrustClassification,
+};
+pub use project_identity::{
+    Checkout, CheckoutId, CheckoutTrustState, DeclaredProjectIdentity, ProjectId,
+    ProjectIdentityError, RemoteFingerprint, TrustedProjectRegistration,
 };
 pub use project_registry::{
     ExpectedRemote, GitHubRepositoryMetadata, ProjectKey, ProjectRegistry, ProjectRegistryError,

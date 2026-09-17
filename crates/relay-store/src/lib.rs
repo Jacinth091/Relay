@@ -83,6 +83,67 @@ pub struct ExecutionRecord {
     pub runtime_metadata_json: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandRecord {
+    pub id: String,
+    pub command_type: String,
+    pub payload_json: String,
+    pub status: String,
+    pub response_json: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewPendingEffectRecord {
+    pub id: String,
+    pub effect_type: String,
+    pub idempotency_key: String,
+    pub payload_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingEffectRecord {
+    pub id: String,
+    pub effect_type: String,
+    pub idempotency_key: String,
+    pub payload_json: String,
+    pub state: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectResultRecord {
+    pub id: String,
+    pub effect_id: String,
+    pub outcome: String,
+    pub result_json: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventRecord {
+    pub sequence: i64,
+    pub task_id: Option<String>,
+    pub execution_id: Option<String>,
+    pub event_kind: String,
+    pub event_json: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonLeaseRecord {
+    pub lease_id: String,
+    pub holder_pid: i64,
+    pub holder_host: String,
+    pub acquired_at: String,
+    pub heartbeat_at: String,
+    pub fencing_token: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
@@ -865,6 +926,491 @@ impl SqliteStore {
         rows.into_iter().map(row_to_task_record).collect()
     }
 
+    pub async fn record_command(
+        &self,
+        id: &str,
+        command_type: &str,
+        payload_json: &str,
+    ) -> Result<bool, StoreError> {
+        retry_on_transient_lock(|| self.record_command_once(id, command_type, payload_json)).await
+    }
+
+    async fn record_command_once(
+        &self,
+        id: &str,
+        command_type: &str,
+        payload_json: &str,
+    ) -> Result<bool, StoreError> {
+        let res = sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO commands (id, command_type, payload_json, status)
+            VALUES (?1, ?2, ?3, 'received')
+            "#,
+        )
+        .bind(id)
+        .bind(command_type)
+        .bind(payload_json)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(res.rows_affected() > 0)
+    }
+
+    pub async fn get_command(&self, id: &str) -> Result<Option<CommandRecord>, StoreError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, command_type, payload_json, status, response_json, created_at, updated_at
+            FROM commands
+            WHERE id = ?1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| {
+            Ok(CommandRecord {
+                id: r.try_get("id")?,
+                command_type: r.try_get("command_type")?,
+                payload_json: r.try_get("payload_json")?,
+                status: r.try_get("status")?,
+                response_json: r.try_get("response_json")?,
+                created_at: r.try_get("created_at")?,
+                updated_at: r.try_get("updated_at")?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn complete_command(
+        &self,
+        id: &str,
+        status: &str,
+        response_json: Option<&str>,
+    ) -> Result<(), StoreError> {
+        retry_on_transient_lock(|| self.complete_command_once(id, status, response_json)).await
+    }
+
+    async fn complete_command_once(
+        &self,
+        id: &str,
+        status: &str,
+        response_json: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let res = sqlx::query(
+            r#"
+            UPDATE commands
+            SET status = ?1,
+                response_json = ?2,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?3
+            "#,
+        )
+        .bind(status)
+        .bind(response_json)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        if res.rows_affected() == 0 {
+            return Err(StoreError::CommandNotFound { id: id.to_owned() });
+        }
+        Ok(())
+    }
+
+    pub async fn insert_pending_effect(
+        &self,
+        effect: &NewPendingEffectRecord,
+    ) -> Result<PendingEffectRecord, StoreError> {
+        retry_on_transient_lock(|| self.insert_pending_effect_once(effect)).await
+    }
+
+    async fn insert_pending_effect_once(
+        &self,
+        effect: &NewPendingEffectRecord,
+    ) -> Result<PendingEffectRecord, StoreError> {
+        sqlx::query(
+            r#"
+            INSERT INTO pending_effects (id, effect_type, idempotency_key, payload_json, state)
+            VALUES (?1, ?2, ?3, ?4, 'pending')
+            "#,
+        )
+        .bind(&effect.id)
+        .bind(&effect.effect_type)
+        .bind(&effect.idempotency_key)
+        .bind(&effect.payload_json)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_pending_effect(&effect.id).await?.ok_or_else(|| {
+            StoreError::PendingEffectNotFound {
+                id: effect.id.clone(),
+            }
+        })
+    }
+
+    pub async fn get_pending_effect(
+        &self,
+        id: &str,
+    ) -> Result<Option<PendingEffectRecord>, StoreError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, effect_type, idempotency_key, payload_json, state, attempts, last_error, created_at, updated_at
+            FROM pending_effects
+            WHERE id = ?1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(row_to_pending_effect_record).transpose()
+    }
+
+    pub async fn get_pending_effect_by_idempotency_key(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<PendingEffectRecord>, StoreError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, effect_type, idempotency_key, payload_json, state, attempts, last_error, created_at, updated_at
+            FROM pending_effects
+            WHERE idempotency_key = ?1
+            "#,
+        )
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(row_to_pending_effect_record).transpose()
+    }
+
+    pub async fn list_pending_effects(
+        &self,
+        state: Option<&str>,
+    ) -> Result<Vec<PendingEffectRecord>, StoreError> {
+        let rows = if let Some(st) = state {
+            sqlx::query(
+                r#"
+                SELECT id, effect_type, idempotency_key, payload_json, state, attempts, last_error, created_at, updated_at
+                FROM pending_effects
+                WHERE state = ?1
+                ORDER BY created_at ASC
+                "#,
+            )
+            .bind(st)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT id, effect_type, idempotency_key, payload_json, state, attempts, last_error, created_at, updated_at
+                FROM pending_effects
+                ORDER BY created_at ASC
+                "#,
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.into_iter().map(row_to_pending_effect_record).collect()
+    }
+
+    pub async fn update_effect_state(
+        &self,
+        id: &str,
+        state: &str,
+        last_error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        retry_on_transient_lock(|| self.update_effect_state_once(id, state, last_error)).await
+    }
+
+    async fn update_effect_state_once(
+        &self,
+        id: &str,
+        state: &str,
+        last_error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let res = sqlx::query(
+            r#"
+            UPDATE pending_effects
+            SET state = ?1,
+                attempts = attempts + 1,
+                last_error = ?2,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?3
+            "#,
+        )
+        .bind(state)
+        .bind(last_error)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        if res.rows_affected() == 0 {
+            return Err(StoreError::PendingEffectNotFound { id: id.to_owned() });
+        }
+        Ok(())
+    }
+
+    pub async fn record_effect_result(
+        &self,
+        id: &str,
+        effect_id: &str,
+        outcome: &str,
+        result_json: &str,
+    ) -> Result<EffectResultRecord, StoreError> {
+        retry_on_transient_lock(|| {
+            self.record_effect_result_once(id, effect_id, outcome, result_json)
+        })
+        .await
+    }
+
+    async fn record_effect_result_once(
+        &self,
+        id: &str,
+        effect_id: &str,
+        outcome: &str,
+        result_json: &str,
+    ) -> Result<EffectResultRecord, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO effect_results (id, effect_id, outcome, result_json)
+            VALUES (?1, ?2, ?3, ?4)
+            "#,
+        )
+        .bind(id)
+        .bind(effect_id)
+        .bind(outcome)
+        .bind(result_json)
+        .execute(&mut *transaction)
+        .await?;
+
+        sqlx::query(
+            r#"
+            UPDATE pending_effects
+            SET state = CASE WHEN ?1 = 'success' THEN 'completed' ELSE 'failed' END,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?2
+            "#,
+        )
+        .bind(outcome)
+        .bind(effect_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        let row = sqlx::query(
+            r#"
+            SELECT id, effect_id, outcome, result_json, created_at
+            FROM effect_results
+            WHERE id = ?1
+            "#,
+        )
+        .bind(id)
+        .fetch_one(&mut *transaction)
+        .await?;
+
+        let record = EffectResultRecord {
+            id: row.try_get("id")?,
+            effect_id: row.try_get("effect_id")?,
+            outcome: row.try_get("outcome")?,
+            result_json: row.try_get("result_json")?,
+            created_at: row.try_get("created_at")?,
+        };
+
+        transaction.commit().await?;
+        Ok(record)
+    }
+
+    pub async fn get_events_after(
+        &self,
+        after_sequence: i64,
+        limit: i64,
+    ) -> Result<Vec<EventRecord>, StoreError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, task_id, execution_id, event_kind, event_json, created_at
+            FROM events
+            WHERE id > ?1
+            ORDER BY id ASC
+            LIMIT ?2
+            "#,
+        )
+        .bind(after_sequence)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(EventRecord {
+                    sequence: row.try_get("id")?,
+                    task_id: row.try_get("task_id")?,
+                    execution_id: row.try_get("execution_id")?,
+                    event_kind: row.try_get("event_kind")?,
+                    event_json: row.try_get("event_json")?,
+                    created_at: row.try_get("created_at")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn latest_event_sequence(&self) -> Result<i64, StoreError> {
+        let max_id = sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(id) FROM events")
+            .fetch_one(&self.pool)
+            .await?;
+
+        Ok(max_id.unwrap_or(0))
+    }
+
+    pub async fn acquire_or_renew_daemon_lease(
+        &self,
+        lease_id: &str,
+        holder_pid: i64,
+        holder_host: &str,
+        ttl: Duration,
+    ) -> Result<DaemonLeaseRecord, StoreError> {
+        retry_on_transient_lock(|| {
+            self.acquire_or_renew_daemon_lease_once(lease_id, holder_pid, holder_host, ttl)
+        })
+        .await
+    }
+
+    async fn acquire_or_renew_daemon_lease_once(
+        &self,
+        lease_id: &str,
+        holder_pid: i64,
+        holder_host: &str,
+        ttl: Duration,
+    ) -> Result<DaemonLeaseRecord, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        let existing = sqlx::query(
+            r#"
+            SELECT lease_id, holder_pid, holder_host, acquired_at, heartbeat_at, fencing_token,
+                   CAST((strftime('%s', 'now') - strftime('%s', heartbeat_at)) AS INTEGER) as elapsed_secs
+            FROM daemon_leases
+            WHERE lease_id = ?1
+            "#,
+        )
+        .bind(lease_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+
+        if let Some(row) = existing {
+            let current_pid: i64 = row.try_get("holder_pid")?;
+            let current_host: String = row.try_get("holder_host")?;
+            let elapsed_secs: Option<i64> = row.try_get("elapsed_secs")?;
+
+            if current_pid == holder_pid && current_host == holder_host {
+                // Heartbeat renewal
+                sqlx::query(
+                    r#"
+                    UPDATE daemon_leases
+                    SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE lease_id = ?1
+                    "#,
+                )
+                .bind(lease_id)
+                .execute(&mut *transaction)
+                .await?;
+            } else {
+                let ttl_secs = ttl.as_secs() as i64;
+                let is_stale = elapsed_secs.is_none_or(|s| s >= ttl_secs);
+
+                if is_stale {
+                    sqlx::query(
+                        r#"
+                        UPDATE daemon_leases
+                        SET holder_pid = ?1,
+                            holder_host = ?2,
+                            acquired_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                            heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                            fencing_token = fencing_token + 1
+                        WHERE lease_id = ?3
+                        "#,
+                    )
+                    .bind(holder_pid)
+                    .bind(holder_host)
+                    .bind(lease_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                } else {
+                    return Err(StoreError::DaemonLeaseHeld {
+                        lease_id: lease_id.to_string(),
+                        holder_pid: current_pid,
+                        holder_host: current_host,
+                    });
+                }
+            }
+        } else {
+            sqlx::query(
+                r#"
+                INSERT INTO daemon_leases (lease_id, holder_pid, holder_host, fencing_token)
+                VALUES (?1, ?2, ?3, 1)
+                "#,
+            )
+            .bind(lease_id)
+            .bind(holder_pid)
+            .bind(holder_host)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
+        let updated = sqlx::query(
+            r#"
+            SELECT lease_id, holder_pid, holder_host, acquired_at, heartbeat_at, fencing_token
+            FROM daemon_leases
+            WHERE lease_id = ?1
+            "#,
+        )
+        .bind(lease_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+
+        let record = DaemonLeaseRecord {
+            lease_id: updated.try_get("lease_id")?,
+            holder_pid: updated.try_get("holder_pid")?,
+            holder_host: updated.try_get("holder_host")?,
+            acquired_at: updated.try_get("acquired_at")?,
+            heartbeat_at: updated.try_get("heartbeat_at")?,
+            fencing_token: updated.try_get("fencing_token")?,
+        };
+
+        transaction.commit().await?;
+        Ok(record)
+    }
+
+    pub async fn release_daemon_lease(
+        &self,
+        lease_id: &str,
+        holder_pid: i64,
+    ) -> Result<(), StoreError> {
+        retry_on_transient_lock(|| self.release_daemon_lease_once(lease_id, holder_pid)).await
+    }
+
+    async fn release_daemon_lease_once(
+        &self,
+        lease_id: &str,
+        holder_pid: i64,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"
+            DELETE FROM daemon_leases
+            WHERE lease_id = ?1
+              AND holder_pid = ?2
+            "#,
+        )
+        .bind(lease_id)
+        .bind(holder_pid)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     #[cfg(test)]
     async fn task_event_count(&self, id: &str) -> Result<i64, StoreError> {
         let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events WHERE task_id = ?1")
@@ -1097,6 +1643,22 @@ fn row_to_execution_record(row: sqlx::sqlite::SqliteRow) -> Result<ExecutionReco
     })
 }
 
+fn row_to_pending_effect_record(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<PendingEffectRecord, StoreError> {
+    Ok(PendingEffectRecord {
+        id: row.try_get("id")?,
+        effect_type: row.try_get("effect_type")?,
+        idempotency_key: row.try_get("idempotency_key")?,
+        payload_json: row.try_get("payload_json")?,
+        state: row.try_get("state")?,
+        attempts: row.try_get("attempts")?,
+        last_error: row.try_get("last_error")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("failed to create Relay database directory '{path}': {source}")]
@@ -1114,6 +1676,16 @@ pub enum StoreError {
     TaskNotFound { id: String },
     #[error("execution {id} was not found")]
     ExecutionNotFound { id: String },
+    #[error("command {id} was not found")]
+    CommandNotFound { id: String },
+    #[error("pending effect {id} was not found")]
+    PendingEffectNotFound { id: String },
+    #[error("daemon lease '{lease_id}' is held by pid {holder_pid} on {holder_host}")]
+    DaemonLeaseHeld {
+        lease_id: String,
+        holder_pid: i64,
+        holder_host: String,
+    },
     #[error("task {id} state conflict: expected '{expected_state}', found '{actual_state}'")]
     StateConflict {
         id: String,
@@ -1625,6 +2197,164 @@ mod tests {
         assert_eq!(execution.task_id, "task-reopen-exec");
         assert_eq!(execution.phase, "finished");
         assert_eq!(execution.exit_outcome.as_deref(), Some("success"));
+    }
+
+    #[tokio::test]
+    async fn commands_idempotency_and_completion() {
+        let store = SqliteStore::in_memory().await.unwrap();
+
+        let inserted = store
+            .record_command("cmd-1", "submit_handoff", r#"{"title":"test"}"#)
+            .await
+            .unwrap();
+        assert!(inserted, "first record_command should return true");
+
+        let duplicate = store
+            .record_command("cmd-1", "submit_handoff", r#"{"title":"test"}"#)
+            .await
+            .unwrap();
+        assert!(
+            !duplicate,
+            "duplicate record_command should return false (idempotent)"
+        );
+
+        let cmd = store.get_command("cmd-1").await.unwrap().unwrap();
+        assert_eq!(cmd.status, "received");
+
+        store
+            .complete_command("cmd-1", "applied", Some(r#"{"result":"ok"}"#))
+            .await
+            .unwrap();
+
+        let completed = store.get_command("cmd-1").await.unwrap().unwrap();
+        assert_eq!(completed.status, "applied");
+        assert_eq!(
+            completed.response_json.as_deref(),
+            Some(r#"{"result":"ok"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_effects_lifecycle_and_idempotency_collision() {
+        let store = SqliteStore::in_memory().await.unwrap();
+
+        let effect = NewPendingEffectRecord {
+            id: "eff-1".to_owned(),
+            effect_type: "process_spawn".to_owned(),
+            idempotency_key: "key-123".to_owned(),
+            payload_json: r#"{"cmd":"cargo"}"#.to_owned(),
+        };
+
+        let created = store.insert_pending_effect(&effect).await.unwrap();
+        assert_eq!(created.state, "pending");
+        assert_eq!(created.attempts, 0);
+
+        // Duplicate idempotency key must fail closed
+        let duplicate = NewPendingEffectRecord {
+            id: "eff-2".to_owned(),
+            effect_type: "process_spawn".to_owned(),
+            idempotency_key: "key-123".to_owned(),
+            payload_json: r#"{"cmd":"cargo"}"#.to_owned(),
+        };
+        assert!(store.insert_pending_effect(&duplicate).await.is_err());
+
+        store
+            .update_effect_state("eff-1", "in_flight", None)
+            .await
+            .unwrap();
+        let in_flight = store.get_pending_effect("eff-1").await.unwrap().unwrap();
+        assert_eq!(in_flight.state, "in_flight");
+        assert_eq!(in_flight.attempts, 1);
+
+        let result = store
+            .record_effect_result("res-1", "eff-1", "success", r#"{"pid":42}"#)
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, "success");
+
+        let completed = store.get_pending_effect("eff-1").await.unwrap().unwrap();
+        assert_eq!(completed.state, "completed");
+    }
+
+    #[tokio::test]
+    async fn monotonic_events_retrieval_and_latest_sequence() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store
+            .insert_task(&task_record("task-1", "Test Task"))
+            .await
+            .unwrap();
+
+        store
+            .append_event(Some("task-1"), None, "step_1", Some(r#"{"n":1}"#))
+            .await
+            .unwrap();
+        store
+            .append_event(Some("task-1"), None, "step_2", Some(r#"{"n":2}"#))
+            .await
+            .unwrap();
+        store
+            .append_event(Some("task-1"), None, "step_3", Some(r#"{"n":3}"#))
+            .await
+            .unwrap();
+
+        let latest = store.latest_event_sequence().await.unwrap();
+        assert_eq!(latest, 4);
+
+        let events = store.get_events_after(1, 10).await.unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].sequence, 2);
+        assert_eq!(events[0].event_kind, "step_1");
+        assert_eq!(events[1].sequence, 3);
+        assert_eq!(events[1].event_kind, "step_2");
+        assert_eq!(events[2].sequence, 4);
+        assert_eq!(events[2].event_kind, "step_3");
+    }
+
+    #[tokio::test]
+    async fn daemon_lease_acquisition_renewal_rejection_and_stale_recovery() {
+        let store = SqliteStore::in_memory().await.unwrap();
+
+        let lease = store
+            .acquire_or_renew_daemon_lease("daemon-main", 1001, "host-a", Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(lease.holder_pid, 1001);
+        assert_eq!(lease.fencing_token, 1);
+
+        // Same holder can renew
+        let renewed = store
+            .acquire_or_renew_daemon_lease("daemon-main", 1001, "host-a", Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(renewed.fencing_token, 1);
+
+        // Other holder is rejected while active
+        let conflict = store
+            .acquire_or_renew_daemon_lease("daemon-main", 1002, "host-b", Duration::from_secs(60))
+            .await;
+        assert!(matches!(conflict, Err(StoreError::DaemonLeaseHeld { .. })));
+
+        // Other holder succeeds when lease is stale (ttl = 0)
+        let recovered = store
+            .acquire_or_renew_daemon_lease("daemon-main", 1002, "host-b", Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(recovered.holder_pid, 1002);
+        assert_eq!(recovered.fencing_token, 2);
+
+        // Release lease
+        store
+            .release_daemon_lease("daemon-main", 1002)
+            .await
+            .unwrap();
+
+        // Now first holder can acquire fresh lease
+        let fresh = store
+            .acquire_or_renew_daemon_lease("daemon-main", 1001, "host-a", Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(fresh.holder_pid, 1001);
+        assert_eq!(fresh.fencing_token, 1);
     }
 
     fn task_record(id: &str, title: &str) -> NewTaskRecord {

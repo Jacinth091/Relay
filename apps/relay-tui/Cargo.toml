@@ -25,7 +25,7 @@ relay-runtime-fake = { path = "../../runtimes/relay-runtime-fake" }
 relay-store = { path = "../../crates/relay-store" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
-tokio = { version = "1.43.0", features = ["io-std", "io-util", "macros", "process", "rt", "sync", "time"] }
+tokio = { version = "1.43.0", features = ["io-std", "io-util", "macros", "process", "rt", "signal", "sync", "time"] }
 toml = "0.8"
 tracing.workspace = true
 tracing-subscriber.workspace = true

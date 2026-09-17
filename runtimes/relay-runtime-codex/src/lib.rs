@@ -1201,8 +1201,12 @@ async fn terminate_process_tree(child: &mut tokio::process::Child) {
         let mut taskkill = Command::new("taskkill");
         taskkill
             .args(["/T", "/F", "/PID", pid.as_str()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
         let _ = taskkill.status().await;
+        let _ = child.kill().await;
     }
     #[cfg(not(windows))]
     {

@@ -43,8 +43,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Ok(command) => command,
         Err(error) => error.exit(),
     };
-    if let cli::CliCommand::ServeMcp = command {
-        return serve_mcp().await;
+    match command {
+        cli::CliCommand::ServeMcp => return serve_mcp().await,
+        cli::CliCommand::Daemon {
+            lease_id,
+            lease_ttl,
+        } => return run_daemon(lease_id, lease_ttl).await,
+        cli::CliCommand::RunTui => {}
     }
 
     let config_path = default_config_path();
@@ -110,6 +115,67 @@ async fn serve_mcp() -> Result<(), Box<dyn Error>> {
     })?;
 
     mcp::run(relay, store).await?;
+    Ok(())
+}
+
+async fn run_daemon(lease_id: String, lease_ttl_secs: u64) -> Result<(), Box<dyn Error>> {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
+
+    let config_path = default_config_path();
+    let relay = match Relay::load_from_config_path(&config_path) {
+        Ok(relay) => relay,
+        Err(error) => {
+            eprintln!(
+                "relay: config error at {}: {error}\nDaemon started with empty project registry.",
+                config_path.display()
+            );
+            Relay::new()
+        }
+    };
+
+    let database_path = default_database_path();
+    let store = relay_core::SqliteStore::open(&database_path).await.map_err(|error| {
+        eprintln!(
+            "relay: database error at {}: {error}\ndaemon cannot confirm durability and must exit.",
+            database_path.display()
+        );
+        error
+    })?;
+
+    let ttl = std::time::Duration::from_secs(lease_ttl_secs);
+    let mut daemon = relay_core::DaemonServer::start(store, relay, &lease_id, ttl)
+        .await
+        .map_err(|error| {
+            eprintln!("relay: failed to start daemon: {error}");
+            error
+        })?;
+
+    tracing::info!(
+        lease_id = %lease_id,
+        fencing_token = daemon.fencing_token(),
+        "Relay daemon running"
+    );
+
+    let heartbeat_interval = (ttl / 3).max(std::time::Duration::from_secs(1));
+    let mut interval = tokio::time::interval(heartbeat_interval);
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                if let Err(err) = daemon.heartbeat(ttl).await {
+                    tracing::error!(error = %err, "failed to renew daemon lease heartbeat");
+                    return Err(Box::new(err));
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Relay daemon received shutdown signal");
+                break;
+            }
+        }
+    }
+
     Ok(())
 }
 

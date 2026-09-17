@@ -31,7 +31,7 @@ Per [02-IMPLEMENTATION-SEQUENCE.md](02-IMPLEMENTATION-SEQUENCE.md):
 | Phase | Description | Status | Evidence / Deliverables |
 |---|---|---|---|
 | **00** | **Governance Rebaseline & Historical Freeze** | **DONE** | ADR-0020 accepted, ADR-0017/0018 updated, M10 pack marked on-hold, v2 docs in-tree, roadmap established, preflight gates verified. |
-| **01** | **Canonical Daemon Ownership + Durable Effects / Events** | Pending | Single writer daemon process, client protocol, durable command IDs, `PendingEffect`/`EffectResult`, `EventRecord` monotonic sequencing. |
+| **01** | **Canonical Daemon Ownership + Durable Effects / Events** | **DONE** | Single writer daemon process (`relay daemon`), client protocol (`DaemonRequest`/`DaemonResponse`), durable command idempotency, `PendingEffect`/`EffectResult` lifecycle, `EventRecord` monotonic sequencing, snapshot sync, lease fencing tokens + heartbeat renewal, full workspace tests PASS. |
 | **02** | **Project / Checkout / Trust Foundation** | Pending | `DeclaredProjectIdentity`, `TrustedProjectRegistration`, `CheckoutId`, remote fingerprint, allowed worktree root. |
 | **03** | **Approved Intent, Execution Grant, Workflow, Roles, Policy** | Pending | `ApprovedIntent`, `ExecutionGrant`, `WorkflowRun`, `RoleInstance`, `RoleAttempt`, `ScopeExpansionRequest`, policy compiler. Legacy adapter for `HandoffTask v1`. |
 | **04** | **Repository / Worktree, Candidate, Lease, Artifact Foundation** | Pending | Isolated worktrees, `Candidate` generation with full repo fingerprint, monotonic `Lease` fencing tokens, immutable `Artifact` store. |

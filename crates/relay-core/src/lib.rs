@@ -2,6 +2,7 @@
 //!
 //! Presentation-framework types do not belong in this crate.
 
+pub mod daemon;
 mod durable_state;
 mod execution;
 mod execution_planning;
@@ -16,6 +17,11 @@ pub use relay_runtime::{
     ReasoningEffort, RuntimeExecutionSelection, RuntimeModelSelection, RuntimeReasoningSelection,
 };
 
+pub use daemon::{
+    CommandStatus, DAEMON_PROTOCOL_NAME, DAEMON_PROTOCOL_VERSION, DEFAULT_LEASE_ID,
+    DEFAULT_LEASE_TTL, DaemonCommand, DaemonError, DaemonRequest, DaemonResponse, DaemonServer,
+    DaemonSnapshot,
+};
 pub use durable_state::{
     SqliteStore, StoredTask, TaskPersistenceError, TaskState, default_database_path,
     get_stored_task, list_stored_tasks, list_stored_tasks_with_quarantined,

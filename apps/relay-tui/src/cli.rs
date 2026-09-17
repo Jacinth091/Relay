@@ -19,6 +19,12 @@ impl Cli {
 pub enum CliCommand {
     RunTui,
     ServeMcp,
+    Daemon {
+        #[arg(long, default_value = "relay-daemon-primary")]
+        lease_id: String,
+        #[arg(long, default_value_t = 15)]
+        lease_ttl: u64,
+    },
 }
 
 pub fn parse_cli<I, T>(args: I) -> Result<CliCommand, clap::Error>
@@ -50,6 +56,35 @@ mod tests {
         assert_eq!(
             parse_cli(args(&["serve-mcp"])).unwrap(),
             CliCommand::ServeMcp
+        );
+    }
+
+    #[test]
+    fn daemon_subcommand_defaults() {
+        assert_eq!(
+            parse_cli(args(&["daemon"])).unwrap(),
+            CliCommand::Daemon {
+                lease_id: "relay-daemon-primary".to_owned(),
+                lease_ttl: 15,
+            }
+        );
+    }
+
+    #[test]
+    fn daemon_subcommand_with_custom_flags() {
+        assert_eq!(
+            parse_cli(args(&[
+                "daemon",
+                "--lease-id",
+                "custom-lease",
+                "--lease-ttl",
+                "30"
+            ]))
+            .unwrap(),
+            CliCommand::Daemon {
+                lease_id: "custom-lease".to_owned(),
+                lease_ttl: 30,
+            }
         );
     }
 

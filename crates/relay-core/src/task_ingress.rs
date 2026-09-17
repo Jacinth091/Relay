@@ -4,6 +4,7 @@ use relay_protocol::{
     HandoffTask, ProtocolError, parse_handoff_task_json, parse_handoff_task_markdown,
     parse_handoff_task_text,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -13,12 +14,16 @@ use crate::{ProjectKey, ProjectRegistryError, Relay};
 pub const MAX_LOCAL_TASK_INPUT_BYTES: u64 = 512 * 1024;
 
 /// Relay-owned task identity, separate from all planner and transport IDs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TaskId(Uuid);
 
 impl TaskId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
+    }
+
+    pub fn generate() -> Self {
+        Self::new()
     }
 
     pub fn parse(input: impl AsRef<str>) -> Result<Self, uuid::Error> {

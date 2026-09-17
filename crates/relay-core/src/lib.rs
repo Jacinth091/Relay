@@ -6,11 +6,14 @@ pub mod daemon;
 mod durable_state;
 mod execution;
 mod execution_planning;
+pub mod legacy_adapter;
+pub mod policy;
 pub mod portable_config;
 pub mod project_identity;
 mod project_registry;
 mod repository_safety;
 mod task_ingress;
+pub mod workflow;
 
 use std::path::Path;
 
@@ -38,6 +41,14 @@ pub use execution_planning::{
     ExecutionPlan, ExecutionPlanEnvironment, ExecutionPlanIntent, ExecutionPlanningError,
     PLANNED_MAX_DURATION, PLANNED_MAX_REPAIR_ATTEMPTS, build_execution_plan,
 };
+pub use legacy_adapter::{
+    LegacyAdapterError, adapt_v1_handoff_to_approved_intent, create_v1_compatibility_run,
+    v1_compatibility_workflow_definition,
+};
+pub use policy::{
+    Capability, EnforcementClass, PolicyCompiler, PolicyDecision, PolicyDisposition, PolicyLayer,
+    built_in_safety_floor,
+};
 pub use portable_config::{
     POLICIES_CONFIG_FILE, PROJECT_CONFIG_FILE, PortableConfigError, PortableRepositoryConfig,
     RELAY_DIR, RawPoliciesToml, RawRestrictionsSection, TrustClassification,
@@ -58,6 +69,15 @@ pub use repository_safety::{
 pub use task_ingress::{
     ImportedTask, MAX_LOCAL_TASK_INPUT_BYTES, SubmissionTransport, TaskId, TaskImportCandidate,
     TaskIngressError,
+};
+pub use workflow::{
+    ApprovalGrant, ApprovalRequest, ApprovedIntent, ApprovedIntentId, ClarificationRequest,
+    ConfigSnapshot, ConfigSnapshotId, DecisionRequest, ExecutionBudget, ExecutionGrant,
+    ExecutionGrantId, ExecutionTarget, RoleAttempt, RoleAttemptId, RoleAttemptState,
+    RoleDefinition, RoleDefinitionId, RoleInstance, RoleInstanceId, RoleInstanceState,
+    RoleWriteMode, ScopeExpansionRequest, WorkflowDefinition, WorkflowDefinitionId, WorkflowError,
+    WorkflowNodeDefinition, WorkflowRun, WorkflowRunId, WorkflowRunState,
+    WorkflowTransitionDefinition,
 };
 
 /// Minimal Relay application state.

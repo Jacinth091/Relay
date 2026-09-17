@@ -2,6 +2,8 @@
 //!
 //! Presentation-framework types do not belong in this crate.
 
+pub mod artifact;
+pub mod candidate;
 pub mod daemon;
 mod durable_state;
 mod execution;
@@ -22,6 +24,14 @@ pub use relay_runtime::{
     ReasoningEffort, RuntimeExecutionSelection, RuntimeModelSelection, RuntimeReasoningSelection,
 };
 
+pub use artifact::{
+    ArtifactError, ArtifactId, ArtifactKind, ArtifactMetadata, ArtifactSensitivity,
+    ArtifactStorageRef, ArtifactStore, ArtifactTrustClass, CreateArtifactRequest, RetentionClass,
+};
+pub use candidate::{
+    Candidate, CandidateError, CandidateFingerprint, CandidateId, Lease, LeaseHolder, LeaseId,
+    LeaseKind, LeaseResource, LeaseState, WorktreeHandle, WorktreeManager, compute_digest,
+};
 pub use daemon::{
     CommandStatus, DAEMON_PROTOCOL_NAME, DAEMON_PROTOCOL_VERSION, DEFAULT_LEASE_ID,
     DEFAULT_LEASE_TTL, DaemonCommand, DaemonError, DaemonRequest, DaemonResponse, DaemonServer,

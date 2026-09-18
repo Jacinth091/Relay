@@ -644,23 +644,13 @@ pub struct ScopeExpansionRequest {
 
 // ---------------------------------------------------------------------------
 // 22. ApprovalRequest & Grant
+//
+// The Phase 03 placeholder shell previously here (bare String digests, no
+// expiration/replay protection) is superseded by the Phase 13 exact
+// approval contract in `crate::privileged` (`ApprovalRequest`,
+// `ApprovalGrant`, SHA-256 `ParameterDigest`), which is provider-agnostic
+// and used for privileged Git operations.
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApprovalRequest {
-    pub request_id: String,
-    pub task_id: TaskId,
-    pub operation: String,
-    pub parameter_digest: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApprovalGrant {
-    pub request_id: String,
-    pub parameter_digest: String,
-    pub granted_by: String,
-    pub granted_at: String,
-}
 
 // ---------------------------------------------------------------------------
 // Configuration Snapshot

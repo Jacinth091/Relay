@@ -13,6 +13,7 @@ mod execution_planning;
 pub mod legacy_adapter;
 pub mod policy;
 pub mod portable_config;
+pub mod privileged;
 pub mod project_identity;
 mod project_registry;
 mod repository_safety;
@@ -77,6 +78,11 @@ pub use portable_config::{
     POLICIES_CONFIG_FILE, PROJECT_CONFIG_FILE, PortableConfigError, PortableRepositoryConfig,
     RELAY_DIR, RawPoliciesToml, RawRestrictionsSection, TrustClassification,
 };
+pub use privileged::{
+    ApprovalGrant, ApprovalRequest, ApprovalRequestId, GitOperationRunner, ParameterDigest,
+    PrivilegedAction, PrivilegedActionExecutor, PrivilegedError, PrivilegedExecutionOutcome,
+    PrivilegedOperationRunner, PrivilegedRunOutcome,
+};
 pub use project_identity::{
     Checkout, CheckoutId, CheckoutTrustState, DeclaredProjectIdentity, ProjectId,
     ProjectIdentityError, RemoteFingerprint, TrustedProjectRegistration,
@@ -99,13 +105,12 @@ pub use task_ingress::{
     TaskIngressError,
 };
 pub use workflow::{
-    ApprovalGrant, ApprovalRequest, ApprovedIntent, ApprovedIntentId, ClarificationRequest,
-    ConfigSnapshot, ConfigSnapshotId, DecisionRequest, ExecutionBudget, ExecutionGrant,
-    ExecutionGrantId, ExecutionTarget, RoleAttempt, RoleAttemptId, RoleAttemptState,
-    RoleDefinition, RoleDefinitionId, RoleInstance, RoleInstanceId, RoleInstanceState,
-    RoleWriteMode, ScopeExpansionRequest, WorkflowDefinition, WorkflowDefinitionId, WorkflowError,
-    WorkflowNodeDefinition, WorkflowRun, WorkflowRunId, WorkflowRunState,
-    WorkflowTransitionDefinition,
+    ApprovedIntent, ApprovedIntentId, ClarificationRequest, ConfigSnapshot, ConfigSnapshotId,
+    DecisionRequest, ExecutionBudget, ExecutionGrant, ExecutionGrantId, ExecutionTarget,
+    RoleAttempt, RoleAttemptId, RoleAttemptState, RoleDefinition, RoleDefinitionId, RoleInstance,
+    RoleInstanceId, RoleInstanceState, RoleWriteMode, ScopeExpansionRequest, WorkflowDefinition,
+    WorkflowDefinitionId, WorkflowError, WorkflowNodeDefinition, WorkflowRun, WorkflowRunId,
+    WorkflowRunState, WorkflowTransitionDefinition,
 };
 
 /// Minimal Relay application state.

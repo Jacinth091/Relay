@@ -6,6 +6,7 @@ pub mod artifact;
 pub mod candidate;
 pub mod daemon;
 mod durable_state;
+pub mod exchange;
 mod execution;
 mod execution_planning;
 pub mod legacy_adapter;
@@ -41,6 +42,11 @@ pub use durable_state::{
     SqliteStore, StoredTask, TaskPersistenceError, TaskState, default_database_path,
     get_stored_task, list_stored_tasks, list_stored_tasks_with_quarantined,
     update_stored_task_state,
+};
+pub use exchange::{
+    ExchangeError, ExchangeMessage, ExchangeMessageId, ExchangeMessageKind, ExchangeOperation,
+    IssueCapabilityRequest, PublishResultRequest, RelayExchange, RoleInbox, RoleSessionCapability,
+    RoleSessionToken, SendMessageRequest,
 };
 pub use execution::{
     BoundedOutputSnapshot, CoreExecutionEvent, ExecutionLimits, ExecutionReport,

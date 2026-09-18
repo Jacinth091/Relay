@@ -264,9 +264,37 @@ impl ArtifactStore {
         if !meta_path.exists() {
             return Err(ArtifactError::NotFound(id.0.clone()));
         }
-        let data = std::fs::read(meta_path)?;
-        let metadata: ArtifactMetadata = serde_json::from_slice(&data)?;
+
+        let mut file = File::open(&meta_path)?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+
+        let metadata: ArtifactMetadata = serde_json::from_slice(&buf)?;
         Ok(metadata)
+    }
+
+    /// Finds and loads metadata for an artifact by id across all kinds.
+    pub fn get_any_metadata(&self, id: &ArtifactId) -> Result<ArtifactMetadata, ArtifactError> {
+        let kinds = [
+            ArtifactKind::Specification,
+            ArtifactKind::ImplementationResult,
+            ArtifactKind::CandidateReference,
+            ArtifactKind::VerificationResult,
+            ArtifactKind::RawLog,
+            ArtifactKind::ReviewResult,
+        ];
+        for k in kinds {
+            if let Ok(meta) = self.get_metadata(k, id) {
+                return Ok(meta);
+            }
+        }
+        Err(ArtifactError::NotFound(id.0.clone()))
+    }
+
+    /// Reads payload for an artifact by id across any kind.
+    pub fn read_payload(&self, id: &ArtifactId) -> Result<Vec<u8>, ArtifactError> {
+        let meta = self.get_any_metadata(id)?;
+        self.get(&meta)
     }
 }
 

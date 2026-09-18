@@ -16,7 +16,9 @@ pub mod portable_config;
 pub mod privileged;
 pub mod project_identity;
 mod project_registry;
+pub mod recovery_v2;
 mod repository_safety;
+pub mod retention;
 pub mod scheduler_v2;
 mod task_ingress;
 pub mod workflow;
@@ -91,11 +93,15 @@ pub use project_registry::{
     ExpectedRemote, GitHubRepositoryMetadata, ProjectKey, ProjectRegistry, ProjectRegistryError,
     RegisterProject, TrustedProject, default_config_path,
 };
+pub use recovery_v2::{
+    AttemptReconciliation, CandidateIntegrity, RecoveryCoordinator, RecoveryError, RecoveryReport,
+};
 pub use repository_safety::{
     BranchState, GitInspectionOperation, NormalizedRemote, RepositoryEligibility,
     RepositoryInspection, RepositorySafetyFailure, RepositoryStatus,
     inspect_trusted_project_repository,
 };
+pub use retention::{CleanupReport, RetentionError, RetentionManager, RetentionPolicy};
 pub use scheduler_v2::{
     ActiveExecutionSlot, QueuedWorkItem, SchedulePriority, SchedulerV2, SchedulerV2Config,
     SchedulerV2Error,

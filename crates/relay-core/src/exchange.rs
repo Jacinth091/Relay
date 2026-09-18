@@ -272,6 +272,33 @@ impl RelayExchange {
         count
     }
 
+    /// Revokes all capabilities whose TTL has expired.
+    pub fn revoke_expired_capabilities(&self) -> usize {
+        let mut caps = self.capabilities.lock().unwrap();
+        let now = current_epoch_seconds();
+        let mut count = 0;
+        for cap in caps.values_mut() {
+            if now >= cap.expires_at && !cap.is_revoked {
+                cap.is_revoked = true;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Revokes all capabilities across all attempts (e.g. upon daemon crash recovery or shutdown).
+    pub fn revoke_all(&self) -> usize {
+        let mut caps = self.capabilities.lock().unwrap();
+        let mut count = 0;
+        for cap in caps.values_mut() {
+            if !cap.is_revoked {
+                cap.is_revoked = true;
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// Mounts an artifact as visible input for a specific role attempt.
     pub fn mount_artifact_for_attempt(
         &self,

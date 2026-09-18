@@ -8,6 +8,7 @@ members = [
     "runtimes/relay-runtime-fake",
     "runtimes/relay-runtime-codex",
     "runtimes/relay-runtime-antigravity",
+    "runtimes/relay-decision-jev",
 ]
 resolver = "3"
 

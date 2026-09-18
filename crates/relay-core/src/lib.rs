@@ -5,6 +5,7 @@
 pub mod artifact;
 pub mod candidate;
 pub mod daemon;
+pub mod decision;
 pub mod delegation;
 mod durable_state;
 pub mod exchange;
@@ -41,6 +42,13 @@ pub use daemon::{
     DEFAULT_LEASE_TTL, DaemonClient, DaemonCommand, DaemonError, DaemonEvent, DaemonPendingEffect,
     DaemonRequest, DaemonResponse, DaemonServer, DaemonSnapshot, DaemonTaskSummary,
     InProcessDaemonClient,
+};
+pub use decision::{
+    ChoiceProbability, DecisionAuditRecord, DecisionChoice, DecisionEngineId, DecisionFuture,
+    DecisionManager, DecisionManagerConfig, DecisionOutcome, DecisionResolution,
+    FakeDecisionEngine, RuleDecisionEngine, SanitizedDecisionState, SemanticDecisionEngine,
+    SemanticDecisionError, SemanticDecisionId, SemanticDecisionKind, SemanticDecisionOutcome,
+    SemanticDecisionPolicy, SemanticDecisionRequest,
 };
 pub use delegation::{
     BudgetAccounting, BudgetError, ConsultationRequest, DelegationError, DelegationManager,

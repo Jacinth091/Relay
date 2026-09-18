@@ -1262,6 +1262,7 @@ name = "relay-runtime"
 version = "0.1.0"
 dependencies = [
  "relay-protocol",
+ "relay-runtime-fake",
  "serde",
  "thiserror",
  "tokio",

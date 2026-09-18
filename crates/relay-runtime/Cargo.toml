@@ -10,5 +10,9 @@ publish.workspace = true
 relay-protocol = { path = "../relay-protocol" }
 serde = { version = "1.0.217", features = ["derive"] }
 thiserror = "2.0.11"
-tokio = { version = "1.43.0", features = ["sync", "time"] }
+tokio = { version = "1.43.0", features = ["sync", "time", "process", "io-util", "rt"] }
 uuid = { version = "1.12.1", features = ["v4"] }
+
+[dev-dependencies]
+relay-runtime-fake = { path = "../../runtimes/relay-runtime-fake" }
+tokio = { version = "1.43.0", features = ["macros", "rt", "rt-multi-thread", "time"] }

@@ -324,13 +324,17 @@ pub struct RuntimeDeadline {
 }
 
 mod activity;
+pub mod backplane;
 mod integration;
+pub mod local_process_backplane;
 mod profile;
 mod router;
 pub mod sanitizer;
 
 pub use activity::*;
+pub use backplane::*;
 pub use integration::*;
+pub use local_process_backplane::*;
 pub use profile::*;
 pub use router::*;
 pub use sanitizer::*;

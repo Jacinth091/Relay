@@ -44,8 +44,8 @@ Per [02-IMPLEMENTATION-SEQUENCE.md](02-IMPLEMENTATION-SEQUENCE.md):
 | **11** | **Multi-Project / Provider Scheduler v2** | **DONE** | Multi-project fair scheduling with starvation-preventing aging weight, global & per-project limits, exclusive checkout write serialization, provider capacity tracking & instant release, cancellation isolation across queues. |
 | **12** | **Web UI + Relay TUI as Daemon Clients** | **DONE** | `DaemonClient` trait, `InProcessDaemonClient`, version-negotiating handshake, multi-client state agreement, monotonic event catch-up, persistent state preservation across disconnects, 3 integration tests passing. |
 | **13** | **Privileged Action Executor + Exact Approvals** | **DONE** | `ApprovalRequest`/`ApprovalGrant`, SHA-256 parameter hashing, replay protection, deterministic executor, `GitOperationRunner`, 6 integration tests passing. |
-| **14** | **SemanticDecisionEngine + Optional Jev Shadow Mode** | Pending | Optional advisory engine interface (`Recommend \| Abstain \| Escalate`), shadow-mode evaluation, non-authoritative. |
-| **15** | **Integrated Recovery, Retention, Security Truthfulness, Docs Cutover** | Pending | End-to-end failure matrix, resource cleanup, documentation cutover. |
+| **14** | **SemanticDecisionEngine + Optional Jev Shadow Mode** | **DONE** | Provider-neutral `SemanticDecisionEngine` interface (`Recommend \| Abstain \| Escalate`), `DecisionManager` with shadow mode, `RuleDecisionEngine`, `FakeDecisionEngine`, optional `JevDecisionAdapter`, 6 integration tests passing. |
+| **15** | **Integrated Recovery, Retention, Security Truthfulness, Docs Cutover** | **DONE** | Crash recovery with pending effect reconciliation, lease fencing verification, candidate working-tree integrity invalidation, `RetentionManager` with safe worktree pruning and expired artifact collection, 5 integration tests passing. |
 
 ---
 

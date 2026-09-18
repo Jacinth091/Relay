@@ -1250,6 +1250,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "relay-decision-jev"
+version = "0.1.0"
+dependencies = [
+ "relay-core",
+ "tokio",
+]
+
+[[package]]
 name = "relay-protocol"
 version = "0.1.0"
 dependencies = [

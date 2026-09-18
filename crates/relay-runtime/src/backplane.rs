@@ -49,7 +49,7 @@ impl std::fmt::Display for BackplaneId {
 }
 
 /// Stable effect key identifying an external provisioning action.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct EffectKey(pub String);
 
 impl EffectKey {
@@ -90,6 +90,29 @@ impl SanitizedEnvironment {
     }
 }
 
+/// Explicit metadata associated with a runtime attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RuntimeMetadata {
+    pub state_root_id: Option<String>,
+    pub project_id: Option<String>,
+    pub checkout_id: Option<String>,
+    pub task_id: Option<String>,
+    pub workflow_run_id: Option<String>,
+    pub role_instance_id: Option<String>,
+    pub role_attempt_id: String,
+    pub effect_key: EffectKey,
+}
+
+impl RuntimeMetadata {
+    pub fn new(role_attempt_id: impl Into<String>, effect_key: EffectKey) -> Self {
+        Self {
+            role_attempt_id: role_attempt_id.into(),
+            effect_key,
+            ..Default::default()
+        }
+    }
+}
+
 /// Provisioning request sent to a RuntimeBackplane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeProvisionRequest {
@@ -99,6 +122,79 @@ pub struct RuntimeProvisionRequest {
     pub launch: LaunchSpecification,
     pub environment: SanitizedEnvironment,
     pub output_byte_limit: usize,
+    #[serde(default)]
+    pub metadata: Option<RuntimeMetadata>,
+}
+
+impl RuntimeProvisionRequest {
+    pub fn new(
+        effect_key: EffectKey,
+        role_attempt_id: impl Into<String>,
+        trusted_cwd: impl Into<PathBuf>,
+        launch: LaunchSpecification,
+        environment: SanitizedEnvironment,
+        output_byte_limit: usize,
+    ) -> Self {
+        Self {
+            effect_key,
+            role_attempt_id: role_attempt_id.into(),
+            trusted_cwd: trusted_cwd.into(),
+            launch,
+            environment,
+            output_byte_limit,
+            metadata: None,
+        }
+    }
+
+    pub fn with_metadata(mut self, metadata: RuntimeMetadata) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+}
+
+/// Unique identifier for a runtime binding.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RuntimeBindingId(pub String);
+
+impl RuntimeBindingId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+}
+
+impl std::fmt::Display for RuntimeBindingId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Lifecycle state of a runtime binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeBindingState {
+    Attached,
+    Running,
+    ExitedCleanly { exit_code: Option<i32> },
+    ExitedFailed { exit_code: Option<i32> },
+    Interrupted,
+    Missing,
+    Orphaned,
+    Mismatched { reason: String },
+    Ambiguous { reason: String },
+    Disposed,
+}
+
+/// Mapping from Relay role attempt identity to runtime backplane handle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeBinding {
+    pub id: RuntimeBindingId,
+    pub role_attempt_id: String,
+    pub backplane_id: BackplaneId,
+    pub runtime_handle: RuntimeHandle,
+    pub created_at: String,
+    pub last_reconciled_at: String,
+    pub state: RuntimeBindingState,
+    pub metadata: Option<RuntimeMetadata>,
 }
 
 /// An opaque physical runtime handle returned by a backplane.
@@ -158,7 +254,9 @@ pub struct BackplaneSnapshot {
 pub enum ReconcileOutcome {
     Alive { pid: u32 },
     CleanlyExited { exit_code: Option<i32> },
+    FailedExit { exit_code: Option<i32> },
     ResourceNotFound,
+    Mismatched { reason: String },
 }
 
 pub type BackplaneFuture<'a, T> =
@@ -178,4 +276,10 @@ pub trait RuntimeBackplane: Send + Sync + 'static {
     fn dispose<'a>(&'a self, handle: &'a RuntimeHandle) -> BackplaneFuture<'a, DisposeReceipt>;
     fn snapshot<'a>(&'a self) -> BackplaneFuture<'a, BackplaneSnapshot>;
     fn reconcile<'a>(&'a self, handle: &'a RuntimeHandle) -> BackplaneFuture<'a, ReconcileOutcome>;
+    fn reconcile_binding<'a>(
+        &'a self,
+        binding: &'a RuntimeBinding,
+    ) -> BackplaneFuture<'a, ReconcileOutcome> {
+        self.reconcile(&binding.runtime_handle)
+    }
 }

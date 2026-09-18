@@ -1264,6 +1264,7 @@ dependencies = [
  "relay-protocol",
  "relay-runtime-fake",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "uuid",

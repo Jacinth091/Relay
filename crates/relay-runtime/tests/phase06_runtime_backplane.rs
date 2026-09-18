@@ -35,6 +35,7 @@ async fn test_local_process_backplane_basic_execution_and_observe() {
         launch: LaunchSpecification::new("git", vec!["--version".to_owned()]),
         environment: SanitizedEnvironment::new(),
         output_byte_limit: 1024,
+        metadata: None,
     };
 
     let handle = backplane.provision(req).await.expect("provisioning failed");
@@ -90,6 +91,7 @@ async fn test_local_process_backplane_output_limit_clamping() {
         launch: LaunchSpecification::new("git", vec!["--version".to_owned()]),
         environment: SanitizedEnvironment::new(),
         output_byte_limit: 10,
+        metadata: None,
     };
 
     let handle = backplane.provision(req).await.unwrap();
@@ -115,6 +117,7 @@ async fn test_local_process_backplane_idempotent_effect_key() {
         launch: LaunchSpecification::new("git", vec!["--version".to_owned()]),
         environment: SanitizedEnvironment::new(),
         output_byte_limit: 1024,
+        metadata: None,
     };
 
     let handle1 = backplane.provision(req.clone()).await.unwrap();
@@ -142,6 +145,7 @@ async fn test_local_process_backplane_rejects_nonexistent_cwd() {
         launch: LaunchSpecification::new("git", vec!["--version".to_owned()]),
         environment: SanitizedEnvironment::new(),
         output_byte_limit: 1024,
+        metadata: None,
     };
 
     let err = backplane.provision(req).await.unwrap_err();
@@ -164,6 +168,7 @@ async fn test_local_process_backplane_dispose() {
         launch: LaunchSpecification::new("git", vec!["--version".to_owned()]),
         environment: SanitizedEnvironment::new(),
         output_byte_limit: 1024,
+        metadata: None,
     };
 
     let handle = backplane.provision(req).await.unwrap();
@@ -195,6 +200,7 @@ async fn test_fake_backplane_deterministic_flow() {
         launch: LaunchSpecification::new("test-proc", vec![]),
         environment: SanitizedEnvironment::new(),
         output_byte_limit: 512,
+        metadata: None,
     };
 
     let handle = backplane.provision(req).await.unwrap();

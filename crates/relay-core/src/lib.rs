@@ -15,6 +15,7 @@ pub mod portable_config;
 pub mod project_identity;
 mod project_registry;
 mod repository_safety;
+pub mod scheduler_v2;
 mod task_ingress;
 pub mod workflow;
 
@@ -81,6 +82,10 @@ pub use repository_safety::{
     BranchState, GitInspectionOperation, NormalizedRemote, RepositoryEligibility,
     RepositoryInspection, RepositorySafetyFailure, RepositoryStatus,
     inspect_trusted_project_repository,
+};
+pub use scheduler_v2::{
+    ActiveExecutionSlot, QueuedWorkItem, SchedulePriority, SchedulerV2, SchedulerV2Config,
+    SchedulerV2Error,
 };
 pub use task_ingress::{
     ImportedTask, MAX_LOCAL_TASK_INPUT_BYTES, SubmissionTransport, TaskId, TaskImportCandidate,

@@ -387,7 +387,14 @@ impl DaemonServer {
             } => {
                 let candidate = match submission_transport.as_str() {
                     "relay-mcp" => self.relay.preview_mcp_submission(handoff_json),
-                    "local-file" => self.relay.preview_local_file(handoff_json),
+                    "local-file" => {
+                        let path = std::path::Path::new(handoff_json);
+                        if path.is_file() {
+                            self.relay.preview_local_file(path)
+                        } else {
+                            self.relay.preview_local_paste(handoff_json)
+                        }
+                    }
                     _ => self.relay.preview_local_paste(handoff_json),
                 }
                 .map_err(|e| DaemonError::Command(e.to_string()))?;
@@ -459,6 +466,134 @@ impl DaemonServer {
                     .to_string(),
                 ))
             }
+        }
+    }
+}
+
+/// Client interface for interacting with the canonical Relay Daemon.
+/// Enforces handshake negotiation, snapshot synchronization, and monotonic event catch-up.
+#[allow(async_fn_in_trait)]
+pub trait DaemonClient: Send + Sync {
+    /// Performs handshake with the daemon.
+    async fn handshake(&self, client_name: &str) -> Result<(String, i64), DaemonError>;
+
+    /// Fetches the latest full state snapshot.
+    async fn get_snapshot(&self) -> Result<DaemonSnapshot, DaemonError>;
+
+    /// Fetches monotonic events after the given sequence number.
+    async fn get_events_after(
+        &self,
+        after_sequence: i64,
+        limit: i64,
+    ) -> Result<Vec<DaemonEvent>, DaemonError>;
+
+    /// Submits a typed command for execution.
+    async fn submit_command(
+        &self,
+        command_id: &str,
+        command: DaemonCommand,
+    ) -> Result<CommandStatus, DaemonError>;
+
+    /// Sends a ping probe to verify connection liveness.
+    async fn ping(&self) -> Result<(), DaemonError>;
+}
+
+/// In-process daemon client that calls DaemonServer directly.
+/// Used by TUI/Web test harnesses or embedded processes without socket overhead.
+pub struct InProcessDaemonClient {
+    server: Arc<DaemonServer>,
+}
+
+impl InProcessDaemonClient {
+    pub fn new(server: Arc<DaemonServer>) -> Self {
+        Self { server }
+    }
+}
+
+impl DaemonClient for InProcessDaemonClient {
+    async fn handshake(&self, client_name: &str) -> Result<(String, i64), DaemonError> {
+        let resp = self
+            .server
+            .handle_request(DaemonRequest::Handshake {
+                client_name: client_name.to_owned(),
+                protocol_version: DAEMON_PROTOCOL_VERSION,
+            })
+            .await;
+
+        match resp {
+            DaemonResponse::HandshakeAck {
+                daemon_version,
+                fencing_token,
+                ..
+            } => Ok((daemon_version, fencing_token)),
+            DaemonResponse::Error(err) => Err(DaemonError::Command(err)),
+            _ => Err(DaemonError::Command(
+                "unexpected handshake response".to_owned(),
+            )),
+        }
+    }
+
+    async fn get_snapshot(&self) -> Result<DaemonSnapshot, DaemonError> {
+        let resp = self.server.handle_request(DaemonRequest::GetSnapshot).await;
+        match resp {
+            DaemonResponse::Snapshot(snapshot) => Ok(snapshot),
+            DaemonResponse::Error(err) => Err(DaemonError::Command(err)),
+            _ => Err(DaemonError::Command(
+                "unexpected snapshot response".to_owned(),
+            )),
+        }
+    }
+
+    async fn get_events_after(
+        &self,
+        after_sequence: i64,
+        limit: i64,
+    ) -> Result<Vec<DaemonEvent>, DaemonError> {
+        let resp = self
+            .server
+            .handle_request(DaemonRequest::GetEventsAfter {
+                after_sequence,
+                limit,
+            })
+            .await;
+
+        match resp {
+            DaemonResponse::Events(events) => Ok(events),
+            DaemonResponse::Error(err) => Err(DaemonError::Command(err)),
+            _ => Err(DaemonError::Command(
+                "unexpected events response".to_owned(),
+            )),
+        }
+    }
+
+    async fn submit_command(
+        &self,
+        command_id: &str,
+        command: DaemonCommand,
+    ) -> Result<CommandStatus, DaemonError> {
+        let resp = self
+            .server
+            .handle_request(DaemonRequest::SubmitCommand {
+                command_id: command_id.to_owned(),
+                command,
+            })
+            .await;
+
+        match resp {
+            DaemonResponse::CommandResult { status, .. } => Ok(status),
+            DaemonResponse::Error(err) => Err(DaemonError::Command(err)),
+            _ => Err(DaemonError::Command(
+                "unexpected command response".to_owned(),
+            )),
+        }
+    }
+
+    async fn ping(&self) -> Result<(), DaemonError> {
+        let resp = self.server.handle_request(DaemonRequest::Ping).await;
+        match resp {
+            DaemonResponse::Pong => Ok(()),
+            DaemonResponse::Error(err) => Err(DaemonError::Command(err)),
+            _ => Err(DaemonError::Command("unexpected ping response".to_owned())),
         }
     }
 }

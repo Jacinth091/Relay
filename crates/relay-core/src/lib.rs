@@ -37,8 +37,9 @@ pub use candidate::{
 };
 pub use daemon::{
     CommandStatus, DAEMON_PROTOCOL_NAME, DAEMON_PROTOCOL_VERSION, DEFAULT_LEASE_ID,
-    DEFAULT_LEASE_TTL, DaemonCommand, DaemonError, DaemonRequest, DaemonResponse, DaemonServer,
-    DaemonSnapshot,
+    DEFAULT_LEASE_TTL, DaemonClient, DaemonCommand, DaemonError, DaemonEvent, DaemonPendingEffect,
+    DaemonRequest, DaemonResponse, DaemonServer, DaemonSnapshot, DaemonTaskSummary,
+    InProcessDaemonClient,
 };
 pub use delegation::{
     BudgetAccounting, BudgetError, ConsultationRequest, DelegationError, DelegationManager,

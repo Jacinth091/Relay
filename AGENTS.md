@@ -36,9 +36,9 @@ Milestone ladder actually tracked by development: M2 registry → M3 repo safety
 | Provider distribution | Route-to-chosen-provider and slot-bounded concurrent executions exist; fan-out to multiple providers, health-aware routing, cross-provider aggregation are design intent only (ADR-0018) |
 | Planner adapters | Documentation/skill documents in `integrations/planners/`; no executable code, no conformance harness yet |
 
-Key decisions recorded: ADR-0015 (local state canonical, bindings optional), ADR-0016 (MCP-first submission layering; v0.1 local-ingress-only descope), ADR-0017 (identity), ADR-0018 (deterministic provider-distribution model). Point-in-time status: `docs/status-2026-08.md`.
+Key decisions recorded: ADR-0015 (local state canonical, bindings optional), ADR-0016 (MCP-first submission layering; v0.1 local-ingress-only descope), ADR-0017 (identity), ADR-0018 (deterministic provider-distribution model). Point-in-time status: `docs/archive/legacy_v1/status-2026-08.md`.
 
-Implementation packs (sequential DEV plans): `docs/M8_1_PACK/...`, `docs/M9_PACK/...`.
+Implementation packs (archived): `docs/archive/historical_milestones/M8_1_PACK/...`, `docs/archive/historical_milestones/M9_PACK/...`.
 
 ---
 
@@ -227,11 +227,11 @@ Deep detail: `docs/security-model.md`.
 | Scheduler/lifecycle/repair changes | `crates/relay-core/src/execution.rs`; M6 semantics are FROZEN — additive amendments only |
 | New user-facing UI copy/screens | `apps/relay-tui/src/ui/`, `docs/tui-ux.md`, ADR-0017 language rules |
 | Runtime/provider work | `crates/relay-runtime/src/lib.rs` (trait + permission/catalog types), relevant runtime crate, `docs/runtime-stack-model.md` |
-| Submission transports / MCP | `docs/adr/0016-*.md`, `docs/M9_PACK/...`, `docs/planner-hosts/` (host registration recipes), `docs/submission-and-bindings.md` |
+| Submission transports / MCP | `docs/adr/0016-*.md`, `docs/archive/historical_milestones/M9_PACK/...`, `docs/planner-hosts/` (host registration recipes), `docs/submission-and-bindings.md` |
 | Multi-provider distribution / fan-out ideas | `docs/adr/0018-*.md` — fan-out is PLANNED, not built; do not present as shipped |
 | Planning surfaces / ChatGPT skill | `integrations/planners/relay-handoff/`, `docs/planner-integrations.md` |
 | Persistence/store changes | `crates/relay-store/`, `docs/data-persistence.md`; two-process access (TUI + future serve-mcp) hardening is an M9 gate |
-| Roadmap/status questions | `docs/roadmap.md`, `docs/status-2026-08.md` |
+| Roadmap/status questions | `docs/v2_architecture_rebaseline/ROADMAP.md`, `docs/archive/legacy_v1/status-2026-08.md` |
 
 ---
 

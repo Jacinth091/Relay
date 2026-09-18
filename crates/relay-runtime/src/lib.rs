@@ -329,6 +329,8 @@ pub mod herdr;
 mod integration;
 pub mod local_process_backplane;
 mod profile;
+mod provider;
+mod resolver;
 mod router;
 pub mod sanitizer;
 
@@ -338,5 +340,7 @@ pub use herdr::*;
 pub use integration::*;
 pub use local_process_backplane::*;
 pub use profile::*;
+pub use provider::*;
+pub use resolver::*;
 pub use router::*;
 pub use sanitizer::*;

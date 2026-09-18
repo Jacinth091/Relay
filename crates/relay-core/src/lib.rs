@@ -5,6 +5,7 @@
 pub mod artifact;
 pub mod candidate;
 pub mod daemon;
+pub mod delegation;
 mod durable_state;
 pub mod exchange;
 mod execution;
@@ -38,6 +39,11 @@ pub use daemon::{
     CommandStatus, DAEMON_PROTOCOL_NAME, DAEMON_PROTOCOL_VERSION, DEFAULT_LEASE_ID,
     DEFAULT_LEASE_TTL, DaemonCommand, DaemonError, DaemonRequest, DaemonResponse, DaemonServer,
     DaemonSnapshot,
+};
+pub use delegation::{
+    BudgetAccounting, BudgetError, ConsultationRequest, DelegationError, DelegationManager,
+    DelegationMode, DelegationOutcome, DelegationRequest, IndependenceRequirement,
+    RoleDependencyGraph, RoleDependencyNode, RoleDependencyState,
 };
 pub use durable_state::{
     SqliteStore, StoredTask, TaskPersistenceError, TaskState, default_database_path,

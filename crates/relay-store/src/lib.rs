@@ -27,6 +27,11 @@ const WRITE_RETRY_ATTEMPTS: usize = 5;
 const WRITE_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(20);
 const WRITE_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(160);
 
+/// Bounded retry budget applied when two Relay processes race to apply the
+/// same migration while opening a shared database for the first time.
+const MIGRATION_RACE_ATTEMPTS: usize = 5;
+const MIGRATION_RACE_BACKOFF: Duration = Duration::from_millis(50);
+
 // Primary SQLite result codes treated as transient lock contention. Extended
 // codes (for example SQLITE_BUSY_SNAPSHOT) share the low byte.
 const SQLITE_BUSY_PRIMARY_CODE: i32 = 5;
@@ -1894,27 +1899,53 @@ fn map_migration_error(error: sqlx::migrate::MigrateError) -> StoreError {
     }
 }
 
-/// Runs migrations, tolerating a benign cross-process race.
+/// Runs migrations, tolerating benign cross-process races.
 ///
-/// Two Relay processes (TUI + serve-mcp) may open a database that has never
-/// been migrated at the same moment. sqlx serializes each migration in its own
-/// transaction but not the applied-version bookkeeping across processes, so
-/// the loser of the race sees a UNIQUE constraint on `_sqlx_migrations.version`.
-/// The winner has then finished migrating; one bounded retry observes the
-/// completed migration history and succeeds. Any other failure fails closed.
+/// Relay processes (TUI, `relay daemon`, serve-mcp) may open a database that
+/// has never been migrated at the same moment. sqlx serializes each
+/// migration's DDL in its own transaction but not the applied-version
+/// bookkeeping across processes, so the loser of the race can surface either
+/// symptom:
+///
+/// - a UNIQUE constraint on `_sqlx_migrations.version`, when both processes
+///   raced the version bookkeeping; or
+/// - `... already exists`, when the loser read the migration history before the
+///   winner committed, then blocked on the winner's write lock and finally
+///   re-ran DDL the winner had committed in the meantime. Migrations
+///   deliberately avoid `IF NOT EXISTS` so that a genuinely partial schema
+///   cannot be silently accepted.
+///
+/// In both cases the winner has finished applying that migration, so a bounded
+/// retry re-reads the completed history and succeeds without re-running DDL.
+/// Every other failure - including a real schema conflict that reproduces on
+/// every attempt - fails closed.
 async fn run_migrations(pool: &SqlitePool) -> Result<(), StoreError> {
-    if let Err(error) = MIGRATOR.run(pool).await {
-        let display = error.to_string();
-        if !display.contains("_sqlx_migrations") || !display.contains("UNIQUE constraint") {
-            return Err(map_migration_error(error));
+    let mut attempt = 1usize;
+
+    loop {
+        match MIGRATOR.run(pool).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if attempt >= MIGRATION_RACE_ATTEMPTS || !is_migration_race(&error) {
+                    return Err(map_migration_error(error));
+                }
+
+                // relay-store deliberately avoids a tracing dependency; the
+                // retry is observable only as normal latency.
+                tokio::time::sleep(MIGRATION_RACE_BACKOFF * attempt as u32).await;
+                attempt += 1;
+            }
         }
-
-        // relay-store deliberately avoids a tracing dependency; the retry is
-        // observable only as normal latency.
-        MIGRATOR.run(pool).await.map_err(map_migration_error)?;
     }
+}
 
-    Ok(())
+/// Recognizes the two symptoms of two processes racing to apply the same
+/// migration (see [`run_migrations`]).
+fn is_migration_race(error: &sqlx::migrate::MigrateError) -> bool {
+    let display = error.to_string();
+
+    (display.contains("_sqlx_migrations") && display.contains("UNIQUE constraint"))
+        || display.contains("already exists")
 }
 
 async fn insert_event(

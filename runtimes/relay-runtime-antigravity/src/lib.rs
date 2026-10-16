@@ -3,8 +3,6 @@
 //! All executable selection is trusted local configuration. Task content is
 //! supplied only on stdin and is never interpreted as shell syntax.
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt as _;
 use std::{
     env,
     path::{Path, PathBuf},

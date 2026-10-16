@@ -144,7 +144,13 @@ mod tests {
                 .success()
         );
         let discovered = discover_project(&path).unwrap();
-        assert_eq!(discovered.repository_root, path);
+        // `git rev-parse --show-toplevel` may return a differently-spelled but
+        // equivalent path (forward slashes, and on Windows CI runners the long
+        // form of an 8.3 short name in `%TEMP%`), so compare canonical forms.
+        assert_eq!(
+            discovered.repository_root.canonicalize().unwrap(),
+            path.canonicalize().unwrap()
+        );
         assert_eq!(
             discovered.suggested_key,
             path.file_name().unwrap().to_string_lossy()

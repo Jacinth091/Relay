@@ -1,0 +1,51 @@
+name: Bug report
+description: Report a reproducible problem in Relay.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: "Relay is an experimental hobby project with no support guarantee. Do not include secrets, credentials, private logs, personal data, or exploit details. Report vulnerabilities privately as described in SECURITY.md."
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the actual behavior and what you expected instead.
+      placeholder: "When I ..., Relay ...; I expected ..."
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: Use a disposable test project and redact anything private.
+      placeholder: "1. ...\n2. ...\n3. ..."
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Relay commit or branch
+      description: The branch and commit SHA you built or ran.
+      placeholder: "feat/v2-architecture-rebaseline @ commit SHA"
+  - type: input
+    id: environment
+    attributes:
+      label: Operating system and Rust version
+      placeholder: "Windows 11 / rustc 1.97.1"
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface?
+      options:
+        - TUI (`relay` / `relay run-tui`)
+        - MCP submission (`relay serve-mcp`)
+        - Daemon (`relay daemon`)
+        - Build or tests
+        - Documentation
+        - Other / not sure
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized logs or details (optional)
+      description: Double-check that everything here is safe to publish.

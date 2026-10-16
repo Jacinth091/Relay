@@ -11,7 +11,7 @@ These are the principles the current implementation actually follows:
 - **Single workspace with panes, not page stacks.** One frame hosts every screen; screens swap into the content area while the top bar, prompt line, and key bar stay fixed. There is no nested navigation chrome.
 - **Clean and minimal.** No decoration beyond panel borders, no color except semantic state, no static help text inside screen bodies — key hints live in one place (the key bar).
 - **Data-relay focus.** The dashboard answers two questions at a glance: *what is running right now* (ACTIVE, DISTRIBUTION) and *what happens next* (queue projection, ESCALATIONS). It is a projection of scheduler and durable state, never an editor of intent.
-- **Handoff language, not orchestrator language** ([ADR-0017](adr/0017-relay-identity-deterministic-handoff-engine.md)). User-facing copy says "handoff", "escalation", "distribution"; internal identifiers keep scheduler/runtime names. See [architecture.md](architecture.md) §"What Relay Is / Is Not".
+- **Handoff language, not orchestrator language** ([ADR-0020](adr/0020-relay-architecture-v2.md)). User-facing copy says "handoff", "escalation", "distribution"; internal identifiers keep scheduler/runtime names. See [architecture.md](architecture.md) §"Identity".
 - **Presentation owns nothing.** The TUI gathers intent, calls Relay Core (`plan_execution`, scheduler), and renders results. It does not own execution policy, ingress validation, routing, repository checks, or persistence decisions.
 
 ---

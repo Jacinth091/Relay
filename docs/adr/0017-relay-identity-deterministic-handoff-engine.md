@@ -26,7 +26,7 @@ Classification test for any proposed capability:
 
 Scope growth widens the *data* available to core (capability metadata) rather than core's *authority*.
 
-This statement is documented normatively in [docs/architecture.md](../architecture.md) ("What Relay Is / Is Not") and elaborates invariants 1 and 7 without changing them.
+This statement was documented normatively in the original (v1) architecture note, now archived at [docs/archive/legacy_v1/architecture-v1.md](../archive/legacy_v1/architecture-v1.md) ("What Relay Is / Is Not"), and elaborates invariants 1 and 7 without changing them. ADR-0017 is superseded by [ADR-0020](0020-relay-architecture-v2.md) for Relay Architecture v2; this record is preserved as history.
 
 ## Consequences
 

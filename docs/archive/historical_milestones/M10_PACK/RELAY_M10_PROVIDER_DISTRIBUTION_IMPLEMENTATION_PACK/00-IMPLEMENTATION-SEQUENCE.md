@@ -1,6 +1,6 @@
 # Relay M10 — Provider Distribution Sequential Implementation Pack
 
-> **STATUS NOTE (2026-09-17):** This unimplemented implementation pack is **ON HOLD / SUPERSEDED** by [ADR-0020](../../adr/0020-relay-architecture-v2.md) and the Relay Architecture v2 rebaseline (`docs/v2_architecture_rebaseline/`). The v2 role-based workflow and attempt architecture replaces the preliminary M10 fan-out proposal. Preserved for historical lineage.
+> **STATUS NOTE (2026-09-17):** This unimplemented implementation pack is **ON HOLD / SUPERSEDED** by [ADR-0020](../../../../adr/0020-relay-architecture-v2.md) and the Relay Architecture v2 rebaseline (`docs/v2_architecture_rebaseline/`). The v2 role-based workflow and attempt architecture replaces the preliminary M10 fan-out proposal. Preserved for historical lineage.
 
 **Status:** ON HOLD / SUPERSEDED (historical)
 **Decision basis:** ADR-0018 (`docs/adr/0018-provider-distribution-model.md`)

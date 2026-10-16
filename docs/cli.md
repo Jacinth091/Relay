@@ -8,11 +8,15 @@ The executable is named `relay` (crate `relay-tui`).
 relay                  Start the TUI (default behavior with no arguments)
 relay run-tui          Explicitly start the TUI
 relay serve-mcp        Run the Relay Direct MCP server over stdio (headless)
+relay daemon           Run the durable Relay daemon (store-lease ownership; no client transport yet)
 relay --help           Show usage
 relay --version        Show version
 ```
 
 Unknown subcommands or flags produce a clap usage error on stderr and exit code 2.
+
+> There is **no** top-level `relay doctor` or `relay config` subcommand. `/doctor`
+> is a TUI command-palette entry (below), not a CLI subcommand.
 
 ### `relay serve-mcp`
 
@@ -22,6 +26,29 @@ Long-lived headless process speaking MCP over stdio (newline-delimited JSON-RPC 
 - Submitted tasks never auto-execute; running them requires explicit Run approval in the TUI.
 - Diagnostics go to stderr only; stdout carries protocol messages exclusively.
 - Host registration recipes: [Claude Code](planner-hosts/claude-code.md), [OpenCode](planner-hosts/opencode.md), [Codex CLI](planner-hosts/codex-cli.md).
+
+This server is **local stdio**. A cloud-hosted planner that cannot spawn local
+processes cannot reach a local Relay instance through it.
+
+### `relay daemon`
+
+Long-lived process that takes durable ownership of the local store: it acquires a
+lease, prints its fencing token, and renews a heartbeat until it is shut down.
+This is the v2 Phase 01 daemon-ownership slice. It does **not** yet serve clients
+over a transport — the TUI and `relay serve-mcp` open the store directly.
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--lease-id <id>` | `relay-daemon-primary` | Lease identity for the daemon's write ownership |
+| `--lease-ttl <seconds>` | `15` | Lease time-to-live |
+
+```sh
+cargo run --locked -p relay-tui -- daemon
+cargo run --locked -p relay-tui -- daemon --lease-id relay-daemon-primary --lease-ttl 30
+```
+
+Starting the daemon is **not required** for ordinary local use: the TUI opens the
+store directly and does not need a running daemon.
 
 ## Environment Variables
 

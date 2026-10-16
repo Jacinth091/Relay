@@ -434,7 +434,7 @@ mod tests {
     #[test]
     fn invalid_project_key_and_filesystem_project_strings_fail() {
         let relay = relay_with_project("relay");
-        for project in ["../relay", "C:/Users/PCC/Relay", "/tmp/relay"] {
+        for project in ["../relay", "C:/Users/example/Relay", "/tmp/relay"] {
             let json = TASK_JSON.replace(
                 "\"project\": \"Relay\"",
                 &format!("\"project\": \"{project}\""),

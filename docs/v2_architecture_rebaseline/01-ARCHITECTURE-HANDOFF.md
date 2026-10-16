@@ -1,7 +1,8 @@
 # Relay v2 Architecture Handoff
 ## Policy-Governed Workflow Orchestration with Provider-Neutral Roles, Durable Exchange, Herdr Backplane, and Optional Semantic Decisions
 
-**Status:** proposed architecture baseline; not implemented  
+**Status:** proposed architecture baseline **as written on 2026-09-17; not implemented at that time**  
+**Current status:** partially implemented — see [ROADMAP.md](ROADMAP.md) for the authoritative, evidence-based per-phase table. The "not implemented" line above is the historical status when the proposal was written and is deliberately not rewritten.  
 **Architecture generation:** v2  
 **Historical predecessor:** Relay deterministic handoff-engine / v0.1 milestone lineage  
 

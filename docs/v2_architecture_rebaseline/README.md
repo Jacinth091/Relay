@@ -6,6 +6,13 @@
 **Architecture generation:** v2  
 **Implementation status:** per-phase status tracked in [ROADMAP.md](ROADMAP.md); no phase is complete until its production exit gate is proven — see [REMEDIATION-WAVES.md](REMEDIATION-WAVES.md) for the current correction plan  
 
+> **Reading note:** this pack is the 2026-09-17 proposal. The documents below
+> describe the intended v2 architecture, not a claim about current behavior.
+> Check [ROADMAP.md](ROADMAP.md) (status-dated) for what has actually been
+> implemented and wired into the production path. Individual handoff documents
+> may carry a "not implemented" status line from the date they were written;
+> that is historical and is intentionally left as-is.
+
 ## Why v2
 
 Relay has one clear architectural predecessor: the deterministic handoff/execution engine built through the original v0.1 milestone lineage. Calling this rebaseline **Relay Architecture v2** gives the project an explicit generational break without pretending that a third architecture already existed.

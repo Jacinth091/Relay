@@ -1,0 +1,66 @@
+name: Rust CI
+
+# Compiles and tests the Relay workspace on Linux and Windows.
+#
+# Design constraints (deliberate, do not relax without review):
+#   - read-only token; no secrets, no provider logins, no network calls to AI
+#     services, and no spending of anyone's coding-agent quota;
+#   - no pull_request_target and no other privileged fork trigger;
+#   - dependency set comes from the checked-in Cargo.lock (`--locked`).
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - staging
+      - feat/v2-architecture-rebaseline
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --workspace --locked

@@ -5,8 +5,6 @@
 
 pub mod app_server;
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt as _;
 use std::{
     env,
     path::{Path, PathBuf},

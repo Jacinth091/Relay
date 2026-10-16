@@ -73,6 +73,13 @@ pub enum AntigravityRuntimeHealth {
         version: Option<String>,
         error: String,
     },
+    /// The CLI answered `--version` but exposes no `auth` subcommand, so
+    /// authentication cannot be verified non-interactively. Relay treats the
+    /// runtime as usable; provider auth is exercised (and enforced by the
+    /// provider) on the first real execution.
+    AuthUnverifiable {
+        version: String,
+    },
     Incompatible {
         version: String,
         reason: String,
@@ -84,7 +91,7 @@ pub enum AntigravityRuntimeHealth {
 
 impl AntigravityRuntimeHealth {
     pub fn is_ready(&self) -> bool {
-        matches!(self, Self::Available { .. })
+        matches!(self, Self::Available { .. } | Self::AuthUnverifiable { .. })
     }
     pub fn display_status(&self) -> &'static str {
         match self {
@@ -92,9 +99,69 @@ impl AntigravityRuntimeHealth {
             Self::Available { .. } => "AGY available",
             Self::NotInstalled { .. } => "AGY not installed",
             Self::NotAuthenticated { .. } => "AGY not authenticated",
+            Self::AuthUnverifiable { .. } => "AGY available (auth not verifiable)",
             Self::Incompatible { .. } => "AGY CLI incompatible",
             Self::DiscoveryFailed { .. } => "AGY discovery failed",
         }
+    }
+}
+
+/// Maps a discovery outcome onto the provider-neutral probe shape.
+fn runtime_probe_from_health(health: AntigravityRuntimeHealth) -> RuntimeProbe {
+    match health {
+        AntigravityRuntimeHealth::Available { version } => RuntimeProbe {
+            installed: true,
+            version: Some(version),
+            authenticated: true,
+            compatible: true,
+            account_identity: None,
+            notes: vec!["Antigravity available and authenticated".to_owned()],
+        },
+        AntigravityRuntimeHealth::NotAuthenticated { version, error } => RuntimeProbe {
+            installed: true,
+            version,
+            authenticated: false,
+            compatible: true,
+            account_identity: None,
+            notes: vec![format!("Not authenticated: {error}")],
+        },
+        AntigravityRuntimeHealth::AuthUnverifiable { version } => RuntimeProbe {
+            installed: true,
+            version: Some(version),
+            authenticated: false,
+            compatible: true,
+            account_identity: None,
+            notes: vec![
+                "Authentication not verifiable: this agy CLI has no 'auth' subcommand; \
+provider auth is exercised on first execution."
+                    .to_owned(),
+            ],
+        },
+        AntigravityRuntimeHealth::Incompatible { version, reason } => RuntimeProbe {
+            installed: true,
+            version: Some(version),
+            authenticated: true,
+            compatible: false,
+            account_identity: None,
+            notes: vec![format!("Incompatible: {reason}")],
+        },
+        AntigravityRuntimeHealth::NotInstalled { error }
+        | AntigravityRuntimeHealth::DiscoveryFailed { error } => RuntimeProbe {
+            installed: false,
+            version: None,
+            authenticated: false,
+            compatible: false,
+            account_identity: None,
+            notes: vec![error],
+        },
+        AntigravityRuntimeHealth::Checking => RuntimeProbe {
+            installed: false,
+            version: None,
+            authenticated: false,
+            compatible: false,
+            account_identity: None,
+            notes: vec!["Health check pending".to_owned()],
+        },
     }
 }
 
@@ -123,52 +190,7 @@ impl RuntimeIntegration for AntigravityRuntime {
     fn probe(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RuntimeProbe> + Send + '_>> {
-        Box::pin(async move {
-            let health = self.discover().await;
-            match health {
-                AntigravityRuntimeHealth::Available { version } => RuntimeProbe {
-                    installed: true,
-                    version: Some(version),
-                    authenticated: true,
-                    compatible: true,
-                    account_identity: None,
-                    notes: vec!["Antigravity available and authenticated".to_owned()],
-                },
-                AntigravityRuntimeHealth::NotAuthenticated { version, error } => RuntimeProbe {
-                    installed: true,
-                    version,
-                    authenticated: false,
-                    compatible: true,
-                    account_identity: None,
-                    notes: vec![format!("Not authenticated: {error}")],
-                },
-                AntigravityRuntimeHealth::Incompatible { version, reason } => RuntimeProbe {
-                    installed: true,
-                    version: Some(version),
-                    authenticated: true,
-                    compatible: false,
-                    account_identity: None,
-                    notes: vec![format!("Incompatible: {reason}")],
-                },
-                AntigravityRuntimeHealth::NotInstalled { error }
-                | AntigravityRuntimeHealth::DiscoveryFailed { error } => RuntimeProbe {
-                    installed: false,
-                    version: None,
-                    authenticated: false,
-                    compatible: false,
-                    account_identity: None,
-                    notes: vec![error],
-                },
-                AntigravityRuntimeHealth::Checking => RuntimeProbe {
-                    installed: false,
-                    version: None,
-                    authenticated: false,
-                    compatible: false,
-                    account_identity: None,
-                    notes: vec!["Health check pending".to_owned()],
-                },
-            }
-        })
+        Box::pin(async move { runtime_probe_from_health(self.discover().await) })
     }
 
     fn profiles(&self) -> Vec<RuntimeProfileDescriptor> {
@@ -199,8 +221,9 @@ impl RuntimeIntegration for AntigravityRuntime {
                 default_model: "default".to_owned(),
                 available_models: vec![RuntimeModelInfo {
                     id: "default".to_owned(),
-                    display_name: "Default (Account/CLI Setting)".to_owned(),
+                    display_name: "Default Shell".to_owned(),
                     supported_reasoning_efforts: vec![],
+                    default_reasoning_effort: None,
                 }],
             }
         })
@@ -437,6 +460,25 @@ fn safe_process_error(bytes: &[u8], fallback: &str) -> String {
     }
 }
 
+/// True when a probe command failed because this CLI build does not know the
+/// subcommand at all (as opposed to running it and reporting a real failure).
+fn reports_unknown_subcommand(output: &std::process::Output) -> bool {
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    text_reports_unknown_subcommand(&text)
+}
+
+fn text_reports_unknown_subcommand(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("unexpected argument")
+        || text.contains("unknown command")
+        || text.contains("unrecognized")
+        || text.contains("unrecognised")
+}
+
 impl AntigravityRuntime {
     pub fn new(config: AntigravityRuntimeConfig) -> Self {
         Self { config }
@@ -477,16 +519,25 @@ impl AntigravityRuntime {
             }
         };
 
+        let mut auth_unverifiable = false;
         match discover_command(&executable, &["auth", "status"]).await {
             Ok(output) if output.status.success() => {}
             Ok(output) => {
-                return AntigravityRuntimeHealth::NotAuthenticated {
-                    version: Some(version),
-                    error: safe_process_error(
-                        &output.stderr,
-                        "agy auth status reported no active login",
-                    ),
-                };
+                if reports_unknown_subcommand(&output) {
+                    // Newer agy builds dropped the `auth` subcommand
+                    // entirely. That is not a login failure: authentication
+                    // simply cannot be probed non-interactively, so mark it
+                    // unverifiable instead of permanently "not authenticated".
+                    auth_unverifiable = true;
+                } else {
+                    return AntigravityRuntimeHealth::NotAuthenticated {
+                        version: Some(version),
+                        error: safe_process_error(
+                            &output.stderr,
+                            "agy auth status reported no active login",
+                        ),
+                    };
+                }
             }
             Err(DiscoveryError::Spawn(error)) => {
                 return AntigravityRuntimeHealth::DiscoveryFailed { error };
@@ -500,7 +551,11 @@ impl AntigravityRuntime {
 
         match discover_command(&executable, &["--help"]).await {
             Ok(output) if output.status.success() => {
-                AntigravityRuntimeHealth::Available { version }
+                if auth_unverifiable {
+                    AntigravityRuntimeHealth::AuthUnverifiable { version }
+                } else {
+                    AntigravityRuntimeHealth::Available { version }
+                }
             }
             Ok(output) => AntigravityRuntimeHealth::Incompatible {
                 version,
@@ -636,7 +691,7 @@ fn render_agy_json_event(event: &Value) -> Option<Vec<u8>> {
 fn normalize_agy_activity(event: &Value) -> Option<RuntimeActivity> {
     let kind = event.get("type")?.as_str()?;
     match kind {
-        "thread.started" => Some(RuntimeActivity::SessionStarted),
+        "init" | "thread.started" => Some(RuntimeActivity::SessionStarted),
         "turn.started" => Some(RuntimeActivity::Analyzing {
             description: "AGY started working".to_owned(),
         }),
@@ -1072,5 +1127,71 @@ impl Runtime for AntigravityRuntime {
                 control: None,
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_stream_json_init_and_result() {
+        let init_json = serde_json::json!({
+            "type": "init",
+            "session_id": "test-session"
+        });
+        let activity = normalize_agy_activity(&init_json);
+        assert!(matches!(activity, Some(RuntimeActivity::SessionStarted)));
+
+        let result_json = serde_json::json!({
+            "type": "result",
+            "result": {
+                "outcome": "success",
+                "summary": "Completed successfully",
+                "verification_summary": "Passed all tests"
+            }
+        });
+        let res: RelayResult = serde_json::from_value(result_json["result"].clone()).unwrap();
+        assert!(matches!(res.outcome, RelayResultKind::Success));
+        assert_eq!(res.summary, "Completed successfully");
+    }
+
+    #[test]
+    fn unknown_auth_subcommand_is_classified_separately_from_login_failures() {
+        // The observed failure mode on newer agy builds.
+        assert!(text_reports_unknown_subcommand(
+            "Error: unexpected argument \"auth\"."
+        ));
+        assert!(text_reports_unknown_subcommand(
+            "error: unrecognized subcommand 'auth'"
+        ));
+        assert!(text_reports_unknown_subcommand(
+            "AGY: unknown command \"auth\""
+        ));
+        assert!(text_reports_unknown_subcommand("Unrecognised option: auth"));
+
+        // Real auth failures must keep the NotAuthenticated classification.
+        assert!(!text_reports_unknown_subcommand(
+            "not logged in. Run `agy login` first."
+        ));
+        assert!(!text_reports_unknown_subcommand("credentials expired"));
+        assert!(!text_reports_unknown_subcommand(""));
+    }
+
+    #[test]
+    fn auth_unverifiable_is_ready_but_honestly_labeled() {
+        let health = AntigravityRuntimeHealth::AuthUnverifiable {
+            version: "agy 1.2.3".to_owned(),
+        };
+        assert!(health.is_ready());
+        assert_eq!(
+            health.display_status(),
+            "AGY available (auth not verifiable)"
+        );
+
+        let probe = runtime_probe_from_health(health);
+        assert!(probe.installed);
+        assert!(!probe.authenticated);
+        assert!(probe.compatible);
     }
 }

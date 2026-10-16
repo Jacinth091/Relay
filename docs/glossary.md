@@ -22,11 +22,11 @@ The canonical user-approved implementation specification accepted by Relay.
 
 ## Submission Transport
 
-How a HandoffTask reaches Relay, such as Relay Direct/MCP, provider GitHub submission, local file, local paste, or GitHub ingress.
+How a HandoffTask reaches Relay. Implemented transports: Relay Direct/MCP (`relay serve-mcp`) and local file/paste. Future optional: GitHub ingress (descoped from v0.1 by ADR-0016).
 
 ## Ingress
 
-A Relay-side receiving mechanism for tasks or protocol objects. Examples include local import, GitHub Issue ingestion, and a future direct MCP/server interface.
+A Relay-side receiving mechanism for tasks or protocol objects. Implemented today: local import and the Relay Direct MCP server. GitHub Issue ingestion is a future optional compatibility path, not current behavior.
 
 ## External Binding
 
@@ -34,7 +34,7 @@ An optional association between a canonical Relay task and a remote record such 
 
 ## Relay Direct
 
-A planner-to-Relay submission path that calls Relay itself through a supported interface such as MCP rather than requiring the planner to write to an external mailbox.
+The implemented planner-to-Relay submission path in which a planner host calls Relay itself through MCP (`relay serve-mcp`) instead of writing to an external mailbox. M9 delivers Phase 1 — submission (`submit_handoff`) only; bidirectional capabilities such as status/result retrieval, trusted diff reading, and clarification/resolution loops are future phases, specified deliberately before implementation.
 
 ## Provider
 

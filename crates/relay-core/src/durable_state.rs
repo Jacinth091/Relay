@@ -114,12 +114,29 @@ pub async fn get_stored_task(
 pub async fn list_stored_tasks(
     store: &SqliteStore,
 ) -> Result<Vec<StoredTask>, TaskPersistenceError> {
-    store
-        .list_tasks()
-        .await?
-        .into_iter()
-        .map(record_to_stored_task)
-        .collect()
+    Ok(list_stored_tasks_with_quarantined(store).await?.0)
+}
+
+/// Lists stored tasks, quarantining records that fail revalidation.
+///
+/// A single corrupt row must not hide every task from the user, so rows that
+/// cannot be revalidated are skipped instead of failing the whole listing.
+/// The number of quarantined records is returned alongside the parsed tasks
+/// so callers can surface partial corruption.
+pub async fn list_stored_tasks_with_quarantined(
+    store: &SqliteStore,
+) -> Result<(Vec<StoredTask>, usize), TaskPersistenceError> {
+    let mut tasks = Vec::new();
+    let mut quarantined = 0usize;
+
+    for record in store.list_tasks().await? {
+        match record_to_stored_task(record) {
+            Ok(task) => tasks.push(task),
+            Err(_) => quarantined += 1,
+        }
+    }
+
+    Ok((tasks, quarantined))
 }
 
 pub async fn update_stored_task_state(
@@ -185,6 +202,7 @@ fn parse_submission_transport(input: &str) -> Result<SubmissionTransport, TaskPe
     match input {
         "local-file" => Ok(SubmissionTransport::LocalFile),
         "local-paste" => Ok(SubmissionTransport::LocalPaste),
+        "relay-mcp" => Ok(SubmissionTransport::RelayMcp),
         transport => Err(TaskPersistenceError::UnknownSubmissionTransport {
             transport: transport.to_owned(),
         }),
@@ -368,6 +386,24 @@ mod tests {
         assert_eq!(loaded.state, TaskState::Ready);
     }
 
+    #[tokio::test]
+    async fn mcp_submission_persists_with_relay_mcp_transport_and_round_trips() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let mut relay = relay_with_project("relay");
+        let candidate = relay.preview_mcp_submission(TASK_JSON).unwrap();
+
+        let stored = relay
+            .confirm_task_import_with_store(&store, candidate)
+            .await
+            .unwrap();
+
+        assert_eq!(stored.submission_transport, SubmissionTransport::RelayMcp);
+        assert_eq!(stored.state, TaskState::Ready);
+
+        let loaded = get_stored_task(&store, stored.id).await.unwrap().unwrap();
+        assert_eq!(loaded.submission_transport, SubmissionTransport::RelayMcp);
+    }
+
     #[test]
     fn unknown_stored_state_is_rejected() {
         let record = task_record(
@@ -386,117 +422,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stored_handoff_json_is_revalidated_on_load() {
+    async fn listing_skips_corrupt_row_and_returns_good_row() {
         let store = SqliteStore::in_memory().await.unwrap();
-        let record = NewTaskRecord {
-            id: "bad-json".to_owned(),
+        let mut relay = relay_with_project("relay");
+        let candidate = relay.preview_local_paste(TASK_JSON).unwrap();
+        let imported = relay.confirm_task_import(candidate).clone();
+        let good = persist_imported_task(&store, &imported).await.unwrap();
+
+        let corrupt = NewTaskRecord {
+            id: "corrupt-json".to_owned(),
             project_key: "relay".to_owned(),
-            title: "Bad JSON".to_owned(),
+            title: "Corrupt JSON".to_owned(),
             requested_stack: None,
             submission_transport: "local-paste".to_owned(),
             source_kind: None,
             source_provider: None,
             state: "ready".to_owned(),
             protocol_version: 1,
-            handoff_json: r#"{
+            handoff_json: "{not valid json".to_owned(),
+        };
+        store.insert_task(&corrupt).await.unwrap();
+
+        let tasks = list_stored_tasks(&store).await.unwrap();
+        let (tasks_with_count, quarantined) =
+            list_stored_tasks_with_quarantined(&store).await.unwrap();
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, good.id);
+        assert_eq!(tasks_with_count.len(), 1);
+        assert_eq!(tasks_with_count[0].id, good.id);
+        assert_eq!(quarantined, 1);
+    }
+
+    #[test]
+    fn stored_handoff_json_is_revalidated_on_load() {
+        let record = task_record(
+            "550e8400-e29b-41d4-a716-446655440000",
+            "Bad JSON",
+            "ready",
+            r#"{
                 "protocol_version": 2,
                 "project": "relay",
                 "title": "Bad JSON",
                 "task": {"goal": "Invalid protocol."},
                 "ambiguity_policy": "needs_clarification"
-            }"#
-            .to_owned(),
-        };
-        store.insert_task(&record).await.unwrap();
+            }"#,
+        );
 
-        let error = list_stored_tasks(&store).await.unwrap_err();
+        let error = record_to_stored_task(record).unwrap_err();
 
         assert!(error.to_string().contains("unsupported protocol version 2"));
     }
 
-    #[tokio::test]
-    async fn stored_handoff_with_empty_required_field_is_rejected_on_load() {
-        let store = SqliteStore::in_memory().await.unwrap();
-        let record = NewTaskRecord {
-            id: "empty-title".to_owned(),
-            project_key: "relay".to_owned(),
-            title: "Stored title".to_owned(),
-            requested_stack: None,
-            submission_transport: "local-paste".to_owned(),
-            source_kind: None,
-            source_provider: None,
-            state: "ready".to_owned(),
-            protocol_version: 1,
-            handoff_json: r#"{
+    #[test]
+    fn stored_handoff_with_empty_required_field_is_rejected_on_load() {
+        let record = task_record(
+            "550e8400-e29b-41d4-a716-446655440001",
+            "Stored title",
+            "ready",
+            r#"{
                 "protocol_version": 1,
                 "project": "relay",
                 "title": "",
                 "task": {"goal": "Invalid empty title."},
                 "ambiguity_policy": "needs_clarification"
-            }"#
-            .to_owned(),
-        };
-        store.insert_task(&record).await.unwrap();
+            }"#,
+        );
 
-        let error = list_stored_tasks(&store).await.unwrap_err();
+        let error = record_to_stored_task(record).unwrap_err();
 
         assert!(error.to_string().contains("title cannot be empty"));
     }
 
-    #[tokio::test]
-    async fn stored_project_key_must_match_handoff_project() {
-        let store = SqliteStore::in_memory().await.unwrap();
-        let record = NewTaskRecord {
-            id: "project-mismatch".to_owned(),
-            project_key: "relay".to_owned(),
-            title: "Mismatch".to_owned(),
-            requested_stack: None,
-            submission_transport: "local-paste".to_owned(),
-            source_kind: None,
-            source_provider: None,
-            state: "ready".to_owned(),
-            protocol_version: 1,
-            handoff_json: r#"{
+    #[test]
+    fn stored_project_key_must_match_handoff_project() {
+        let record = task_record(
+            "550e8400-e29b-41d4-a716-446655440002",
+            "Mismatch",
+            "ready",
+            r#"{
                 "protocol_version": 1,
                 "project": "other",
                 "title": "Mismatch",
                 "task": {"goal": "Mismatch."},
                 "ambiguity_policy": "needs_clarification"
-            }"#
-            .to_owned(),
-        };
-        store.insert_task(&record).await.unwrap();
+            }"#,
+        );
 
-        let error = list_stored_tasks(&store).await.unwrap_err();
+        let error = record_to_stored_task(record).unwrap_err();
 
         assert!(error.to_string().contains("does not match handoff project"));
     }
 
-    #[tokio::test]
-    async fn stored_title_must_match_handoff_title() {
-        let store = SqliteStore::in_memory().await.unwrap();
-        let record = NewTaskRecord {
-            id: "title-mismatch".to_owned(),
-            project_key: "relay".to_owned(),
-            title: "Stored title".to_owned(),
-            requested_stack: None,
-            submission_transport: "local-paste".to_owned(),
-            source_kind: None,
-            source_provider: None,
-            state: "ready".to_owned(),
-            protocol_version: 1,
-            handoff_json: r#"{
+    #[test]
+    fn stored_title_must_match_handoff_title() {
+        let record = task_record(
+            "550e8400-e29b-41d4-a716-446655440003",
+            "Stored title",
+            "ready",
+            r#"{
                 "protocol_version": 1,
                 "project": "relay",
                 "title": "Canonical title",
                 "task": {"goal": "Mismatch."},
                 "ambiguity_policy": "needs_clarification"
-            }"#
-            .to_owned(),
-        };
-        store.insert_task(&record).await.unwrap();
+            }"#,
+        );
 
-        let error = list_stored_tasks(&store).await.unwrap_err();
+        let error = record_to_stored_task(record).unwrap_err();
 
         assert!(error.to_string().contains("does not match handoff title"));
     }

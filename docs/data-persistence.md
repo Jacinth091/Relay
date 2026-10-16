@@ -118,6 +118,37 @@ Use explicit database migrations from the beginning.
 
 Database schema version and Relay protocol versions are separate.
 
+## Multi-Process Access
+
+Relay supports concurrent access to the same local database file from exactly
+two writer classes: the TUI and the `relay serve-mcp` process (implemented,
+M9). Anything more (additional writer processes, networked/shared databases)
+is out of scope until re-examined.
+
+This two-process behavior is proven by tests: interleaved writes across two
+store handles on one database file, busy-timeout retry under contention, and
+compare-and-set loser rejection (M9 phase 02). It does not claim anything
+beyond what those tests cover.
+
+Every Relay connection sets:
+
+- WAL journal mode, so readers never block writers and vice versa;
+- a 5000 ms busy timeout, so short cross-process write contention resolves by
+  waiting rather than failing;
+- foreign key enforcement.
+
+Write paths additionally retry transient `SQLITE_BUSY`/`SQLITE_LOCKED` errors
+with bounded exponential backoff (5 attempts). If contention persists beyond
+the retry budget, the write fails with a typed busy error instead of hanging or
+corrupting state. Concurrent writes to the same task row are arbitrated by
+compare-and-set state transitions: exactly one writer wins; the loser receives
+a typed conflict error.
+
+A second process that opens a database written by an incompatible Relay build
+(unknown migration version, modified applied migration, or partially applied /
+dirty migration) fails closed at open time with a typed schema-version error.
+It does not crash, migrate blindly, or continue silently.
+
 ## Current Implementation
 
 M5 initializes Relay's embedded SQLite store through SQLx migrations owned by

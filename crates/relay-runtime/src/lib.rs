@@ -129,6 +129,7 @@ pub enum RuntimeOutputStream {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum RuntimeEvent {
     Activity(RuntimeActivity),
     Output {
@@ -152,6 +153,13 @@ pub struct RuntimePermissionRequest {
     pub requested: RuntimeRequestedPermissions,
     #[serde(default)]
     pub available_decisions: Vec<RuntimePermissionDecisionKind>,
+    pub item_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub environment_id: Option<String>,
+    pub grant_root: Option<PathBuf>,
+    pub command_actions: Option<Vec<String>>,
+    pub network_approval_context: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,10 +178,24 @@ pub struct RuntimeRequestedPermissions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimePermissionScope {
+    Once,
+    Turn,
+    Session,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePermissionGrant {
+    pub decision: RuntimePermissionDecision,
+    pub scope: RuntimePermissionScope,
+    pub granted_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeControl {
     PermissionDecision {
         request_id: String,
-        decision: RuntimePermissionDecision,
+        grant: RuntimePermissionGrant,
     },
     UserInputResponse {
         request_id: String,
@@ -302,13 +324,23 @@ pub struct RuntimeDeadline {
 }
 
 mod activity;
+pub mod backplane;
+pub mod herdr;
 mod integration;
+pub mod local_process_backplane;
 mod profile;
+mod provider;
+mod resolver;
 mod router;
 pub mod sanitizer;
 
 pub use activity::*;
+pub use backplane::*;
+pub use herdr::*;
 pub use integration::*;
+pub use local_process_backplane::*;
 pub use profile::*;
+pub use provider::*;
+pub use resolver::*;
 pub use router::*;
 pub use sanitizer::*;

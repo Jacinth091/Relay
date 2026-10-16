@@ -11,17 +11,21 @@ name = "relay"
 path = "src/main.rs"
 
 [dependencies]
+clap.workspace = true
 crossterm = { version = "0.28.1", features = ["event-stream"] }
 dirs = "6.0.0"
 futures = "0.3"
 ratatui = "0.29.0"
 relay-core = { path = "../../crates/relay-core" }
+relay-protocol = { path = "../../crates/relay-protocol" }
 relay-runtime = { path = "../../crates/relay-runtime" }
 relay-runtime-antigravity = { path = "../../runtimes/relay-runtime-antigravity" }
 relay-runtime-codex = { path = "../../runtimes/relay-runtime-codex" }
 relay-runtime-fake = { path = "../../runtimes/relay-runtime-fake" }
 relay-store = { path = "../../crates/relay-store" }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1.43.0", features = ["macros", "process", "rt", "sync", "time"] }
+serde_json = { version = "1.0", features = ["raw_value"] }
+tokio = { version = "1.43.0", features = ["io-std", "io-util", "macros", "process", "rt", "signal", "sync", "time"] }
 toml = "0.8"
+tracing.workspace = true
+tracing-subscriber.workspace = true

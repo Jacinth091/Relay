@@ -96,6 +96,7 @@ impl Default for ExecutionLimits {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum CoreExecutionEvent {
     ExecutionQueued {
         task_id: TaskId,
@@ -295,6 +296,37 @@ impl<R: Runtime> ExecutionScheduler<R> {
         &self.limits
     }
 
+    /// Deterministically plans an execution run from user intent.
+    ///
+    /// Loads the stored task and registered project, then delegates all policy
+    /// decisions (profile resolution, stack validation, limit clamping,
+    /// permission envelope construction) to [`crate::build_execution_plan`].
+    pub async fn plan_execution(
+        &self,
+        task_id: TaskId,
+        intent: crate::ExecutionPlanIntent,
+        environment: &crate::ExecutionPlanEnvironment,
+    ) -> Result<crate::ExecutionPlan, crate::ExecutionPlanningError> {
+        let stored = get_stored_task(&self.store, task_id)
+            .await?
+            .ok_or(crate::ExecutionPlanningError::TaskNotFound { task_id })?;
+        let project = self
+            .relay
+            .resolve_project(stored.project_key.as_str())
+            .map_err(|_| crate::ExecutionPlanningError::ProjectNotRegistered {
+                project_key: stored.project_key.as_str().to_owned(),
+            })?;
+        let fallback_profile_id = self.runtime.identity().profile_id.clone();
+        crate::build_execution_plan(
+            &stored,
+            project,
+            intent,
+            &self.limits,
+            environment,
+            &fallback_profile_id,
+        )
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<CoreExecutionEvent> {
         self.event_tx.subscribe()
     }
@@ -304,7 +336,7 @@ impl<R: Runtime> ExecutionScheduler<R> {
         &self,
         task_id: TaskId,
         request_id: String,
-        decision: relay_runtime::RuntimePermissionDecision,
+        grant: relay_runtime::RuntimePermissionGrant,
     ) -> Result<(), ExecutionSchedulerError> {
         let sender = self.permission_channels.lock().await.get(&task_id).cloned();
         let Some(sender) = sender else {
@@ -345,7 +377,7 @@ impl<R: Runtime> ExecutionScheduler<R> {
             });
         }
         if let Some(request) = self.pending_permissions.lock().await.get(&task_id) {
-            let decision_name = match decision {
+            let decision_name = match grant.decision {
                 relay_runtime::RuntimePermissionDecision::AllowOnce => "allow_once",
                 relay_runtime::RuntimePermissionDecision::AllowForRun => "allow_for_run",
                 relay_runtime::RuntimePermissionDecision::Deny => "deny",
@@ -374,11 +406,12 @@ impl<R: Runtime> ExecutionScheduler<R> {
                     ExecutionSchedulerError::TaskPersistence(TaskPersistenceError::Store(error))
                 })?;
         }
+        self.send(CoreExecutionEvent::SchedulerStatusChanged {
+            task_id,
+            status: SchedulerTaskStatus::Running,
+        });
         sender
-            .send(RuntimeControl::PermissionDecision {
-                request_id,
-                decision,
-            })
+            .send(RuntimeControl::PermissionDecision { request_id, grant })
             .await
             .map_err(|_| ExecutionSchedulerError::TaskNotFound { task_id })
     }
@@ -1260,6 +1293,13 @@ async fn collect_runtime_events<R: Runtime>(
                             permission_execution_ids.lock().await.remove(&task_id);
                             return RuntimeOutcome::new(RuntimeOutcomeKind::NeedsDecision, "provider could not receive permission decision");
                         }
+                        send(
+                            event_tx,
+                            CoreExecutionEvent::SchedulerStatusChanged {
+                                task_id,
+                                status: SchedulerTaskStatus::Running,
+                            },
+                        );
                     }
                     None => {
                         permission_channels.lock().await.remove(&task_id);

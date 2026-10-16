@@ -30,6 +30,7 @@ pub enum RelayCommand {
     },
     Settings,
     Doctor,
+    Updates,
     Help,
     Run {
         task: String,
@@ -63,6 +64,7 @@ pub const COMMANDS: &[&str] = &[
     "/runtime profile <profile>",
     "/settings",
     "/doctor",
+    "/updates",
     "/help",
     "/run <task> [--model=<id>] [--reasoning=<effort>]",
     "/cancel <task>",
@@ -134,6 +136,7 @@ pub fn parse_relay_command(input: &str) -> Result<RelayCommand, String> {
         }),
         "/settings" if argument.is_empty() => Ok(RelayCommand::Settings),
         "/doctor" if argument.is_empty() => Ok(RelayCommand::Doctor),
+        "/updates" if argument.is_empty() => Ok(RelayCommand::Updates),
         "/help" if argument.is_empty() => Ok(RelayCommand::Help),
         "/run" if !argument.is_empty() => parse_run_command(argument),
         "/cancel" if !argument.is_empty() => Ok(RelayCommand::Cancel {

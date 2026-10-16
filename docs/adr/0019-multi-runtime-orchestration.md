@@ -1,4 +1,6 @@
-# ADR-009: Multi-Runtime Orchestration Architecture
+# ADR-0019: Multi-Runtime Orchestration Architecture
+
+> **Numbering note:** this ADR was originally filed as `0009-multi-runtime-orchestration.md`, colliding with `0009-single-relay-ingress-model.md`. It was renumbered to 0019 without any change to its decision content.
 
 **Status:** Proposed
 **Date:** 2026-08-15

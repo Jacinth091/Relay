@@ -34,24 +34,29 @@ Initial/future transport identifiers may include:
 
 ```text
 relay-direct
-relay-mcp
+relay-mcp        <- IMPLEMENTED (M9): `relay serve-mcp`, persisted provenance "relay-mcp"
 provider-github
-local-file
-local-paste
-github-ingress
+local-file       <- implemented (local ingress)
+local-paste      <- implemented (local ingress)
+github-ingress   <- descoped from v0.1 by ADR-0016; not started
 ```
 
 The exact persisted names may evolve, but the distinction must remain.
 
 ### Preferred order for planner handoff
 
-When the user explicitly says **Send this to Relay**, a planner adapter should use the strongest supported path available:
+Per invariant 23, a planner adapter prefers transports in this order:
 
-1. **Relay Direct** — submit to Relay through a supported direct interface such as MCP.
-2. **Provider-native remote transport** — for example, create an Issue in the user's configured private Relay mailbox when the planner host has authorized issue-write capability. The mailbox is user-owned configuration, not a Relay-maintainer service.
-3. **Local artifact/paste fallback** — produce a canonical Relay task for import when no automatic transport is available.
+1. **Relay Direct** when available — submit through Relay's own interface.
+   This is `relay serve-mcp` today: an MCP stdio server whose single tool
+   `submit_handoff` accepts one canonical HandoffTask v1 JSON object and,
+   after validation and durable persistence, answers with `{task_id, state:
+   "Ready"}`. Host registration recipes live under
+   [docs/planner-hosts/](planner-hosts/).
+2. **Provider-native remote compatibility transport** — for example, create an Issue in the user's configured private Relay mailbox when the planner host has authorized issue-write capability. The mailbox is user-owned configuration, not a Relay-maintainer service.
+3. **Local artifact/paste fallback** — produce a canonical Relay task for import when no automatic transport is available ([docs/local-ingress.md](local-ingress.md)).
 
-A planner must not claim that a task was sent unless an external receiver confirms success.
+A planner must not claim that a task was sent unless an external receiver confirms success. Submission never executes anything: running requires explicit Run approval in the Relay TUI.
 
 ## External Binding
 

@@ -11,11 +11,12 @@ relay-protocol = { path = "../relay-protocol" }
 relay-runtime = { path = "../relay-runtime" }
 relay-store = { path = "../relay-store" }
 serde = { version = "1.0.217", features = ["derive"] }
+sha2 = "0.10.9"
 serde_json = "1.0.135"
 thiserror = "2.0.11"
 tokio = { version = "1.43.0", features = ["macros", "rt", "sync", "time"] }
 toml = "0.8.19"
-uuid = { version = "1.12.1", features = ["v4"] }
+uuid = { version = "1.12.1", features = ["serde", "v4"] }
 
 [dev-dependencies]
 relay-runtime-fake = { path = "../../runtimes/relay-runtime-fake" }

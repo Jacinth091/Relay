@@ -6,7 +6,9 @@
 
 use std::{
     env,
+    future::Future,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use sqlx::{
@@ -16,6 +18,19 @@ use sqlx::{
 use thiserror::Error;
 
 const MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// Default SQLite busy timeout applied to every Relay connection.
+const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
+
+/// Bounded retry budget applied before transient SQLite lock errors surface.
+const WRITE_RETRY_ATTEMPTS: usize = 5;
+const WRITE_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(20);
+const WRITE_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(160);
+
+// Primary SQLite result codes treated as transient lock contention. Extended
+// codes (for example SQLITE_BUSY_SNAPSHOT) share the low byte.
+const SQLITE_BUSY_PRIMARY_CODE: i32 = 5;
+const SQLITE_LOCKED_PRIMARY_CODE: i32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewTaskRecord {
@@ -68,6 +83,67 @@ pub struct ExecutionRecord {
     pub runtime_metadata_json: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandRecord {
+    pub id: String,
+    pub command_type: String,
+    pub payload_json: String,
+    pub status: String,
+    pub response_json: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewPendingEffectRecord {
+    pub id: String,
+    pub effect_type: String,
+    pub idempotency_key: String,
+    pub payload_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingEffectRecord {
+    pub id: String,
+    pub effect_type: String,
+    pub idempotency_key: String,
+    pub payload_json: String,
+    pub state: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectResultRecord {
+    pub id: String,
+    pub effect_id: String,
+    pub outcome: String,
+    pub result_json: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventRecord {
+    pub sequence: i64,
+    pub task_id: Option<String>,
+    pub execution_id: Option<String>,
+    pub event_kind: String,
+    pub event_json: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonLeaseRecord {
+    pub lease_id: String,
+    pub holder_pid: i64,
+    pub holder_host: String,
+    pub acquired_at: String,
+    pub heartbeat_at: String,
+    pub fencing_token: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
@@ -75,7 +151,20 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     /// Opens a SQLite database, creates parent directories, and runs migrations.
+    ///
+    /// Every connection sets WAL journal mode, a 5000 ms busy timeout, and
+    /// foreign key enforcement so two Relay processes (TUI, serve-mcp) can
+    /// share the same database file safely.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_with_busy_timeout(path, DEFAULT_BUSY_TIMEOUT).await
+    }
+
+    /// Opens a SQLite database like [`SqliteStore::open`] with an explicit
+    /// busy timeout.
+    pub async fn open_with_busy_timeout(
+        path: impl AsRef<Path>,
+        busy_timeout: Duration,
+    ) -> Result<Self, StoreError> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|source| {
@@ -86,22 +175,30 @@ impl SqliteStore {
             })?;
         }
 
-        let options = SqliteConnectOptions::new()
-            .filename(path)
+        let options = Self::connect_options(path)
             .create_if_missing(true)
-            .foreign_keys(true)
-            .journal_mode(SqliteJournalMode::Wal);
+            .busy_timeout(busy_timeout);
         Self::connect(options).await
     }
 
     /// Opens an in-memory SQLite database and runs migrations.
     pub async fn in_memory() -> Result<Self, StoreError> {
-        Self::connect(
-            SqliteConnectOptions::new()
-                .filename(":memory:")
-                .foreign_keys(true),
-        )
-        .await
+        Self::connect(Self::connect_options(":memory:").busy_timeout(DEFAULT_BUSY_TIMEOUT)).await
+    }
+
+    /// Read access to the underlying connection pool for inspection queries.
+    ///
+    /// Intended for integration tests and operational verification; all schema
+    /// mutations must go through the typed store APIs.
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    fn connect_options(filename: impl AsRef<Path>) -> SqliteConnectOptions {
+        SqliteConnectOptions::new()
+            .filename(filename)
+            .foreign_keys(true)
+            .journal_mode(SqliteJournalMode::Wal)
     }
 
     async fn connect(options: SqliteConnectOptions) -> Result<Self, StoreError> {
@@ -109,12 +206,16 @@ impl SqliteStore {
             .max_connections(1)
             .connect_with(options)
             .await?;
-        MIGRATOR.run(&pool).await?;
+        run_migrations(&pool).await?;
 
         Ok(Self { pool })
     }
 
     pub async fn insert_task(&self, task: &NewTaskRecord) -> Result<TaskRecord, StoreError> {
+        retry_on_transient_lock(|| self.insert_task_once(task)).await
+    }
+
+    async fn insert_task_once(&self, task: &NewTaskRecord) -> Result<TaskRecord, StoreError> {
         let mut transaction = self.pool.begin().await?;
 
         sqlx::query(
@@ -180,6 +281,19 @@ impl SqliteStore {
         event_kind: &str,
         event_json: Option<&str>,
     ) -> Result<(), StoreError> {
+        retry_on_transient_lock(|| {
+            self.append_event_once(task_id, execution_id, event_kind, event_json)
+        })
+        .await
+    }
+
+    async fn append_event_once(
+        &self,
+        task_id: Option<&str>,
+        execution_id: Option<&str>,
+        event_kind: &str,
+        event_json: Option<&str>,
+    ) -> Result<(), StoreError> {
         let mut transaction = self.pool.begin().await?;
         insert_event(
             &mut transaction,
@@ -194,6 +308,15 @@ impl SqliteStore {
     }
 
     pub async fn update_task_state(
+        &self,
+        id: &str,
+        expected_state: &str,
+        new_state: &str,
+    ) -> Result<TaskRecord, StoreError> {
+        retry_on_transient_lock(|| self.update_task_state_once(id, expected_state, new_state)).await
+    }
+
+    async fn update_task_state_once(
         &self,
         id: &str,
         expected_state: &str,
@@ -237,6 +360,13 @@ impl SqliteStore {
     }
 
     pub async fn claim_ready_task_for_execution(
+        &self,
+        execution: &NewExecutionRecord,
+    ) -> Result<(TaskRecord, ExecutionRecord), StoreError> {
+        retry_on_transient_lock(|| self.claim_ready_task_for_execution_once(execution)).await
+    }
+
+    async fn claim_ready_task_for_execution_once(
         &self,
         execution: &NewExecutionRecord,
     ) -> Result<(TaskRecord, ExecutionRecord), StoreError> {
@@ -358,6 +488,14 @@ impl SqliteStore {
         execution_id: &str,
         phase: &str,
     ) -> Result<ExecutionRecord, StoreError> {
+        retry_on_transient_lock(|| self.update_execution_phase_once(execution_id, phase)).await
+    }
+
+    async fn update_execution_phase_once(
+        &self,
+        execution_id: &str,
+        phase: &str,
+    ) -> Result<ExecutionRecord, StoreError> {
         let result = sqlx::query(
             r#"
             UPDATE executions
@@ -384,6 +522,26 @@ impl SqliteStore {
     }
 
     pub async fn transition_task_and_execution(
+        &self,
+        task_id: &str,
+        expected_task_state: &str,
+        new_task_state: &str,
+        execution_id: &str,
+        new_execution_phase: &str,
+    ) -> Result<(TaskRecord, ExecutionRecord), StoreError> {
+        retry_on_transient_lock(|| {
+            self.transition_task_and_execution_once(
+                task_id,
+                expected_task_state,
+                new_task_state,
+                execution_id,
+                new_execution_phase,
+            )
+        })
+        .await
+    }
+
+    async fn transition_task_and_execution_once(
         &self,
         task_id: &str,
         expected_task_state: &str,
@@ -476,6 +634,13 @@ impl SqliteStore {
         &self,
         execution_id: &str,
     ) -> Result<ExecutionRecord, StoreError> {
+        retry_on_transient_lock(|| self.increment_execution_repair_count_once(execution_id)).await
+    }
+
+    async fn increment_execution_repair_count_once(
+        &self,
+        execution_id: &str,
+    ) -> Result<ExecutionRecord, StoreError> {
         let result = sqlx::query(
             r#"
             UPDATE executions
@@ -501,6 +666,22 @@ impl SqliteStore {
     }
 
     pub async fn transition_task_and_increment_repair_count(
+        &self,
+        task_id: &str,
+        expected_task_state: &str,
+        execution_id: &str,
+    ) -> Result<(TaskRecord, ExecutionRecord), StoreError> {
+        retry_on_transient_lock(|| {
+            self.transition_task_and_increment_repair_count_once(
+                task_id,
+                expected_task_state,
+                execution_id,
+            )
+        })
+        .await
+    }
+
+    async fn transition_task_and_increment_repair_count_once(
         &self,
         task_id: &str,
         expected_task_state: &str,
@@ -585,6 +766,28 @@ impl SqliteStore {
     }
 
     pub async fn finish_execution(
+        &self,
+        task_id: &str,
+        expected_task_state: &str,
+        terminal_task_state: &str,
+        execution_id: &str,
+        exit_outcome: &str,
+        failure_category: Option<&str>,
+    ) -> Result<(TaskRecord, ExecutionRecord), StoreError> {
+        retry_on_transient_lock(|| {
+            self.finish_execution_once(
+                task_id,
+                expected_task_state,
+                terminal_task_state,
+                execution_id,
+                exit_outcome,
+                failure_category,
+            )
+        })
+        .await
+    }
+
+    async fn finish_execution_once(
         &self,
         task_id: &str,
         expected_task_state: &str,
@@ -723,6 +926,491 @@ impl SqliteStore {
         rows.into_iter().map(row_to_task_record).collect()
     }
 
+    pub async fn record_command(
+        &self,
+        id: &str,
+        command_type: &str,
+        payload_json: &str,
+    ) -> Result<bool, StoreError> {
+        retry_on_transient_lock(|| self.record_command_once(id, command_type, payload_json)).await
+    }
+
+    async fn record_command_once(
+        &self,
+        id: &str,
+        command_type: &str,
+        payload_json: &str,
+    ) -> Result<bool, StoreError> {
+        let res = sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO commands (id, command_type, payload_json, status)
+            VALUES (?1, ?2, ?3, 'received')
+            "#,
+        )
+        .bind(id)
+        .bind(command_type)
+        .bind(payload_json)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(res.rows_affected() > 0)
+    }
+
+    pub async fn get_command(&self, id: &str) -> Result<Option<CommandRecord>, StoreError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, command_type, payload_json, status, response_json, created_at, updated_at
+            FROM commands
+            WHERE id = ?1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| {
+            Ok(CommandRecord {
+                id: r.try_get("id")?,
+                command_type: r.try_get("command_type")?,
+                payload_json: r.try_get("payload_json")?,
+                status: r.try_get("status")?,
+                response_json: r.try_get("response_json")?,
+                created_at: r.try_get("created_at")?,
+                updated_at: r.try_get("updated_at")?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn complete_command(
+        &self,
+        id: &str,
+        status: &str,
+        response_json: Option<&str>,
+    ) -> Result<(), StoreError> {
+        retry_on_transient_lock(|| self.complete_command_once(id, status, response_json)).await
+    }
+
+    async fn complete_command_once(
+        &self,
+        id: &str,
+        status: &str,
+        response_json: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let res = sqlx::query(
+            r#"
+            UPDATE commands
+            SET status = ?1,
+                response_json = ?2,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?3
+            "#,
+        )
+        .bind(status)
+        .bind(response_json)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        if res.rows_affected() == 0 {
+            return Err(StoreError::CommandNotFound { id: id.to_owned() });
+        }
+        Ok(())
+    }
+
+    pub async fn insert_pending_effect(
+        &self,
+        effect: &NewPendingEffectRecord,
+    ) -> Result<PendingEffectRecord, StoreError> {
+        retry_on_transient_lock(|| self.insert_pending_effect_once(effect)).await
+    }
+
+    async fn insert_pending_effect_once(
+        &self,
+        effect: &NewPendingEffectRecord,
+    ) -> Result<PendingEffectRecord, StoreError> {
+        sqlx::query(
+            r#"
+            INSERT INTO pending_effects (id, effect_type, idempotency_key, payload_json, state)
+            VALUES (?1, ?2, ?3, ?4, 'pending')
+            "#,
+        )
+        .bind(&effect.id)
+        .bind(&effect.effect_type)
+        .bind(&effect.idempotency_key)
+        .bind(&effect.payload_json)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_pending_effect(&effect.id).await?.ok_or_else(|| {
+            StoreError::PendingEffectNotFound {
+                id: effect.id.clone(),
+            }
+        })
+    }
+
+    pub async fn get_pending_effect(
+        &self,
+        id: &str,
+    ) -> Result<Option<PendingEffectRecord>, StoreError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, effect_type, idempotency_key, payload_json, state, attempts, last_error, created_at, updated_at
+            FROM pending_effects
+            WHERE id = ?1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(row_to_pending_effect_record).transpose()
+    }
+
+    pub async fn get_pending_effect_by_idempotency_key(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<PendingEffectRecord>, StoreError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, effect_type, idempotency_key, payload_json, state, attempts, last_error, created_at, updated_at
+            FROM pending_effects
+            WHERE idempotency_key = ?1
+            "#,
+        )
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(row_to_pending_effect_record).transpose()
+    }
+
+    pub async fn list_pending_effects(
+        &self,
+        state: Option<&str>,
+    ) -> Result<Vec<PendingEffectRecord>, StoreError> {
+        let rows = if let Some(st) = state {
+            sqlx::query(
+                r#"
+                SELECT id, effect_type, idempotency_key, payload_json, state, attempts, last_error, created_at, updated_at
+                FROM pending_effects
+                WHERE state = ?1
+                ORDER BY created_at ASC
+                "#,
+            )
+            .bind(st)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT id, effect_type, idempotency_key, payload_json, state, attempts, last_error, created_at, updated_at
+                FROM pending_effects
+                ORDER BY created_at ASC
+                "#,
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.into_iter().map(row_to_pending_effect_record).collect()
+    }
+
+    pub async fn update_effect_state(
+        &self,
+        id: &str,
+        state: &str,
+        last_error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        retry_on_transient_lock(|| self.update_effect_state_once(id, state, last_error)).await
+    }
+
+    async fn update_effect_state_once(
+        &self,
+        id: &str,
+        state: &str,
+        last_error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let res = sqlx::query(
+            r#"
+            UPDATE pending_effects
+            SET state = ?1,
+                attempts = attempts + 1,
+                last_error = ?2,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?3
+            "#,
+        )
+        .bind(state)
+        .bind(last_error)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        if res.rows_affected() == 0 {
+            return Err(StoreError::PendingEffectNotFound { id: id.to_owned() });
+        }
+        Ok(())
+    }
+
+    pub async fn record_effect_result(
+        &self,
+        id: &str,
+        effect_id: &str,
+        outcome: &str,
+        result_json: &str,
+    ) -> Result<EffectResultRecord, StoreError> {
+        retry_on_transient_lock(|| {
+            self.record_effect_result_once(id, effect_id, outcome, result_json)
+        })
+        .await
+    }
+
+    async fn record_effect_result_once(
+        &self,
+        id: &str,
+        effect_id: &str,
+        outcome: &str,
+        result_json: &str,
+    ) -> Result<EffectResultRecord, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO effect_results (id, effect_id, outcome, result_json)
+            VALUES (?1, ?2, ?3, ?4)
+            "#,
+        )
+        .bind(id)
+        .bind(effect_id)
+        .bind(outcome)
+        .bind(result_json)
+        .execute(&mut *transaction)
+        .await?;
+
+        sqlx::query(
+            r#"
+            UPDATE pending_effects
+            SET state = CASE WHEN ?1 = 'success' THEN 'completed' ELSE 'failed' END,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?2
+            "#,
+        )
+        .bind(outcome)
+        .bind(effect_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        let row = sqlx::query(
+            r#"
+            SELECT id, effect_id, outcome, result_json, created_at
+            FROM effect_results
+            WHERE id = ?1
+            "#,
+        )
+        .bind(id)
+        .fetch_one(&mut *transaction)
+        .await?;
+
+        let record = EffectResultRecord {
+            id: row.try_get("id")?,
+            effect_id: row.try_get("effect_id")?,
+            outcome: row.try_get("outcome")?,
+            result_json: row.try_get("result_json")?,
+            created_at: row.try_get("created_at")?,
+        };
+
+        transaction.commit().await?;
+        Ok(record)
+    }
+
+    pub async fn get_events_after(
+        &self,
+        after_sequence: i64,
+        limit: i64,
+    ) -> Result<Vec<EventRecord>, StoreError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, task_id, execution_id, event_kind, event_json, created_at
+            FROM events
+            WHERE id > ?1
+            ORDER BY id ASC
+            LIMIT ?2
+            "#,
+        )
+        .bind(after_sequence)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(EventRecord {
+                    sequence: row.try_get("id")?,
+                    task_id: row.try_get("task_id")?,
+                    execution_id: row.try_get("execution_id")?,
+                    event_kind: row.try_get("event_kind")?,
+                    event_json: row.try_get("event_json")?,
+                    created_at: row.try_get("created_at")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn latest_event_sequence(&self) -> Result<i64, StoreError> {
+        let max_id = sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(id) FROM events")
+            .fetch_one(&self.pool)
+            .await?;
+
+        Ok(max_id.unwrap_or(0))
+    }
+
+    pub async fn acquire_or_renew_daemon_lease(
+        &self,
+        lease_id: &str,
+        holder_pid: i64,
+        holder_host: &str,
+        ttl: Duration,
+    ) -> Result<DaemonLeaseRecord, StoreError> {
+        retry_on_transient_lock(|| {
+            self.acquire_or_renew_daemon_lease_once(lease_id, holder_pid, holder_host, ttl)
+        })
+        .await
+    }
+
+    async fn acquire_or_renew_daemon_lease_once(
+        &self,
+        lease_id: &str,
+        holder_pid: i64,
+        holder_host: &str,
+        ttl: Duration,
+    ) -> Result<DaemonLeaseRecord, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        let existing = sqlx::query(
+            r#"
+            SELECT lease_id, holder_pid, holder_host, acquired_at, heartbeat_at, fencing_token,
+                   CAST((strftime('%s', 'now') - strftime('%s', heartbeat_at)) AS INTEGER) as elapsed_secs
+            FROM daemon_leases
+            WHERE lease_id = ?1
+            "#,
+        )
+        .bind(lease_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+
+        if let Some(row) = existing {
+            let current_pid: i64 = row.try_get("holder_pid")?;
+            let current_host: String = row.try_get("holder_host")?;
+            let elapsed_secs: Option<i64> = row.try_get("elapsed_secs")?;
+
+            if current_pid == holder_pid && current_host == holder_host {
+                // Heartbeat renewal
+                sqlx::query(
+                    r#"
+                    UPDATE daemon_leases
+                    SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE lease_id = ?1
+                    "#,
+                )
+                .bind(lease_id)
+                .execute(&mut *transaction)
+                .await?;
+            } else {
+                let ttl_secs = ttl.as_secs() as i64;
+                let is_stale = elapsed_secs.is_none_or(|s| s >= ttl_secs);
+
+                if is_stale {
+                    sqlx::query(
+                        r#"
+                        UPDATE daemon_leases
+                        SET holder_pid = ?1,
+                            holder_host = ?2,
+                            acquired_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                            heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                            fencing_token = fencing_token + 1
+                        WHERE lease_id = ?3
+                        "#,
+                    )
+                    .bind(holder_pid)
+                    .bind(holder_host)
+                    .bind(lease_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                } else {
+                    return Err(StoreError::DaemonLeaseHeld {
+                        lease_id: lease_id.to_string(),
+                        holder_pid: current_pid,
+                        holder_host: current_host,
+                    });
+                }
+            }
+        } else {
+            sqlx::query(
+                r#"
+                INSERT INTO daemon_leases (lease_id, holder_pid, holder_host, fencing_token)
+                VALUES (?1, ?2, ?3, 1)
+                "#,
+            )
+            .bind(lease_id)
+            .bind(holder_pid)
+            .bind(holder_host)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
+        let updated = sqlx::query(
+            r#"
+            SELECT lease_id, holder_pid, holder_host, acquired_at, heartbeat_at, fencing_token
+            FROM daemon_leases
+            WHERE lease_id = ?1
+            "#,
+        )
+        .bind(lease_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+
+        let record = DaemonLeaseRecord {
+            lease_id: updated.try_get("lease_id")?,
+            holder_pid: updated.try_get("holder_pid")?,
+            holder_host: updated.try_get("holder_host")?,
+            acquired_at: updated.try_get("acquired_at")?,
+            heartbeat_at: updated.try_get("heartbeat_at")?,
+            fencing_token: updated.try_get("fencing_token")?,
+        };
+
+        transaction.commit().await?;
+        Ok(record)
+    }
+
+    pub async fn release_daemon_lease(
+        &self,
+        lease_id: &str,
+        holder_pid: i64,
+    ) -> Result<(), StoreError> {
+        retry_on_transient_lock(|| self.release_daemon_lease_once(lease_id, holder_pid)).await
+    }
+
+    async fn release_daemon_lease_once(
+        &self,
+        lease_id: &str,
+        holder_pid: i64,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"
+            DELETE FROM daemon_leases
+            WHERE lease_id = ?1
+              AND holder_pid = ?2
+            "#,
+        )
+        .bind(lease_id)
+        .bind(holder_pid)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     #[cfg(test)]
     async fn task_event_count(&self, id: &str) -> Result<i64, StoreError> {
         let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events WHERE task_id = ?1")
@@ -731,6 +1419,91 @@ impl SqliteStore {
             .await?;
         Ok(count)
     }
+}
+
+/// Runs a write operation, retrying transient SQLite lock contention with
+/// bounded exponential backoff before surfacing a typed error.
+///
+/// Each attempt re-runs the whole operation (transactions are never resumed
+/// mid-flight), so a retry always starts from a clean transaction boundary.
+async fn retry_on_transient_lock<T, F, Fut>(mut operation: F) -> Result<T, StoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, StoreError>>,
+{
+    let mut attempt = 1usize;
+    loop {
+        match operation().await {
+            Err(error) if is_transient_lock_error(&error) => {
+                if attempt >= WRITE_RETRY_ATTEMPTS {
+                    return Err(match error {
+                        StoreError::Sqlx(source) => StoreError::DatabaseBusy {
+                            attempts: attempt as u32,
+                            source,
+                        },
+                        other => other,
+                    });
+                }
+                let backoff = WRITE_RETRY_BASE_BACKOFF
+                    .saturating_mul(2u32.pow(attempt as u32 - 1))
+                    .min(WRITE_RETRY_MAX_BACKOFF);
+                tokio::time::sleep(backoff).await;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+fn is_transient_lock_error(error: &StoreError) -> bool {
+    let StoreError::Sqlx(sqlx::Error::Database(database_error)) = error else {
+        return false;
+    };
+    database_error
+        .code()
+        .and_then(|code| code.parse::<i32>().ok())
+        .is_some_and(|code| {
+            matches!(
+                code & 0xff,
+                SQLITE_BUSY_PRIMARY_CODE | SQLITE_LOCKED_PRIMARY_CODE
+            )
+        })
+}
+
+fn map_migration_error(error: sqlx::migrate::MigrateError) -> StoreError {
+    match error {
+        // The database was written by a different Relay build; fail closed.
+        sqlx::migrate::MigrateError::VersionMissing(version)
+        | sqlx::migrate::MigrateError::VersionMismatch(version)
+        | sqlx::migrate::MigrateError::VersionNotPresent(version) => {
+            StoreError::SchemaVersionMismatch { version }
+        }
+        sqlx::migrate::MigrateError::Dirty(version) => StoreError::SchemaMigrationDirty { version },
+        other => StoreError::Migration(other),
+    }
+}
+
+/// Runs migrations, tolerating a benign cross-process race.
+///
+/// Two Relay processes (TUI + serve-mcp) may open a database that has never
+/// been migrated at the same moment. sqlx serializes each migration in its own
+/// transaction but not the applied-version bookkeeping across processes, so
+/// the loser of the race sees a UNIQUE constraint on `_sqlx_migrations.version`.
+/// The winner has then finished migrating; one bounded retry observes the
+/// completed migration history and succeeds. Any other failure fails closed.
+async fn run_migrations(pool: &SqlitePool) -> Result<(), StoreError> {
+    if let Err(error) = MIGRATOR.run(pool).await {
+        let display = error.to_string();
+        if !display.contains("_sqlx_migrations") || !display.contains("UNIQUE constraint") {
+            return Err(map_migration_error(error));
+        }
+
+        // relay-store deliberately avoids a tracing dependency; the retry is
+        // observable only as normal latency.
+        MIGRATOR.run(pool).await.map_err(map_migration_error)?;
+    }
+
+    Ok(())
 }
 
 async fn insert_event(
@@ -870,6 +1643,22 @@ fn row_to_execution_record(row: sqlx::sqlite::SqliteRow) -> Result<ExecutionReco
     })
 }
 
+fn row_to_pending_effect_record(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<PendingEffectRecord, StoreError> {
+    Ok(PendingEffectRecord {
+        id: row.try_get("id")?,
+        effect_type: row.try_get("effect_type")?,
+        idempotency_key: row.try_get("idempotency_key")?,
+        payload_json: row.try_get("payload_json")?,
+        state: row.try_get("state")?,
+        attempts: row.try_get("attempts")?,
+        last_error: row.try_get("last_error")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("failed to create Relay database directory '{path}': {source}")]
@@ -887,12 +1676,34 @@ pub enum StoreError {
     TaskNotFound { id: String },
     #[error("execution {id} was not found")]
     ExecutionNotFound { id: String },
+    #[error("command {id} was not found")]
+    CommandNotFound { id: String },
+    #[error("pending effect {id} was not found")]
+    PendingEffectNotFound { id: String },
+    #[error("daemon lease '{lease_id}' is held by pid {holder_pid} on {holder_host}")]
+    DaemonLeaseHeld {
+        lease_id: String,
+        holder_pid: i64,
+        holder_host: String,
+    },
     #[error("task {id} state conflict: expected '{expected_state}', found '{actual_state}'")]
     StateConflict {
         id: String,
         expected_state: String,
         actual_state: String,
     },
+    #[error(
+        "database stayed locked after {attempts} attempts (WAL busy timeout exceeded): {source}"
+    )]
+    DatabaseBusy { attempts: u32, source: sqlx::Error },
+    #[error(
+        "database schema was written by a different Relay build (unexpected migration version {version}); refusing to open"
+    )]
+    SchemaVersionMismatch { version: i64 },
+    #[error(
+        "database schema is partially migrated (dirty migration version {version}); refusing to open"
+    )]
+    SchemaMigrationDirty { version: i64 },
 }
 
 #[cfg(test)]
@@ -914,6 +1725,29 @@ mod tests {
         .unwrap();
 
         assert_eq!(tasks, 1);
+    }
+
+    #[tokio::test]
+    async fn file_database_connections_set_concurrency_pragmas() {
+        let database_path = temp_path("relay-pragmas.sqlite3");
+        let store = SqliteStore::open(&database_path).await.unwrap();
+
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(busy_timeout, 5000);
+        assert_eq!(foreign_keys, 1);
     }
 
     #[tokio::test]
@@ -1363,6 +2197,164 @@ mod tests {
         assert_eq!(execution.task_id, "task-reopen-exec");
         assert_eq!(execution.phase, "finished");
         assert_eq!(execution.exit_outcome.as_deref(), Some("success"));
+    }
+
+    #[tokio::test]
+    async fn commands_idempotency_and_completion() {
+        let store = SqliteStore::in_memory().await.unwrap();
+
+        let inserted = store
+            .record_command("cmd-1", "submit_handoff", r#"{"title":"test"}"#)
+            .await
+            .unwrap();
+        assert!(inserted, "first record_command should return true");
+
+        let duplicate = store
+            .record_command("cmd-1", "submit_handoff", r#"{"title":"test"}"#)
+            .await
+            .unwrap();
+        assert!(
+            !duplicate,
+            "duplicate record_command should return false (idempotent)"
+        );
+
+        let cmd = store.get_command("cmd-1").await.unwrap().unwrap();
+        assert_eq!(cmd.status, "received");
+
+        store
+            .complete_command("cmd-1", "applied", Some(r#"{"result":"ok"}"#))
+            .await
+            .unwrap();
+
+        let completed = store.get_command("cmd-1").await.unwrap().unwrap();
+        assert_eq!(completed.status, "applied");
+        assert_eq!(
+            completed.response_json.as_deref(),
+            Some(r#"{"result":"ok"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_effects_lifecycle_and_idempotency_collision() {
+        let store = SqliteStore::in_memory().await.unwrap();
+
+        let effect = NewPendingEffectRecord {
+            id: "eff-1".to_owned(),
+            effect_type: "process_spawn".to_owned(),
+            idempotency_key: "key-123".to_owned(),
+            payload_json: r#"{"cmd":"cargo"}"#.to_owned(),
+        };
+
+        let created = store.insert_pending_effect(&effect).await.unwrap();
+        assert_eq!(created.state, "pending");
+        assert_eq!(created.attempts, 0);
+
+        // Duplicate idempotency key must fail closed
+        let duplicate = NewPendingEffectRecord {
+            id: "eff-2".to_owned(),
+            effect_type: "process_spawn".to_owned(),
+            idempotency_key: "key-123".to_owned(),
+            payload_json: r#"{"cmd":"cargo"}"#.to_owned(),
+        };
+        assert!(store.insert_pending_effect(&duplicate).await.is_err());
+
+        store
+            .update_effect_state("eff-1", "in_flight", None)
+            .await
+            .unwrap();
+        let in_flight = store.get_pending_effect("eff-1").await.unwrap().unwrap();
+        assert_eq!(in_flight.state, "in_flight");
+        assert_eq!(in_flight.attempts, 1);
+
+        let result = store
+            .record_effect_result("res-1", "eff-1", "success", r#"{"pid":42}"#)
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, "success");
+
+        let completed = store.get_pending_effect("eff-1").await.unwrap().unwrap();
+        assert_eq!(completed.state, "completed");
+    }
+
+    #[tokio::test]
+    async fn monotonic_events_retrieval_and_latest_sequence() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store
+            .insert_task(&task_record("task-1", "Test Task"))
+            .await
+            .unwrap();
+
+        store
+            .append_event(Some("task-1"), None, "step_1", Some(r#"{"n":1}"#))
+            .await
+            .unwrap();
+        store
+            .append_event(Some("task-1"), None, "step_2", Some(r#"{"n":2}"#))
+            .await
+            .unwrap();
+        store
+            .append_event(Some("task-1"), None, "step_3", Some(r#"{"n":3}"#))
+            .await
+            .unwrap();
+
+        let latest = store.latest_event_sequence().await.unwrap();
+        assert_eq!(latest, 4);
+
+        let events = store.get_events_after(1, 10).await.unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].sequence, 2);
+        assert_eq!(events[0].event_kind, "step_1");
+        assert_eq!(events[1].sequence, 3);
+        assert_eq!(events[1].event_kind, "step_2");
+        assert_eq!(events[2].sequence, 4);
+        assert_eq!(events[2].event_kind, "step_3");
+    }
+
+    #[tokio::test]
+    async fn daemon_lease_acquisition_renewal_rejection_and_stale_recovery() {
+        let store = SqliteStore::in_memory().await.unwrap();
+
+        let lease = store
+            .acquire_or_renew_daemon_lease("daemon-main", 1001, "host-a", Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(lease.holder_pid, 1001);
+        assert_eq!(lease.fencing_token, 1);
+
+        // Same holder can renew
+        let renewed = store
+            .acquire_or_renew_daemon_lease("daemon-main", 1001, "host-a", Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(renewed.fencing_token, 1);
+
+        // Other holder is rejected while active
+        let conflict = store
+            .acquire_or_renew_daemon_lease("daemon-main", 1002, "host-b", Duration::from_secs(60))
+            .await;
+        assert!(matches!(conflict, Err(StoreError::DaemonLeaseHeld { .. })));
+
+        // Other holder succeeds when lease is stale (ttl = 0)
+        let recovered = store
+            .acquire_or_renew_daemon_lease("daemon-main", 1002, "host-b", Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(recovered.holder_pid, 1002);
+        assert_eq!(recovered.fencing_token, 2);
+
+        // Release lease
+        store
+            .release_daemon_lease("daemon-main", 1002)
+            .await
+            .unwrap();
+
+        // Now first holder can acquire fresh lease
+        let fresh = store
+            .acquire_or_renew_daemon_lease("daemon-main", 1001, "host-a", Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(fresh.holder_pid, 1001);
+        assert_eq!(fresh.fencing_token, 1);
     }
 
     fn task_record(id: &str, title: &str) -> NewTaskRecord {

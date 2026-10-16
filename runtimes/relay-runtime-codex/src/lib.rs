@@ -67,6 +67,7 @@ pub enum CodexRuntimeHealth {
     Checking,
     Available {
         version: String,
+        account: Option<String>,
     },
     NotInstalled {
         error: String,
@@ -172,7 +173,8 @@ impl CodexRuntime {
         .await
         {
             Ok(output) if output.status.success() && required_exec_flags_present(&output) => {
-                CodexRuntimeHealth::Available { version }
+                let account = self.discover_account_identity().await;
+                CodexRuntimeHealth::Available { version, account }
             }
             Ok(output) if output.status.success() => CodexRuntimeHealth::Incompatible {
                 version,
@@ -335,12 +337,12 @@ impl RuntimeIntegration for CodexRuntime {
         Box::pin(async move {
             let health = self.discover().await;
             match health {
-                CodexRuntimeHealth::Available { version } => RuntimeProbe {
+                CodexRuntimeHealth::Available { version, account } => RuntimeProbe {
                     installed: true,
                     version: Some(version),
                     authenticated: true,
                     compatible: true,
-                    account_identity: self.discover_account_identity().await,
+                    account_identity: account,
                     notes: vec!["Codex available and authenticated".to_owned()],
                 },
                 CodexRuntimeHealth::NotAuthenticated { version, error } => RuntimeProbe {
@@ -405,7 +407,7 @@ impl RuntimeIntegration for CodexRuntime {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RuntimeModelCatalog> + Send + '_>> {
         let runtime = self.clone();
         Box::pin(async move {
-            if env::var("RELAY_CODEX_TRANSPORT").as_deref() == Ok("app-server") {
+            if env::var("RELAY_CODEX_TRANSPORT").as_deref() != Ok("exec") {
                 if let Ok(executable) = runtime.resolve_executable() {
                     if let Ok(catalog) = discover_app_server_models(&executable).await {
                         return catalog;
@@ -418,6 +420,7 @@ impl RuntimeIntegration for CodexRuntime {
                     id: "default".to_owned(),
                     display_name: "Default (Account/CLI Setting)".to_owned(),
                     supported_reasoning_efforts: vec![],
+                    default_reasoning_effort: None,
                 }],
             }
         })
@@ -533,8 +536,7 @@ impl Runtime for CodexRuntime {
             streaming_output: true,
             cancellation: true,
             deterministic_outcome: true,
-            permission_support: if env::var("RELAY_CODEX_TRANSPORT").as_deref() == Ok("app-server")
-            {
+            permission_support: if env::var("RELAY_CODEX_TRANSPORT").as_deref() != Ok("exec") {
                 relay_runtime::RuntimePermissionSupport::LiveApproval
             } else {
                 relay_runtime::RuntimePermissionSupport::PreapprovedOnly
@@ -549,7 +551,7 @@ impl Runtime for CodexRuntime {
     ) -> RuntimeStartFuture {
         let runtime = self.clone();
         Box::pin(async move {
-            if env::var("RELAY_CODEX_TRANSPORT").as_deref() == Ok("app-server") {
+            if env::var("RELAY_CODEX_TRANSPORT").as_deref() != Ok("exec") {
                 return start_app_server(runtime, request, cancellation).await;
             }
             if cancellation.is_cancelled() {
@@ -660,8 +662,16 @@ async fn start_app_server(
         .stdout
         .take()
         .ok_or_else(|| RuntimeError::StartFailed("app-server stdout unavailable".to_owned()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| RuntimeError::StartFailed("app-server stderr unavailable".to_owned()))?;
     let (tx, rx) = mpsc::channel(64);
     let (control_tx, mut control_rx) = mpsc::channel(16);
+    let tx_stderr = tx.clone();
+    tokio::spawn(async move {
+        let _ = read_stderr(stderr, tx_stderr).await;
+    });
     let cwd = request.trusted_working_dir.clone();
     let prompt = build_prompt(&request);
     tokio::spawn(async move {
@@ -726,7 +736,7 @@ async fn start_app_server(
             "workspaceWrite"
         };
         if let Some(modes) = requirements
-            .pointer("/result/allowedSandboxModes")
+            .pointer("/result/requirements/allowedSandboxModes")
             .and_then(Value::as_array)
             && !modes
                 .iter()
@@ -734,6 +744,18 @@ async fn start_app_server(
                 .any(|mode| mode.eq_ignore_ascii_case(sandbox_name))
         {
             let _ = tx.send(RuntimeEvent::InvalidOutput { reason: format!("Relay profile is incompatible with managed sandbox requirements ({sandbox_name})") }).await;
+            terminate_process_tree(&mut child).await;
+            return;
+        }
+        if let Some(policies) = requirements
+            .pointer("/result/requirements/allowedApprovalPolicies")
+            .and_then(Value::as_array)
+            && !policies
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|p| p.eq_ignore_ascii_case("never") || p.eq_ignore_ascii_case("always"))
+        {
+            let _ = tx.send(RuntimeEvent::InvalidOutput { reason: "Relay requires 'never' or 'always' approval policy support in Codex managed requirements".to_owned() }).await;
             terminate_process_tree(&mut child).await;
             return;
         }
@@ -783,20 +805,63 @@ async fn start_app_server(
         } else {
             serde_json::json!({"type":"workspaceWrite", "writableRoots":[cwd], "networkAccess":false})
         };
-        if write_rpc(&mut stdin, next_id, "turn/start", serde_json::json!({"threadId":thread_id, "input":prompt, "cwd":cwd, "model":request.runtime_selection.model.as_option(), "effort":request.runtime_selection.reasoning_effort.as_option().map(|e| format!("{e:?}")), "sandboxPolicy":sandbox_policy})).await.is_err() { return; }
+        let effort_str = request
+            .runtime_selection
+            .reasoning_effort
+            .as_option()
+            .map(|e| match e {
+                relay_runtime::ReasoningEffort::Default => "default",
+                relay_runtime::ReasoningEffort::Low => "low",
+                relay_runtime::ReasoningEffort::Medium => "medium",
+                relay_runtime::ReasoningEffort::High => "high",
+                relay_runtime::ReasoningEffort::XHigh => "xhigh",
+            });
+        if write_rpc(&mut stdin, next_id, "turn/start", serde_json::json!({"threadId":thread_id, "input": [{"type": "text", "text": prompt}], "cwd":cwd, "model":request.runtime_selection.model.as_option(), "effort":effort_str, "sandboxPolicy":sandbox_policy})).await.is_err() { return; }
+
+        let mut turn_id = None;
+        loop {
+            let line =
+                match tokio::time::timeout(std::time::Duration::from_secs(15), reader.next_line())
+                    .await
+                {
+                    Ok(Ok(Some(line))) => line,
+                    _ => break,
+                };
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if value.get("id").and_then(Value::as_u64) == Some(next_id) {
+                turn_id = value
+                    .pointer("/result/turn/id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                break;
+            } else if let Some(activity) = normalize_app_server_activity(&value) {
+                let _ = tx.send(RuntimeEvent::Activity(activity)).await;
+            }
+        }
         loop {
             tokio::select! {
-                _ = cancellation.cancelled() => { let _ = write_rpc(&mut stdin, next_id, "turn/interrupt", serde_json::json!({"threadId":thread_id})).await; break; }
+                _ = cancellation.cancelled() => { let _ = write_rpc(&mut stdin, next_id, "turn/interrupt", serde_json::json!({"threadId":thread_id, "turnId":turn_id})).await; break; }
                 Some(control) = control_rx.recv() => {
-                    if let relay_runtime::RuntimeControl::PermissionDecision { request_id, decision } = control {
+                    if let relay_runtime::RuntimeControl::PermissionDecision { request_id, grant } = control {
                         if let Ok(id) = request_id.parse::<u64>() {
-                            let decision = match decision {
+                            let decision_str = match grant.decision {
                                 relay_runtime::RuntimePermissionDecision::AllowOnce => "accept",
                                 relay_runtime::RuntimePermissionDecision::AllowForRun => "acceptForSession",
                                 relay_runtime::RuntimePermissionDecision::Deny => "decline",
                                 relay_runtime::RuntimePermissionDecision::Cancel => "cancel",
                             };
-                            if let Ok(line) = app_server::encode_response(id, serde_json::json!({"decision": decision})) {
+                            let scope_str = match grant.scope {
+                                relay_runtime::RuntimePermissionScope::Once => "once",
+                                relay_runtime::RuntimePermissionScope::Turn => "turn",
+                                relay_runtime::RuntimePermissionScope::Session => "session",
+                            };
+                            if let Ok(line) = app_server::encode_response(id, serde_json::json!({
+                                "decision": decision_str,
+                                "scope": scope_str,
+                                "grantedPaths": grant.granted_paths
+                            })) {
                                 let _ = stdin.write_all(&line).await;
                             }
                         }
@@ -805,7 +870,7 @@ async fn start_app_server(
                 line = reader.next_line() => {
                     let Ok(Some(line)) = line else { break; };
                     let Ok(value) = serde_json::from_str::<Value>(&line) else { let _ = tx.send(RuntimeEvent::InvalidOutput { reason: "invalid app-server JSONL".to_owned() }).await; break; };
-                    if let Some(activity) = normalize_codex_activity(&value) {
+                    if let Some(activity) = normalize_app_server_activity(&value) {
                         let _ = tx.send(RuntimeEvent::Activity(activity)).await;
                     }
                     let kind = value.get("method").or_else(|| value.get("type")).and_then(Value::as_str).unwrap_or("");
@@ -813,29 +878,90 @@ async fn start_app_server(
                         let request_id = value.get("id").and_then(Value::as_u64).map(|id| id.to_string()).unwrap_or_else(|| "unknown".to_owned());
                         let permission_kind = if kind.contains("commandExecution") { relay_runtime::RuntimePermissionKind::CommandExecution } else if kind.contains("fileChange") { relay_runtime::RuntimePermissionKind::FileChange } else { relay_runtime::RuntimePermissionKind::Permissions };
                         let params = value.get("params");
+
+                        let item_id = params.and_then(|p| p.get("itemId")).and_then(Value::as_str).map(str::to_owned);
+                        let thread_id_val = params.and_then(|p| p.get("threadId")).and_then(Value::as_str).map(str::to_owned);
+                        let turn_id_val = params.and_then(|p| p.get("turnId")).and_then(Value::as_str).map(str::to_owned);
+                        let reason = params.and_then(|p| p.get("reason")).and_then(Value::as_str).map(str::to_owned);
+
                         let command = params.and_then(|p| p.get("command")).and_then(Value::as_str).map(str::to_owned);
-                        let requested = relay_runtime::RuntimeRequestedPermissions {
-                            workspace_write: permission_kind == relay_runtime::RuntimePermissionKind::FileChange,
-                            network: params.and_then(|p| p.get("networkApprovalContext")).is_some(),
-                            paths: params.and_then(|p| p.get("fileChange")).and_then(|p| p.get("paths")).and_then(Value::as_array).map(|paths| paths.iter().filter_map(Value::as_str).map(PathBuf::from).collect()).unwrap_or_default(),
+                        let req_cwd = params.and_then(|p| p.get("cwd")).and_then(Value::as_str).map(PathBuf::from).or_else(|| Some(cwd.clone()));
+                        let command_actions = params.and_then(|p| p.get("commandActions")).and_then(Value::as_array).map(|arr| arr.iter().filter_map(Value::as_str).map(str::to_owned).collect());
+                        let network_approval_context = params.and_then(|p| p.get("networkApprovalContext")).and_then(Value::as_str).map(str::to_owned);
+
+                        let grant_root = params.and_then(|p| p.get("grantRoot")).and_then(Value::as_str).map(PathBuf::from);
+                        let environment_id = params.and_then(|p| p.get("environmentId")).and_then(Value::as_str).map(str::to_owned);
+
+                        let paths = if permission_kind == relay_runtime::RuntimePermissionKind::FileChange {
+                            params.and_then(|p| p.get("fileChange")).and_then(|p| p.get("paths")).and_then(Value::as_array).map(|paths| paths.iter().filter_map(Value::as_str).map(PathBuf::from).collect()).unwrap_or_default()
+                        } else {
+                            vec![]
                         };
+
+                        let filesystem_perm = params.and_then(|p| p.get("filesystem")).and_then(Value::as_bool).unwrap_or(permission_kind == relay_runtime::RuntimePermissionKind::FileChange);
+                        let network_perm = params.and_then(|p| p.get("network")).and_then(Value::as_bool).unwrap_or(network_approval_context.is_some());
+
+                        let requested = relay_runtime::RuntimeRequestedPermissions {
+                            workspace_write: filesystem_perm,
+                            network: network_perm,
+                            paths,
+                        };
+
+                        let available_decisions = params.and_then(|p| p.get("availableDecisions")).and_then(Value::as_array).map(|arr| {
+                            arr.iter().filter_map(Value::as_str).filter_map(|s| {
+                                match s {
+                                    "accept" => Some(relay_runtime::RuntimePermissionDecisionKind::AllowOnce),
+                                    "acceptForSession" => Some(relay_runtime::RuntimePermissionDecisionKind::AllowForRun),
+                                    "decline" => Some(relay_runtime::RuntimePermissionDecisionKind::Deny),
+                                    "cancel" => Some(relay_runtime::RuntimePermissionDecisionKind::Cancel),
+                                    _ => None,
+                                }
+                            }).collect()
+                        }).unwrap_or_else(|| vec![
+                            relay_runtime::RuntimePermissionDecisionKind::AllowOnce,
+                            relay_runtime::RuntimePermissionDecisionKind::AllowForRun,
+                            relay_runtime::RuntimePermissionDecisionKind::Deny,
+                            relay_runtime::RuntimePermissionDecisionKind::Cancel,
+                        ]);
+
                         let _ = tx.send(RuntimeEvent::PermissionRequested(relay_runtime::RuntimePermissionRequest {
                             request_id,
                             kind: permission_kind,
-                            reason: params.and_then(|p| p.get("reason")).and_then(Value::as_str).map(str::to_owned),
+                            reason,
                             command,
-                            cwd: Some(cwd.clone()),
+                            cwd: req_cwd,
                             requested,
-                            available_decisions: vec![
-                                relay_runtime::RuntimePermissionDecisionKind::AllowOnce,
-                                relay_runtime::RuntimePermissionDecisionKind::AllowForRun,
-                                relay_runtime::RuntimePermissionDecisionKind::Deny,
-                                relay_runtime::RuntimePermissionDecisionKind::Cancel,
-                            ],
+                            available_decisions,
+                            item_id,
+                            thread_id: thread_id_val,
+                            turn_id: turn_id_val,
+                            environment_id,
+                            grant_root,
+                            command_actions,
+                            network_approval_context,
                         })).await;
                     } else if kind == "turn/completed" || kind == "result" {
-                        let summary = value.get("params").and_then(|p| p.get("summary")).and_then(Value::as_str).unwrap_or("Codex app-server turn completed");
-                        let _ = tx.send(RuntimeEvent::Outcome(RuntimeOutcome::new(RuntimeOutcomeKind::Success, summary))).await; break;
+                        let summary = value.pointer("/params/turn/summary").or_else(|| value.pointer("/params/summary")).and_then(Value::as_str).unwrap_or("Codex app-server turn completed");
+                        let status = value.pointer("/params/turn/status").and_then(Value::as_str).unwrap_or("completed");
+
+                        let outcome_kind = match status {
+                            "interrupted" => RuntimeOutcomeKind::Cancelled,
+                            "failed" => RuntimeOutcomeKind::RuntimeFailure,
+                            _ => RuntimeOutcomeKind::Success,
+                        };
+
+                        let error_msg = value.pointer("/params/turn/error")
+                            .or_else(|| value.pointer("/params/codexErrorInfo"))
+                            .map(|v| v.to_string())
+                            .unwrap_or_default();
+
+                        let final_summary = if !error_msg.is_empty() {
+                            format!("{summary}\nError details: {error_msg}")
+                        } else {
+                            summary.to_owned()
+                        };
+
+                        let _ = tx.send(RuntimeEvent::Outcome(RuntimeOutcome::new(outcome_kind, final_summary))).await; break;
                     } else if let Some(text) = value.get("text").and_then(Value::as_str).or_else(|| value.get("delta").and_then(Value::as_str)) {
                         let _ = tx.send(RuntimeEvent::Output { stream: RuntimeOutputStream::Stdout, bytes: format!("{text}\n").into_bytes() }).await;
                     }
@@ -959,58 +1085,104 @@ async fn discover_app_server_models(executable: &Path) -> Result<RuntimeModelCat
         .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}\n")
         .await
         .map_err(|e| e.to_string())?;
-    write_rpc(&mut stdin, 2, "model/list", serde_json::json!({})).await?;
-    let response = read_rpc_response(&mut reader, 2).await?;
-    let models = response
-        .pointer("/result/models")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "model/list returned no models".to_owned())?;
+    let mut next_id = 2;
     let mut available_models = Vec::new();
     let mut default_model = "default".to_owned();
-    for model in models {
-        if model
-            .get("hidden")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let Some(id) = model.get("id").and_then(Value::as_str) else {
-            continue;
+    let mut cursor: Option<String> = None;
+
+    loop {
+        let params = if let Some(c) = &cursor {
+            serde_json::json!({"cursor": c})
+        } else {
+            serde_json::json!({})
         };
-        let display_name = model
-            .get("displayName")
-            .and_then(Value::as_str)
-            .unwrap_or(id);
-        if model
-            .get("isDefault")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            default_model = id.to_owned();
-        }
-        let supported_reasoning_efforts = model
-            .get("supportedReasoningEfforts")
+
+        write_rpc(&mut stdin, next_id, "model/list", params).await?;
+        let response = read_rpc_response(&mut reader, next_id).await?;
+        next_id += 1;
+
+        let models = response
+            .pointer("/result/data")
             .and_then(Value::as_array)
-            .map(|efforts| {
-                efforts
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .filter_map(|effort| match effort {
-                        "low" => Some(ReasoningEffort::Low),
-                        "medium" => Some(ReasoningEffort::Medium),
-                        "high" => Some(ReasoningEffort::High),
-                        "xhigh" => Some(ReasoningEffort::XHigh),
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        available_models.push(RuntimeModelInfo {
-            id: id.to_owned(),
-            display_name: display_name.to_owned(),
-            supported_reasoning_efforts,
-        });
+            .ok_or_else(|| "Codex model catalog incompatible".to_owned())?;
+
+        for model in models {
+            if model
+                .get("hidden")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Some(id) = model.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let display_name = model
+                .get("displayName")
+                .and_then(Value::as_str)
+                .unwrap_or(id);
+            if model
+                .get("isDefault")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                default_model = id.to_owned();
+            }
+            let supported_reasoning_efforts = model
+                .get("supportedReasoningEfforts")
+                .and_then(Value::as_array)
+                .map(|efforts| {
+                    efforts
+                        .iter()
+                        .filter_map(|effort| {
+                            let text = if let Some(obj) = effort.as_object() {
+                                obj.get("reasoningEffort").and_then(Value::as_str)
+                            } else {
+                                effort.as_str()
+                            };
+                            match text {
+                                Some("low") => Some(ReasoningEffort::Low),
+                                Some("medium") => Some(ReasoningEffort::Medium),
+                                Some("high") => Some(ReasoningEffort::High),
+                                Some("xhigh") => Some(ReasoningEffort::XHigh),
+                                _ => None,
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let default_reasoning_effort = model.get("defaultReasoningEffort").and_then(|v| {
+                let text = if let Some(obj) = v.as_object() {
+                    obj.get("reasoningEffort").and_then(Value::as_str)
+                } else {
+                    v.as_str()
+                };
+                match text {
+                    Some("low") => Some(ReasoningEffort::Low),
+                    Some("medium") => Some(ReasoningEffort::Medium),
+                    Some("high") => Some(ReasoningEffort::High),
+                    Some("xhigh") => Some(ReasoningEffort::XHigh),
+                    _ => None,
+                }
+            });
+
+            available_models.push(RuntimeModelInfo {
+                id: id.to_owned(),
+                display_name: display_name.to_owned(),
+                supported_reasoning_efforts,
+                default_reasoning_effort,
+            });
+        }
+
+        if let Some(next_cursor) = response
+            .pointer("/result/nextCursor")
+            .and_then(Value::as_str)
+        {
+            cursor = Some(next_cursor.to_owned());
+        } else {
+            break;
+        }
     }
     let _ = child.kill().await;
     if available_models.is_empty() {
@@ -1029,8 +1201,12 @@ async fn terminate_process_tree(child: &mut tokio::process::Child) {
         let mut taskkill = Command::new("taskkill");
         taskkill
             .args(["/T", "/F", "/PID", pid.as_str()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
         let _ = taskkill.status().await;
+        let _ = child.kill().await;
     }
     #[cfg(not(windows))]
     {
@@ -1179,6 +1355,77 @@ fn render_codex_json_event(event: &Value) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(format!("{text}\n").into_bytes())
+}
+
+fn normalize_app_server_activity(event: &Value) -> Option<RuntimeActivity> {
+    let kind = event
+        .get("type")
+        .or_else(|| event.get("method"))
+        .and_then(Value::as_str)?;
+    let item = event.get("item").or_else(|| event.pointer("/params/item"));
+    match kind {
+        "thread.started" | "thread/started" => Some(RuntimeActivity::SessionStarted),
+        "turn.started" | "turn/started" => Some(RuntimeActivity::Analyzing {
+            description: "Codex is analyzing the task".to_owned(),
+        }),
+        "item.started" | "item/started" => {
+            let item = item?;
+            match item.get("type")?.as_str()? {
+                "commandExecution" => Some(RuntimeActivity::CommandStarted {
+                    logical_command: item
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or("command")
+                        .to_owned(),
+                    raw_command: None,
+                    working_directory: item.get("cwd").and_then(Value::as_str).map(PathBuf::from),
+                }),
+                "agentMessage" => Some(RuntimeActivity::AgentMessage {
+                    message: RuntimeText {
+                        content: bounded_event_text(
+                            item.get("text").and_then(Value::as_str).unwrap_or_default(),
+                        ),
+                        format: RuntimeTextFormat::Markdown,
+                    },
+                }),
+                _ => None,
+            }
+        }
+        "item.completed" | "item/completed" => {
+            let item = item?;
+            match item.get("type")?.as_str()? {
+                "commandExecution" => Some(RuntimeActivity::CommandCompleted {
+                    logical_command: item
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or("command")
+                        .to_owned(),
+                    success: item.get("exitCode").and_then(Value::as_i64) == Some(0),
+                    exit_code: item
+                        .get("exitCode")
+                        .and_then(Value::as_i64)
+                        .and_then(|code| i32::try_from(code).ok()),
+                    working_directory: item.get("cwd").and_then(Value::as_str).map(PathBuf::from),
+                }),
+                "fileChange" => {
+                    let change = item.get("changes").and_then(Value::as_array)?.first()?;
+                    let path = PathBuf::from(change.get("path").and_then(Value::as_str)?);
+                    let change_kind = match change
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("modified")
+                    {
+                        "add" | "added" => FileChangeKind::Added,
+                        "delete" | "deleted" => FileChangeKind::Deleted,
+                        _ => FileChangeKind::Modified,
+                    };
+                    Some(RuntimeActivity::FileChanged { path, change_kind })
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 fn normalize_codex_activity(event: &Value) -> Option<RuntimeActivity> {

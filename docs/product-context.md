@@ -76,6 +76,8 @@ escalate only when intent must change
 
 A secondary product aim is **usage efficiency**: avoid spending limited coding-agent capacity on planning work that can happen before the handoff.
 
+As an architectural aim, Relay acts as the deterministic orchestration control plane for coding-runtime providers: it owns approved intent, execution grants, workflows, roles, policy, scheduling, and recovery; it supervises execution within approved scope; and it relays outcomes or structured escalations back to the human. Relay itself contains no LLM reasoning requirement and does not decide intent ([ADR-0020](adr/0020-relay-architecture-v2.md), which supersedes [ADR-0017](adr/0017-relay-identity-deterministic-handoff-engine.md) and the incompatible unimplemented portions of [ADR-0018](adr/0018-provider-distribution-model.md)). Distribution beyond one chosen provider remains design intent, not shipped capability — see [docs/v2_architecture_rebaseline/ROADMAP.md](v2_architecture_rebaseline/ROADMAP.md) for current status.
+
 ## Primary User
 
 Initially:

@@ -23,19 +23,16 @@ ChatGPT Personal Skills may need to be installed separately on different ChatGPT
 
 ## Submission behavior
 
-Preferred long-term path:
+Layering follows [ADR-0016](../../../../../docs/adr/0016-mcp-first-submission-and-v0-1-local-descope.md):
 
-```text
-ChatGPT -> Relay Direct/MCP -> Relay
-```
+1. **Relay Direct/MCP** — submit through `relay serve-mcp` when an MCP-capable
+   host surface is available (implemented in M9). ChatGPT surfaces without
+   MCP client capability cannot use this layer; do not imply otherwise.
+2. **Provider-native remote compatibility transport** — a user-owned GitHub
+   mailbox Issue, only when the surface has authorized issue-write capability.
+3. **Local artifact/paste fallback** — generate local/pasteable Relay JSON.
 
-The v0.1 compatibility path may use a connected write-capable GitHub integration:
-
-```text
-ChatGPT -> GitHub handoff Issue -> Relay GitHub ingress
-```
-
-If neither automatic path is available, the adapter must generate local/pasteable Relay JSON instead of claiming success. A successful direct handoff does not require a GitHub Issue; Relay may create an optional binding afterward.
+A successful direct handoff does not require a GitHub Issue; Relay may create an optional binding afterward. No layer implies host-action coupling: submission lands the task in `Ready`, and execution still requires explicit Run approval in the Relay TUI. The adapter must never claim success unless the chosen transport confirmed receipt (MCP structured result with a TaskId, or explicit local import by the user).
 
 ## Local ingress
 

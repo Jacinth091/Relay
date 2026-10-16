@@ -177,6 +177,10 @@ impl TrustedProject {
     pub fn github(&self) -> Option<&GitHubRepositoryMetadata> {
         self.github.as_ref()
     }
+
+    pub fn to_trusted_registration(&self) -> crate::project_identity::TrustedProjectRegistration {
+        crate::project_identity::TrustedProjectRegistration::from(self)
+    }
 }
 
 /// Request to register a trusted local project.
@@ -279,6 +283,13 @@ impl ProjectRegistry {
         self.projects
             .get(&key)
             .ok_or(ProjectRegistryError::UnknownProjectKey { key })
+    }
+
+    pub fn get_registration(
+        &self,
+        key: impl AsRef<str>,
+    ) -> Result<crate::project_identity::TrustedProjectRegistration, ProjectRegistryError> {
+        self.get(key).map(|p| p.to_trusted_registration())
     }
 
     pub fn list(&self) -> impl ExactSizeIterator<Item = &TrustedProject> {

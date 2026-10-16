@@ -1,5 +1,10 @@
 # Relay
 
+> [!WARNING]
+> **Experimental hobby and development project.** Relay is a personal, AI-assisted experiment shared for learning, testing, and contributions, not a supported or production-ready orchestration service. Interfaces, file formats, and behavior may change without notice. There is no warranty, security certification, or support commitment. It launches tools that can modify local code: inspect configuration and test with a disposable Git repository before using it on important work. [MIT License](LICENSE) (permits commercial use too).
+>
+> **Current source versus plans:** the default-branch Rust TUI, SQLite state, and fake runtime are development foundations. This README and other design documents also describe planned capabilities; do not assume Codex, Direct/MCP, hosted access, or distribution installers are working on `main`. See [Developing Relay](docs/DEVELOPMENT.md) and the [public-release checklist](docs/PUBLIC_RELEASE_CHECKLIST.md).
+
 > **Planning is a conversation. Execution is a handoff.**
 
 Relay is a local, developer-controlled handoff engine that moves **user-approved implementation intent** from a planning surface into a coding agent.

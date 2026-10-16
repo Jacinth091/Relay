@@ -11,7 +11,7 @@ This directory preserves historical, milestone-specific, and superseded developm
   - `M8_1_PACK/`: Milestone 8.1 Codex runtime & interactive backplane package.
   - `M9_PACK/`: Milestone 9 Relay Direct / MCP stdio server package.
   - `M10_PACK/`: Milestone 10 (Multi-runtime distribution) package — frozen and placed on-hold per ADR-0020.
-- **[`legacy_v1/`](legacy_v1/)**: Historical documents describing Relay v1 architectures, stale milestone roadmaps, or features descoped prior to the v2 architecture rebaseline (e.g., initial GitHub mailbox integration descoped by ADR-0016).
+- **[`legacy_v1/`](legacy_v1/)**: Historical documents describing Relay v1 architectures, stale milestone roadmaps, or features descoped prior to the v2 architecture rebaseline (e.g., the original v1 architecture note, the superseded v1 milestone roadmap, and the initial GitHub mailbox integration descoped by ADR-0016). Paths inside these documents may reference their original locations.
 
 ---
 

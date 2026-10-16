@@ -1,0 +1,27 @@
+name: Idea or feature request
+description: Propose a small, practical improvement to this experimental project.
+title: "idea: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: "Ideas are welcome, but this is a personal hobby/development project with no roadmap, review, or implementation commitment. For large architectural proposals, please read docs/adr/0020-relay-architecture-v2.md and docs/v2_architecture_rebaseline/ROADMAP.md first."
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe your actual workflow and the obstacle you hit.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help?
+      description: Describe a simple approach and why existing functionality is not sufficient.
+    validations:
+      required: true
+  - type: textarea
+    id: implications
+    attributes:
+      label: Compatibility or safety considerations (optional)
+      description: Note any effect on approved intent, runtime/provider boundaries, security, or persistence.

@@ -3,7 +3,11 @@ use std::ffi::OsString;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "relay", version, about = "Relay deterministic handoff engine")]
+#[command(
+    name = "relay",
+    version,
+    about = "Local-first, policy-governed orchestration control plane for user-approved software work"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<CliCommand>,

@@ -22,23 +22,45 @@ Normative sources: `docs/adr/0020-relay-architecture-v2.md`, `docs/v2_architectu
 
 ---
 
-## 2. Current Status Snapshot (2026-08)
+## 2. Current Status Snapshot
 
-Milestone ladder actually tracked by development: M2 registry → M3 repo safety → M4 task semantics → M5 SQLite → M6 scheduler/recovery → M7 run approval UX → M8 Codex runtime → M8.1 multi-runtime orchestration/UX.
+Relay Architecture v2 (ADR-0020) is accepted and is delivered as 16
+dependency-ordered vertical slices (phases 00–15).
+
+**Authoritative phase status is the table in `docs/v2_architecture_rebaseline/ROADMAP.md`**
+(status date 2026-09-18). Read it for current truth; do not rely on this summary.
+As of that date the roadmap records phases 00–15 as `DONE` on the strength of
+unit and integration test evidence. Those are **self-reported** results from the
+roadmap, not independent end-to-end validation: most v2 proof runs against
+deterministic/fake infrastructure (`FakeBackplane`, fake runtime, in-process
+clients), and live provider, Herdr, or multi-process paths are not exercised by
+CI. Do not present a module or test as proof that a path is production-ready.
 
 | Item | State |
 |---|---|
-| M2–M7 | Done, merged to main |
-| **M8 / M8.1** | **Done on `feat/m8-codex-runtime`, pending merge** (branch is ahead of main by ~40 commits) |
-| **M9 (Relay Direct/MCP)** | **Done on `feat/m9-relay-direct-mcp`, pending merge** — clap CLI entry point, `relay serve-mcp` MCP stdio server (`submit_handoff`), store concurrency hardening, conformance tests + host docs |
-| Working end-to-end path today | Local paste/file import → TUI review → explicit Run approval → Codex (`app-server` transport default) → events/diff/logs/history; plus MCP submission via `relay serve-mcp` on the M9 branch |
-| Ingress reality | Local file/paste plus `relay serve-mcp` (M9 branch). GitHub ingress descoped from v0.1 by ADR-0016 |
-| Provider distribution | Route-to-chosen-provider and slot-bounded concurrent executions exist; fan-out to multiple providers, health-aware routing, cross-provider aggregation are design intent only (ADR-0018) |
+| Historical v1 lineage (M0–M9) | Frozen as historical evidence; ADR-0017 superseded by ADR-0020 |
+| v2 phase table (00–15) | Recorded `DONE` per the dated roadmap (unit/integration evidence); see `ROADMAP.md` |
+| Working end-to-end path today | Local paste/file import (and `relay serve-mcp` `submit_handoff`) → TUI review → explicit Run approval → `ExecutionScheduler` → runtime → events/diff/logs/history |
+| A real Web UI | **Does not exist.** Phase 12's evidence was an in-process `DaemonClient` abstraction and integration tests, not a web application |
+| Daemon | `relay daemon` runs the durable daemon process (store lease ownership + fencing token, heartbeat renewal). It does not yet serve clients over a transport: the TUI and MCP server open the store directly |
+| Herdr backplane | Reference/fake-protocol vertical slice; not a durable production transport |
+| Jev / semantic decisions | Optional advisory adapter behind a provider-neutral seam; not required for correctness |
+| Ingress reality | Local file/paste plus `relay serve-mcp` (local stdio). GitHub ingress descoped from v0.1 by ADR-0016 |
+| Provider distribution | Route-to-chosen-provider and slot-bounded concurrent executions exist; fan-out, health-aware routing, and cross-provider aggregation are design intent only (unimplemented portion of ADR-0018, superseded by ADR-0020) |
 | Planner adapters | Documentation/skill documents in `integrations/planners/`; no executable code, no conformance harness yet |
+| Release status | Source-buildable only. No published installers, binaries, or packages |
 
-Key decisions recorded: ADR-0015 (local state canonical, bindings optional), ADR-0016 (MCP-first submission layering; v0.1 local-ingress-only descope), ADR-0017 (identity), ADR-0018 (deterministic provider-distribution model). Point-in-time status: `docs/archive/legacy_v1/status-2026-08.md`.
+Key decisions recorded: ADR-0015 (local state canonical, bindings optional),
+ADR-0016 (MCP-first submission layering; v0.1 local-ingress-only descope),
+ADR-0020 (v2 identity and ownership; supersedes ADR-0017 and incompatible
+ADR-0018 portions). Archived v1 status: `docs/archive/legacy_v1/status-2026-08.md`.
 
-Implementation packs (archived): `docs/archive/historical_milestones/M8_1_PACK/...`, `docs/archive/historical_milestones/M9_PACK/...`.
+Implementation packs (archived): `docs/archive/historical_milestones/M8_1_PACK/...`,
+`docs/archive/historical_milestones/M9_PACK/...`, `.../M10_PACK/...`.
+
+> Do not "correct" a status table by editing it to match the code, and do not
+> mark a phase `DONE` on the strength of a module or test alone. If code and a
+> status document disagree, report the drift to the maintainer.
 
 ---
 
@@ -103,10 +125,11 @@ crates/
 runtimes/
   relay-runtime-codex/       Codex adapter (app-server stdio JSONL default; exec fallback)
   relay-runtime-antigravity/ Antigravity adapter
-  relay-runtime-fake/        Scriptable runtime for tests
+  relay-runtime-fake/        Scriptable runtime + fake backplane for tests
+  relay-decision-jev/        Optional advisory semantic decision adapter
 integrations/planners/  Planner specification + host adapters (documents/skills, no code)
 schemas/                Wire format schemas
-docs/                   Architecture docs, ADRs, implementation packs
+docs/                   Architecture docs, ADRs, v2 rebaseline pack, archive
 contexts/               Project-level context documents
 ```
 
@@ -114,12 +137,14 @@ contexts/               Project-level context documents
 
 | Module | Responsibility |
 |---|---|
-| `task_ingress.rs` | Local task intake: preview/validate paste & file imports (size caps, duplicate-key rejection, project resolution, fail-closed). Entry point for ALL transports — MCP will reuse this path |
-| `execution.rs` | `ExecutionScheduler`: queueing, global/project concurrency slots, permission broker (scoped grants), bounded repair loop, verification, escalation events, cancellation. Also `ExecutionRunPolicy`, limits, reports |
-| `execution_planning.rs` | `plan_execution` / `build_execution_plan`: turns user *intent* (profile/model/effort preferences) into a validated, clamped plan. Owns stack allowlist, cross-provider model-leakage rejection, clamps duration/repair bounds. Trusted workspace derives ONLY from registered projects |
+| `task_ingress.rs` | Local task intake: preview/validate paste & file imports (size caps, duplicate-key rejection, project resolution, fail-closed). Entry point for ALL transports |
+| `execution.rs` | v1 `ExecutionScheduler`: queueing, global/project concurrency slots, permission broker (scoped grants), bounded repair loop, verification, escalation events, cancellation. M6 semantics are FROZEN — additive amendments only |
+| `execution_planning.rs` | `plan_execution` / `build_execution_plan`: turns user *intent* (profile/model/effort preferences) into a validated, clamped plan. Trusted workspace derives ONLY from registered projects |
 | `project_registry.rs` | Trusted local project registry: filesystem paths, expected Git remotes, default stacks. Remote/task input may reference projects by key only — never paths |
 | `repository_safety.rs` | Pre-run repository inspection/eligibility checks via git |
 | `durable_state.rs` | Stored-task state machine over relay-store; corrupt rows are quarantined, not fatal to listing |
+| `daemon.rs` | v2 Phase 01 daemon ownership: client protocol types, typed commands, monotonic events, durable effects, and a lease + fencing token. `relay daemon` acquires the store lease and renews a heartbeat; it does **not** yet serve clients over a transport — the TUI and MCP open the store directly |
+| v2 domain modules (`workflow`, `policy`, `candidate`, `lease`, `artifact`, `exchange`, `delegation`, `privileged`, `scheduler_v2`, …) | v2 orchestration domain. Mostly `PARTIAL` and not yet on the production Run path — check `ROADMAP.md` before relying on any of it |
 
 ### apps/relay-tui — presentation (must not own policy)
 
@@ -225,7 +250,7 @@ Deep detail: `docs/security-model.md`.
 |---|---|
 | Anything touching task acceptance/validation | `crates/relay-core/src/task_ingress.rs`, `docs/task-protocol.md`, `docs/local-ingress.md` |
 | Scheduler/lifecycle/repair changes | `crates/relay-core/src/execution.rs`; M6 semantics are FROZEN — additive amendments only |
-| New user-facing UI copy/screens | `apps/relay-tui/src/ui/`, `docs/tui-ux.md`, ADR-0017 language rules |
+| New user-facing UI copy/screens | `apps/relay-tui/src/ui/`, `docs/tui-ux.md`, ADR-0020 language and ownership rules |
 | Runtime/provider work | `crates/relay-runtime/src/lib.rs` (trait + permission/catalog types), relevant runtime crate, `docs/runtime-stack-model.md` |
 | Submission transports / MCP | `docs/adr/0016-*.md`, `docs/archive/historical_milestones/M9_PACK/...`, `docs/planner-hosts/` (host registration recipes), `docs/submission-and-bindings.md` |
 | Multi-provider distribution / fan-out ideas | `docs/adr/0018-*.md` — fan-out is PLANNED, not built; do not present as shipped |
@@ -264,7 +289,16 @@ Add focused integration tests for process boundaries, repository safety, recover
 
 ## 12. Next Up (so agents don't guess)
 
-1. **Relay Architecture v2 Rebaseline** — follow the 16-phase sequential implementation plan in `docs/v2_architecture_rebaseline/02-IMPLEMENTATION-SEQUENCE.md` and track via `docs/v2_architecture_rebaseline/ROADMAP.md`.
-2. **Phase 00 (DONE)**: ADR-0020 accepted, historical freeze recorded, rebaseline specifications tracked in-tree.
-3. **Phase 01 (Next)**: Canonical Daemon Ownership + Durable Effects / Events (`PendingEffect`, `EffectResult`, monotonic `EventRecord` sequencing).
-4. **Subsequent Phases**: Domain contracts (Phase 03), Repository/Candidate/Leases (Phase 04), Deterministic Tracer Bullet (Phase 05), Backplane Seam (Phase 06), Herdr Backplane (Phase 07), Provider Adapters (Phase 08).
+1. **Relay Architecture v2 Rebaseline** — follow the 16-phase sequential implementation plan in `docs/v2_architecture_rebaseline/02-IMPLEMENTATION-SEQUENCE.md`. Per-phase status is tracked authoritatively in `docs/v2_architecture_rebaseline/ROADMAP.md` — read that table for current truth, do not rely on this section for phase status, and do not mark a phase `DONE` here or there until its production exit gate is proven.
+2. The roadmap's `DONE` entries rest on unit and integration test evidence; most v2 proof runs use deterministic/fake infrastructure (`FakeBackplane`, fake runtime, in-process clients). The production **Run** path still executes the v1 `ExecutionScheduler`, and the cutover to the v2 orchestrator is **not implemented at this revision**. Do not describe the v2 orchestration domain as wired into the production path until that cutover lands and is proven end to end.
+3. If committed work on a branch contradicts `ROADMAP.md`, **report the drift to the maintainer**; do not rewrite the status tables yourself.
+
+## 13. Working on this repository as a public project
+
+Relay is prepared for public, experimental hobby/development use. Anyone (including an agent) preparing or reviewing public-facing changes should read:
+
+- `CONTRIBUTING.md` and `docs/DEVELOPMENT.md` — contribution policy and contributor onboarding.
+- `docs/PUBLIC_RELEASE_CHECKLIST.md` — the owner-controlled publication gate.
+- `SECURITY.md` — private vulnerability reporting (do not disclose in public issues).
+
+Do not change repository visibility, default branch, branch protection, releases, or history as part of an ordinary change; those are owner decisions with their own approval path. Never commit secrets, private logs, `.env` files, local SQLite state, or `.relay/` privileged state.

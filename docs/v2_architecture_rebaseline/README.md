@@ -1,10 +1,17 @@
 # Relay v2 Architecture Rebaseline Handoff Pack
 
-**Status:** proposed forward architecture and implementation baseline  
+**Status:** accepted forward architecture, partially implemented (see [ADR-0020](../adr/0020-relay-architecture-v2.md))  
 **Date:** 2026-09-17  
 **Product:** Relay  
 **Architecture generation:** v2  
-**Implementation status:** not yet implemented  
+**Implementation status:** per-phase status tracked in [ROADMAP.md](ROADMAP.md); no phase is complete until its production exit gate is proven  
+
+> **Reading note:** this pack is the 2026-09-17 proposal. The documents below
+> describe the intended v2 architecture, not a claim about current behavior.
+> Check [ROADMAP.md](ROADMAP.md) (status-dated) for what has actually been
+> implemented and wired into the production path. Individual handoff documents
+> may carry a "not implemented" status line from the date they were written;
+> that is historical and is intentionally left as-is.
 
 ## Why v2
 
@@ -48,13 +55,15 @@ Provider CLI
 
 ## Governance action before implementation
 
-Create a new architecture ADR, recommended as `ADR-0019`, that:
+This action has been completed: [ADR-0020: Relay Architecture v2](../adr/0020-relay-architecture-v2.md) is **Accepted** (2026-09-17) and:
 
 - declares Relay Architecture v2;
 - marks ADR-0017 and the incompatible portions of ADR-0018 as superseded while preserving their history;
 - freezes the original v0.1/M0-M9 lineage as historical implementation evidence;
 - marks the old unimplemented provider-distribution M10 direction superseded/on hold;
 - defines the v2 compatibility obligations for `HandoffTask v1`, `relay serve-mcp`, explicit Run, no automatic push, trusted local path resolution, and provider-neutral core semantics.
+
+Note: `ADR-0019` was already assigned to an unrelated, still-`Proposed` ADR (`docs/adr/0019-multi-runtime-orchestration.md`, renumbered from 0009) before this pack was written. ADR-0020 is the correct and current authority for this architecture generation; do not create a duplicate ADR-0019 for it.
 
 ## Implementation principle
 

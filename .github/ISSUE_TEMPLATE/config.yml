@@ -1,0 +1,10 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security reporting guidance
+    url: https://github.com/Jacinth091/Relay/security/policy
+    about: Do not disclose vulnerabilities, credentials, or private data in public issues.
+  # Update this branch-qualified link to the public default branch once the
+  # v2 source is promoted to `main` (see docs/PUBLIC_RELEASE_CHECKLIST.md).
+  - name: How to build and test Relay
+    url: https://github.com/Jacinth091/Relay/blob/feat/v2-architecture-rebaseline/docs/DEVELOPMENT.md
+    about: Source build, quality checks, and source layout for contributors.

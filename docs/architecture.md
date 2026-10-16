@@ -1,464 +1,167 @@
 # Architecture
 
-## Architectural Statement
+> **Authority:** [ADR-0020: Relay Architecture v2](adr/0020-relay-architecture-v2.md).
+> This page is a concise guide to the current architecture. Where it and
+> ADR-0020 disagree, ADR-0020 wins. For the honest per-phase implementation
+> status, see [`docs/v2_architecture_rebaseline/ROADMAP.md`](v2_architecture_rebaseline/ROADMAP.md) —
+> module or test presence is not proof that a path is wired into production.
+>
+> The original v1 architecture note is preserved at
+> [`docs/archive/legacy_v1/architecture-v1.md`](archive/legacy_v1/architecture-v1.md).
 
-Relay is **one local handoff engine** with replaceable planner integrations, ingresses, runtimes, stacks, and presentation clients.
+## Identity
 
-The first presentation client is a terminal UI.
+Relay is a **local-first, policy-governed orchestration control plane for
+user-approved software work**.
 
-GitHub is an integration option, not a second Relay implementation and not the canonical task store.
+> *"The human owns intent. Relay owns controlled orchestration. Runtime
+> backplanes host execution. Providers perform assigned roles."*
 
----
+Relay coordinates multi-step, multi-role work under explicit human authority. It
+does **not** own intent: it never decides what should be built, never expands
+scope on its own, and never infers that a discussion is finished.
 
-## What Relay Is / Is Not
-
-"Orchestrator" is an overloaded word, so this is stated explicitly.
-
-There are two activities people call orchestration:
-
-**Intent orchestration** — deciding what should be done: planning, reasoning, strategy selection. Relay does **not** do this. It is reserved for the human and the planner surface (AGENTS.md invariants 3 and 7; "Relay should never infer that a conversation has gone on long enough and silently begin implementation").
-
-**Execution orchestration** — deterministic lifecycle management: validate, route, persist, spawn a runtime process, stream events, apply bounded repair, escalate with structured packets. This **is** Relay's job. It is a state machine, not a brain.
-
-Relay's identity in one sentence:
-
-> **Relay is the border checkpoint between conversation and execution — it stamps, routes, and logs; it never decides where anyone is going.**
-
-This also settles whether Relay is "an MCP server" or similar. Transport and presentation surfaces are doors around one core:
+## Canonical ownership
 
 ```text
-TUI        = presentation door
-MCP server = submission door
-GitHub     = ingress door (optional)
-paste/file = ingress door (universal fallback)
+Human              owns intent, approves objectives and constraints,
+                   grants execution, resolves scope-expanding decisions,
+                   and approves privileged actions
+
+Relay (Daemon)     canonical owner of durable tasks, approved intent, execution
+                   grants, workflow definitions, role instances, role attempts,
+                   candidates, leases, artifacts, exchange, policies, and recovery
+
+Runtime backplane  hosts process/session resources and reports observations.
+                   Does not own tasks, decide policy, or determine completion
+
+Provider adapter   translates provider-specific launch/readiness/result behavior
+                   (Codex, Claude, AGY, OpenCode)
+
+Provider CLI       performs one assigned role attempt
+                   (RoleAttempt)
+
+Semantic engine    optional advisory recommendations after deterministic
+(optional)         filtering; never an authority, never required for correctness
 ```
 
-None of these is what Relay *is*. If a protocol disappears, its door is replaced; the engine survives. A new surface passes the identity test only by answering three questions:
+`Provider != Role != RoleAttempt != Skill != Policy != RuntimeProfile`.
 
-| Question | Answer decides |
-|---|---|
-| Is it deterministic policy, lifecycle, persistence, validation? | belongs in Relay Core |
-| Is it moving data to/from an external host or provider? | belongs in an edge crate |
-| Does it decide intent or strategy? | does not belong in Relay at all |
+## Domain primitives
 
-Scope discipline follows from README's One Rule: features widen the *data* available to core (capabilities, metadata) rather than widening core's *authority*.
+The v2 domain separates concerns that v1 conflated (full detail in
+[ADR-0020 §3](adr/0020-relay-architecture-v2.md)):
 
----
+- `ProjectId` / `DeclaredProjectIdentity` — logical repository identity, distinct
+  from filesystem paths.
+- `TrustedProjectRegistration` / `CheckoutId` — trusted local root, remote
+  fingerprint, and allowed worktree boundaries.
+- `Task` — the user-visible objective and its durable state.
+- `ApprovedIntent` — immutable approved objective, acceptance criteria,
+  constraints, and non-goals. Scope changes create a new generation.
+- `ExecutionGrant` — the explicit authorization created by a human Run.
+- `WorkflowDefinition` / `WorkflowRun` — a validated graph of typed inputs,
+  roles, transitions, and bounds.
+- `RoleDefinition` / `RoleInstance` / `RoleAttempt` — responsibility, activation,
+  and one concrete provider attempt.
+- `Candidate` — a generation-bound repository state frozen with a full fingerprint.
+- `Lease` — a monotonically fenced ownership token preventing conflicting writes.
+- `Artifact` / `Exchange` — provenance-tracked, checksummed work products passed
+  across role boundaries.
 
-## Layer Model
+## Layer model
 
 ```text
-Planner Surface
+Planner surface  (conversation, editor, your own tool)
       |
-Planner Integration
-      |
-Relay Task Protocol
-      |
-Submission Transport / Ingress
-      |
-Relay Core
-  |   |   |   |
-  |   |   |   +-- Recovery / clarification
-  |   |   +------ Persistence
-  |   +---------- Project/Security Policy
-  +-------------- Runtime Registry
-      |
-Runtime Profile
-      |
-Runtime Implementation
-      |
-Coding Agent Process
-      |
-Target Repository
+      | explicit human approval of intent
+      v
+HandoffTask v1  -->  Submission transport  -->  Relay Daemon
+                     (serve-mcp stdio,        |
+                      local file/paste)       | validate -> resolve trusted
+                                              | project -> persist -> READY
+                                              v
+                                    explicit human Run approval
+                                              |
+                                              v
+                                    ExecutionGrant + workflow
+                                              |
+                                              v
+                                    RuntimeBackplane (provision/observe/
+                                    send/interrupt/dispose/reconcile)
+                                              |
+                                              v
+                                    Provider CLI role attempt
+                                              |
+                                              v
+                                    Target repository (local)
 ```
 
-Presentation clients observe and command the same Relay Core:
+The daemon is the single canonical writer of durable state, effects, and events.
+Presentation clients (TUI today; Web UI planned) and submission transports are
+clients of the daemon, not alternative engines.
+
+## Runtime backplane seam
+
+`RuntimeBackplane` is deliberately decoupled from provider and from Herdr
+topology:
+
+- `FakeBackplane` — deterministic test infrastructure.
+- `LocalProcessBackplane` — direct process spawning with argument arrays and a
+  trusted CWD; the minimal non-Herdr execution path.
+- `HerdrBackplane` — the reference interactive backplane. Herdr's internal
+  workspace/tab/pane topology is private to that adapter; Relay core has no
+  dependency on it.
+
+A backplane hosts processes. It does not own tasks, decide policy, or determine
+completion.
+
+## Preserved invariants
+
+These are non-negotiable without a superseding ADR:
+
+1. `HandoffTask v1` remains wire-compatible; it is adapted internally into
+   `ApprovedIntent` (generation 1) plus a compatibility workflow run.
+2. `relay serve-mcp` `submit_handoff` means *validate → resolve trusted project →
+   persist → `READY`*. It never auto-executes.
+3. No workflow executes without an explicit human Run creating an `ExecutionGrant`.
+4. Relay never pushes to a remote repository automatically.
+5. Tasks cannot inject filesystem paths; working directories derive solely from
+   trusted local project registrations. Repository `.relay/` declarations may
+   restrict, but never expand, what is permitted.
+6. Provider authentication, billing, and subscription controls stay with the
+   provider CLIs. Relay never bypasses them.
+7. Unknown protocols, malformed outputs, and security mismatches fail closed.
+
+## Where things live
 
 ```text
-                  Relay Core
-                /     |      \
-               /      |       \
-            TUI    Desktop    Server
+apps/relay-tui/            presentation + CLI entry + MCP service + daemon wiring
+crates/relay-core/         deterministic domain engine (no LLM reasoning)
+crates/relay-protocol/     HandoffTask v1 wire format
+crates/relay-runtime/      runtime trait, backplane seam, profiles, router
+crates/relay-store/        SQLite persistence
+runtimes/*                 provider adapters and the fake runtime
+integrations/planners/     planner specification and adapter documents
+schemas/                   wire format schemas
 ```
 
----
-
-## Planner Integration
-
-The provider-neutral Planner Specification defines handoff semantics. Provider adapters live outside core execution.
-
-They may:
-
-- recognize explicit user handoff approval;
-- convert approved intent into the Relay task protocol;
-- submit tasks through a supported submission transport;
-- attach source metadata;
-- attach stack-specific extensions;
-- submit Resolution Packets.
-
-They do not control local paths.
-
-They are clients of Relay.
-
----
-
-## Submission Transport, Ingress, and External Binding
-
-A **submission transport** describes how a planner delivers a HandoffTask toward Relay.
-
-A Relay-side **ingress** receives it.
-
-Examples:
-
-- Relay Direct/MCP;
-- provider-created GitHub Issue consumed by Relay's GitHub ingress;
-- local file import;
-- local paste.
-
-When a direct Relay interface is available, planner adapters should prefer it. A planner-host GitHub connector is a compatibility transport, not a universal dependency.
-
-After acceptance, Relay's local durable task state is canonical.
-
-An **external binding** is optional. For example, Relay may create or synchronize a GitHub Issue for collaboration/history even when the task arrived through MCP or local paste.
-
-```text
-submission provenance      external binding
----------------------      ----------------
-relay-mcp                  none
-github-direct              github-issue
-local-paste                github-issue
-local-file                 none
-```
-
-The local ingress accepts either canonical Relay JSON or Markdown containing an embedded canonical Relay JSON block. The TUI should support file selection and direct paste.
-
-Relay's first GitHub implementation should use `gh` so authentication remains owned by GitHub CLI. Relay can use that integration both to consume GitHub-ingress tasks and to manage optional GitHub bindings.
-
-For a bound GitHub Issue, Relay may publish:
-
-- status;
-- clarification/decision packets;
-- resolution acknowledgments;
-- final result.
-
-Submission transport and external binding do not decide implementation strategy.
-
-See `docs/submission-and-bindings.md`.
-
-## Core Responsibilities
-
-Relay Core owns:
-
-- canonical task state;
-- task transition validation;
-- project registry;
-- project lookup;
-- execution policy;
-- repository preflight orchestration;
-- runtime-profile selection;
-- capability checks;
-- execution lifecycle;
-- recovery/repair policy;
-- clarification/decision state;
-- durable execution metadata;
-- domain events.
-
-Relay Core must not depend on Ratatui.
-
----
-
-## Project Registry
-
-The local registry maps a logical project key to trusted configuration.
-
-Example:
-
-```toml
-[projects.practicore]
-name = "PractiCore"
-path = "D:\\Projects\\PractiCore"
-expected_remote = "..."
-default_stack = "chatgpt-codex"
-```
-
-A handoff task contains only:
-
-```json
-{ "project": "practicore" }
-```
-
-The project registry resolves it locally.
-
----
-
-## Runtime Registry
-
-A runtime implementation describes:
-
-- runtime identifier;
-- provider identifier;
-- supported runtime transports;
-- capabilities;
-- health/version detection;
-- task preparation;
-- process execution;
-- output/event parsing;
-- cancellation behavior;
-- recovery/clarification support.
-
-Example identity:
-
-```text
-provider          openai
-runtime           codex
-runtime transport cli
-```
-
----
-
-## Runtime Profile
-
-A runtime profile is local configuration for a runtime instance.
-
-Example concept:
-
-```toml
-[runtime_profiles.codex_default]
-provider = "openai"
-runtime = "codex"
-transport = "cli"
-```
-
-Runtime-native options belong under namespaced configuration.
-
----
-
-## Stack
-
-A Stack is an opinionated composition.
-
-It may choose:
-
-- planner integration;
-- default submission preference;
-- optional external binding policy;
-- runtime profile;
-- native task preparation;
-- native extension behavior;
-- recovery policy;
-- project instruction conventions.
-
-Initial stack:
-
-```text
-chatgpt-codex
-```
-
----
-
-## Execution and Recovery Flow
-
-```text
-1. A submission transport/ingress delivers an approved task to Relay.
-2. Protocol parser validates envelope/version.
-3. Core records task.
-4. User reviews task.
-5. Core resolves project key.
-6. Core runs repository/runtime preflight.
-7. User selects Run.
-8. Core starts execution.
-9. Runtime receives validated project context + task.
-10. Runtime implements and verifies.
-11. Ordinary implementation failures may enter bounded repair.
-12. If repair stays in scope, execution continues automatically.
-13. If execution crosses the intent boundary:
-      - NEEDS_CLARIFICATION, or
-      - NEEDS_DECISION.
-14. Relay creates a structured packet.
-15. Packet is persisted and optionally published through a direct planner channel or external binding when supported.
-16. User/planner provides a Resolution Packet.
-17. Relay validates the resolution.
-18. Execution resumes or restarts according to the packet/policy.
-19. On success, Core refreshes repository state and records DONE.
-```
-
----
-
-## State Machine
-
-Foundation state model:
-
-```text
-RECEIVED
-   |
-   v
-READY
-   |
-   | user Run
-   v
-RUNNING
-   |
-   +-------------------------+
-   |                         |
-   v                         v
-VERIFYING                 FAILED
-   |
-   +-----------+
-   |           |
-   v           v
-PASS        REPAIRING
-   |           |
-   |           +----> RUNNING / VERIFYING
-   |
-   v
-DONE
-```
-
-Intent-boundary states:
-
-```text
-RUNNING / REPAIRING / VERIFYING
-            |
-            +----> NEEDS_CLARIFICATION
-            |
-            `----> NEEDS_DECISION
-```
-
-Resolution:
-
-```text
-NEEDS_CLARIFICATION / NEEDS_DECISION
-            |
-            v
-RESOLVED
-            |
-      +-----+------+
-      |            |
-      v            v
-   RUNNING       FAILED/CANCELLED
-```
-
-Exact persisted state names may evolve, but the distinction between implementation recovery and planning escalation is architectural.
-
----
-
-## Recovery Policy
-
-Default stack behavior should distinguish:
-
-```text
-Implementation repair       AUTO
-Verification failure repair AUTO
-Requirement ambiguity       ESCALATE
-Architecture change         ESCALATE
-Scope expansion             ESCALATE
-Destructive change          ESCALATE
-Security-policy change      ESCALATE
-```
-
-Repair loops must be bounded by local policy such as attempt/time limits.
-
----
-
-## Clarification / Decision Packets
-
-Relay should model structured domain data, not parse arbitrary prose.
-
-See `docs/clarification-protocol.md`.
-
-Packets may be rendered as Markdown for:
-
-- optional GitHub binding comments;
-- clipboard;
-- terminal display;
-- future planner integrations.
-
-The structured object remains authoritative.
-
----
-
-## Domain Events
-
-Relay should expose typed events such as:
-
-```text
-TaskReceived
-TaskValidated
-TaskReady
-ExecutionPreflightStarted
-ExecutionPreflightFailed
-ExecutionStarted
-RuntimeOutput
-RuntimeWarning
-VerificationStarted
-RepairStarted
-RepairAttempted
-ClarificationRequested
-DecisionRequested
-ResolutionReceived
-ExecutionResumed
-RuntimeExited
-TaskCompleted
-TaskFailed
-ExecutionCancelled
-RepositoryStatusChanged
-```
-
-Presentation clients consume events without owning execution.
-
----
-
-## Concurrency
-
-v0.1 may allow only one running execution globally or one per project.
-
-Do not build a scheduler until real usage requires one.
-
-A project should eventually have an execution lock to prevent accidental simultaneous modification unless explicitly supported.
-
----
-
-## Extension Model
-
-Built-in runtimes/ingresses come first.
-
-Long-term community extensions should be out-of-process rather than native dynamic libraries.
-
-The exact external extension wire protocol is intentionally deferred until the first non-built-in extension is implemented.
-
----
-
-## Presentation Independence
-
-No core method should return Ratatui widgets, terminal coordinates, or keybindings.
-
-Core APIs expose domain data/events.
-
-The same operation should eventually be callable from:
-
-```text
-relay-tui
-relay-desktop
-relay-server
-tests
-```
-
----
-
-## Dependency Direction
-
-Preferred dependency direction:
-
-```text
-presentation -> core
-ingress implementation -> ingress traits/core types
-runtime implementation -> runtime traits/core types
-store implementation -> core/domain types
-
-core -X-> presentation
-core -X-> Codex
-core -X-> GitHub
-core -X-> ChatGPT
-```
-
-`-X->` means must not depend directly on.
+Dependency direction: presentation → core; runtime/ingress/store
+implementations → traits and core types. Core must not depend on Ratatui, a
+specific provider, or Herdr.
+
+## Relationship to v1
+
+v1 was a single-turn handoff engine: human-approved intent in, one coding
+runtime launched, results and structured escalations out. v2 keeps all of that
+as its compatibility baseline (M0–M9 is frozen historical evidence) and adds
+policy-governed multi-role workflows, candidates, leases, artifacts, and
+Exchange on top — while keeping intent authority with the human.
+
+See also:
+
+- [docs/design-principles.md](design-principles.md)
+- [docs/security-model.md](security-model.md)
+- [docs/task-protocol.md](task-protocol.md)
+- [docs/clarification-protocol.md](clarification-protocol.md)
+- [docs/runtime-stack-model.md](runtime-stack-model.md)

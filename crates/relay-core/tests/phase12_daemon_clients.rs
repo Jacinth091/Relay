@@ -66,6 +66,7 @@ async fn test_client_handshake_and_protocol_negotiation() {
         .handle_request(DaemonRequest::Handshake {
             client_name: "legacy-client".to_owned(),
             protocol_version: 9999, // Mismatched version
+            state_identity: server.state_identity().to_owned(),
         })
         .await;
 

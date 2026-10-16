@@ -556,6 +556,68 @@ async fn adding_project_rebinds_idle_scheduler_to_current_registry() {
     assert!(state.relay.resolve_project("relay").is_ok());
 }
 
+/// R16-03: a project registered *after* the daemon started must be usable for
+/// intake immediately, with no daemon restart.
+///
+/// Production shape: the daemon and the TUI both boot from the persisted
+/// trusted registry (empty at first run), and `Add Project` persists the first
+/// registration afterwards. The daemon re-resolves submissions against the
+/// persisted registry, so the handoff that follows is accepted.
+#[tokio::test]
+async fn project_registered_after_the_daemon_started_is_immediately_usable() {
+    let config_path = unique_temp_path("late-project-config").join("relay.toml");
+    let project_dir = unique_temp_path("late-project-repo");
+    fs::create_dir_all(&project_dir).unwrap();
+
+    // Boot state: trusted config exists (or not) but declares no project.
+    let boot_relay = Relay::load_from_config_path(&config_path).unwrap();
+    assert!(boot_relay.resolve_project("relay").is_err());
+
+    let store = SqliteStore::in_memory().await.unwrap();
+    // The daemon captures the boot registry - the stale clone that used to be
+    // the reason the next submission was rejected.
+    let daemon = embedded_daemon_for(&store, &boot_relay).await;
+
+    let mut state = AppState::new_with_store(
+        boot_relay,
+        config_path,
+        true,
+        unique_temp_path("late-project-state").join("relay.sqlite3"),
+        Some(store),
+        Vec::new(),
+        "ready".to_owned(),
+    );
+    state.attach_daemon(Some(daemon));
+
+    // Add Project: persists the registration to the trusted config the daemon reads.
+    state.add_project = AddProjectForm {
+        key: "relay".to_owned(),
+        path: project_dir.to_string_lossy().into_owned(),
+        expected_remote: String::new(),
+        default_stack: "fake".to_owned(),
+        github_owner: String::new(),
+        github_repo: String::new(),
+    };
+    state.submit_add_project().unwrap();
+
+    // The very next intake must succeed without restarting anything.
+    state.start_paste_task();
+    state.paste_text = task_json();
+    state.submit_paste_task();
+    state.confirm_task_import().await;
+    state.refresh_durable_tasks().await;
+
+    assert!(
+        !state.feedback.contains("Failed"),
+        "intake after Add Project must not fail: {}",
+        state.feedback
+    );
+    let stored = state
+        .selected_stored_task()
+        .expect("the handoff submitted after Add Project must be stored");
+    assert_eq!(stored.state, TaskState::Ready);
+}
+
 #[tokio::test]
 async fn finished_driver_reports_are_reaped_before_new_work_can_replace_it() {
     let mut state = app_state_with_project_with_store().await;

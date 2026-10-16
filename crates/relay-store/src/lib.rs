@@ -226,6 +226,22 @@ impl SqliteStore {
         &self.pool
     }
 
+    /// Returns this database's durable state identity: a random value generated
+    /// once, inside the database, when the schema was created (migration 0007).
+    ///
+    /// Two stores opened on the same database file return the same identity; two
+    /// different databases - including two [`SqliteStore::in_memory`] stores - never
+    /// do. The daemon transport compares it during its handshake so that a client
+    /// can only ever mutate the durable state it was opened against, instead of
+    /// trusting that some responding pipe must be serving the right database.
+    pub async fn store_identity(&self) -> Result<String, StoreError> {
+        let identity =
+            sqlx::query_scalar::<_, String>("SELECT identity FROM store_identity WHERE id = 1")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(identity)
+    }
+
     fn connect_options(filename: impl AsRef<Path>) -> SqliteConnectOptions {
         SqliteConnectOptions::new()
             .filename(filename)
@@ -1162,6 +1178,52 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Atomically claims an unfinished command for execution.
+    ///
+    /// Returns `true` only for the caller that won the claim, so concurrent replays
+    /// of the same command id resolve through a single applier and a single terminal
+    /// result instead of racing each other into inconsistent state.
+    pub async fn claim_command(&self, id: &str) -> Result<bool, StoreError> {
+        retry_on_transient_lock(|| self.claim_command_once(id)).await
+    }
+
+    async fn claim_command_once(&self, id: &str) -> Result<bool, StoreError> {
+        let res = sqlx::query(
+            r#"
+            UPDATE commands
+            SET claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?1
+              AND claimed_at IS NULL
+              AND status IN ('received', 'needs_reconciliation')
+            "#,
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Clears command claims left behind by a crashed process.
+    ///
+    /// Only safe during single-threaded startup reconciliation, before the request
+    /// listener accepts connections; a live applier holds its claim precisely so a
+    /// concurrent replay cannot steal it.
+    pub async fn reset_command_claims(&self) -> Result<u64, StoreError> {
+        let res = sqlx::query(
+            r#"
+            UPDATE commands
+            SET claimed_at = NULL
+            WHERE claimed_at IS NOT NULL
+              AND status IN ('received', 'needs_reconciliation')
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(res.rows_affected())
+    }
+
     pub async fn insert_pending_effect(
         &self,
         effect: &NewPendingEffectRecord,
@@ -1621,12 +1683,25 @@ impl SqliteStore {
         .await?;
         let max_token: i64 = latest_token_row.try_get("max_token")?;
 
-        // 2. Check if there is currently an active lease on this resource
+        // 2. Check if there is currently an active lease on this resource.
+        //
+        // `expires_at` holds Unix epoch seconds — the canonical representation written
+        // by relay-core's durable lease wrapper (`durable_state::acquire_durable_lease`)
+        // — so expiry is compared as integers. Evaluating this with
+        // `strftime('%s', expires_at)` previously returned NULL for epoch seconds, which
+        // made every lease look unexpired and permanently blocked reclamation.
+        //
+        // A row whose expiry is not numeric casts to 0 and therefore reads as expired
+        // and reclaimable. Such a row can only be produced out of band (no Relay writer
+        // emits it), and reclaiming it grants no authority: the new holder gets a
+        // strictly higher fencing token, and the domain layer
+        // (`candidate::Lease::assert_valid`) treats an unparseable expiry as invalid
+        // rather than as valid forever.
         let active_row = sqlx::query(
             r#"
             SELECT id, resource_type, resource_id, lease_kind, holder_id, holder_pid, holder_host,
                    fencing_token, acquired_at, expires_at, state,
-                   CAST((strftime('%s', 'now') - strftime('%s', expires_at)) AS INTEGER) as expired_diff
+                   CAST(strftime('%s', 'now') AS INTEGER) - CAST(expires_at AS INTEGER) as expired_diff
             FROM resource_leases
             WHERE resource_type = ?1 AND resource_id = ?2 AND state = 'active'
             ORDER BY fencing_token DESC
@@ -2832,8 +2907,12 @@ mod tests {
     async fn durable_resource_lease_fencing_and_lifecycle() {
         let store = SqliteStore::in_memory().await.unwrap();
 
-        let expires_future = "2099-01-01T00:00:00.000Z".to_string();
-        let expires_past = "2000-01-01T00:00:00.000Z".to_string();
+        // `expires_at` carries Unix epoch seconds — the canonical representation
+        // written by relay-core's durable lease wrapper. These fixtures previously
+        // used SQLite date text, which is why the epoch-seconds expiry defect passed
+        // unnoticed here (PR #16 review finding R16-01).
+        let expires_future = "4102444800".to_string(); // 2100-01-01T00:00:00Z
+        let expires_past = "946684800".to_string(); // 2000-01-01T00:00:00Z
 
         let lease_req1 = NewResourceLeaseRecord {
             id: "lease-1".to_string(),
@@ -2907,6 +2986,70 @@ mod tests {
 
         let prev_l2 = store.get_resource_lease("lease-2").await.unwrap().unwrap();
         assert_eq!(prev_l2.state, "expired");
+    }
+
+    #[tokio::test]
+    async fn durable_resource_lease_reclaims_expired_epoch_seconds_lease() {
+        // Regression for PR #16 review finding R16-01. The production writer
+        // (relay-core's durable lease wrapper) stores `expires_at` as Unix epoch
+        // seconds; this pins that representation at the store boundary. Evaluating
+        // expiry with strftime('%s', expires_at) returned NULL for epoch seconds, so
+        // expired leases were never detected and never reclaimed.
+        let store = SqliteStore::in_memory().await.unwrap();
+
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let epoch = |offset: i64| (now_secs + offset).to_string();
+        let lease_req = |id: &str, holder: &str, expires_at: String| NewResourceLeaseRecord {
+            id: id.to_string(),
+            resource_type: "workflow_run".to_string(),
+            resource_id: "wfr-epoch-1".to_string(),
+            lease_kind: "exclusive_write".to_string(),
+            holder_id: holder.to_string(),
+            holder_pid: 301,
+            holder_host: "localhost".to_string(),
+            expires_at,
+        };
+
+        let live = store
+            .acquire_resource_lease(&lease_req("lease-epoch-1", "holder-1", epoch(3600)))
+            .await
+            .unwrap();
+        assert_eq!(live.fencing_token, 1);
+        assert_eq!(live.state, "active");
+
+        // A live epoch-seconds lease still blocks a competing holder.
+        let blocked = store
+            .acquire_resource_lease(&lease_req("lease-epoch-2", "holder-2", epoch(3600)))
+            .await
+            .unwrap_err();
+        assert!(matches!(blocked, StoreError::ResourceLeaseHeld { .. }));
+
+        // Move the active lease's expiry into the past and confirm reclamation.
+        sqlx::query("UPDATE resource_leases SET expires_at = ?1 WHERE id = 'lease-epoch-1'")
+            .bind(epoch(-60))
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let takeover = store
+            .acquire_resource_lease(&lease_req("lease-epoch-3", "holder-3", epoch(3600)))
+            .await
+            .unwrap();
+        assert_eq!(
+            takeover.fencing_token, 2,
+            "fencing token must stay monotonic"
+        );
+        assert_eq!(takeover.state, "active");
+
+        let superseded = store
+            .get_resource_lease("lease-epoch-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(superseded.state, "expired");
     }
 
     fn task_record(id: &str, title: &str) -> NewTaskRecord {

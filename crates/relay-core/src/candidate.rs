@@ -47,6 +47,8 @@ pub enum CandidateError {
     FencingConflict { current: u64, attempted: u64 },
     #[error("lease has expired: expires_at {expires_at}")]
     LeaseExpired { expires_at: String },
+    #[error("lease expiry is not a valid Unix timestamp: expires_at {expires_at}")]
+    LeaseExpiryUnparseable { expires_at: String },
     #[error("lease is not active: state is {state:?}")]
     LeaseNotActive { state: LeaseState },
     #[error("lease resource mismatch: expected {expected:?}, observed {observed:?}")]
@@ -411,16 +413,23 @@ impl Lease {
                 attempted: candidate_fencing_token,
             });
         }
-        if let Ok(exp_secs) = self.expires_at.parse::<u64>() {
-            let now_secs = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if now_secs >= exp_secs {
-                return Err(CandidateError::LeaseExpired {
+        // The canonical expiry representation for durable leases is Unix epoch
+        // seconds (see `durable_state::acquire_durable_lease`). An expiry we cannot
+        // parse must not be treated as "valid forever" — fail closed (invariant 17).
+        let exp_secs =
+            self.expires_at
+                .parse::<u64>()
+                .map_err(|_| CandidateError::LeaseExpiryUnparseable {
                     expires_at: self.expires_at.clone(),
-                });
-            }
+                })?;
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now_secs >= exp_secs {
+            return Err(CandidateError::LeaseExpired {
+                expires_at: self.expires_at.clone(),
+            });
         }
         Ok(())
     }
@@ -627,6 +636,14 @@ mod tests {
         assert!(matches!(
             expired_lease.assert_valid(5),
             Err(CandidateError::LeaseExpired { .. })
+        ));
+
+        // An unparseable expiry fails closed instead of reading as "never expires"
+        let mut corrupt_lease = lease.clone();
+        corrupt_lease.expires_at = "2099-01-01T00:00:00.000Z".to_string();
+        assert!(matches!(
+            corrupt_lease.assert_valid(5),
+            Err(CandidateError::LeaseExpiryUnparseable { .. })
         ));
 
         // Released / non-active lease is rejected

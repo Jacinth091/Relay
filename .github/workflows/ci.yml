@@ -1,6 +1,8 @@
 name: Rust CI
 
-# Compiles and tests the Relay workspace on Linux and Windows.
+# Compiles and tests the Relay workspace on Windows (the supported host and
+# the merge gate) and on Linux (advisory - see the `continue-on-error` note on
+# the job below).
 #
 # Design constraints (deliberate, do not relax without review):
 #   - read-only token; no secrets, no provider logins, no network calls to AI
@@ -29,6 +31,14 @@ jobs:
   rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Windows is the supported host, so it is the gate. Linux runs for
+    # visibility only: the local-daemon transport
+    # (crates/relay-core/src/daemon_transport.rs, gated `#![cfg(windows)]`) uses
+    # a Windows named pipe, so the Linux leg cannot build `apps/relay-tui` yet.
+    # A Linux failure is reported but must not block a merge - see
+    # CONTRIBUTING.md, "Supported platforms". Remove this once a contributor
+    # lands a platform-neutral transport.
+    continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:

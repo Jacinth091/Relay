@@ -98,6 +98,12 @@ To build and test from source you need:
 - On Windows with the MSVC toolchain: the Microsoft C++ build tools and Windows
   SDK, used from a **Developer Command Prompt / PowerShell**
 
+**Windows with the MSVC toolchain is the only supported host today.** The build
+is not yet portable: the local Relay Daemon transport is a Windows named pipe,
+so the `ubuntu-latest` CI leg is advisory and expected to fail. See
+[CONTRIBUTING.md](CONTRIBUTING.md#supported-platforms) if you would like to help
+change that.
+
 You do **not** need a coding-agent login, API key, hosted service, Herdr server,
 or a GitHub mailbox to compile and test the source. Real provider execution
 additionally requires the corresponding provider CLI, installed and

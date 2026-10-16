@@ -186,19 +186,43 @@ fn test_lease_monotonic_fencing_tokens() {
         60,
     );
 
-    // Current token is 10
+    // Exact token is valid
     assert!(lease.assert_valid(10).is_ok());
-    // Advanced token is valid
-    assert!(lease.assert_valid(11).is_ok());
+
+    // Unissued higher token is strictly rejected
+    let forged = lease.assert_valid(11);
+    assert!(matches!(
+        forged,
+        Err(CandidateError::FencingConflict {
+            current: 10,
+            attempted: 11
+        })
+    ));
 
     // Stale token (e.g. 9 or earlier) is rejected
-    let res = lease.assert_valid(9);
+    let stale = lease.assert_valid(9);
     assert!(matches!(
-        res,
+        stale,
         Err(CandidateError::FencingConflict {
             current: 10,
             attempted: 9
         })
+    ));
+
+    // Expired lease is rejected
+    let mut expired = lease.clone();
+    expired.expires_at = "100".to_string();
+    assert!(matches!(
+        expired.assert_valid(10),
+        Err(CandidateError::LeaseExpired { .. })
+    ));
+
+    // Released lease is rejected
+    let mut released = lease.clone();
+    released.state = relay_core::LeaseState::Released;
+    assert!(matches!(
+        released.assert_valid(10),
+        Err(CandidateError::LeaseNotActive { .. })
     ));
 }
 

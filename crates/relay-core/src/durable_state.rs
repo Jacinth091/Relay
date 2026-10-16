@@ -1,11 +1,16 @@
 use std::fmt;
 
 use relay_protocol::{HandoffTask, parse_handoff_task_json};
-use relay_store::{NewTaskRecord, StoreError, TaskRecord};
+use relay_store::{
+    NewResourceLeaseRecord, NewTaskRecord, ResourceLeaseRecord, StoreError, TaskRecord,
+};
 pub use relay_store::{SqliteStore, default_database_path};
 use thiserror::Error;
 
-use crate::{ImportedTask, ProjectKey, Relay, SubmissionTransport, TaskId, TaskImportCandidate};
+use crate::{
+    CheckoutId, ImportedTask, Lease, LeaseHolder, LeaseId, LeaseKind, LeaseResource, LeaseState,
+    ProjectKey, Relay, SubmissionTransport, TaskId, TaskImportCandidate, WorkflowRunId,
+};
 
 /// Durable Relay task state stored locally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +258,122 @@ pub enum TaskPersistenceError {
     },
     #[error("{0}")]
     ProjectRegistry(#[from] crate::ProjectRegistryError),
+    #[error("{0}")]
+    ProjectIdentity(#[from] crate::project_identity::ProjectIdentityError),
+    #[error("unknown stored lease resource type '{resource_type}'")]
+    UnknownLeaseResourceType { resource_type: String },
+    #[error("unknown stored lease kind '{lease_kind}'")]
+    UnknownLeaseKind { lease_kind: String },
+    #[error("unknown stored lease state '{state}'")]
+    UnknownLeaseState { state: String },
+}
+
+pub fn record_to_lease(record: ResourceLeaseRecord) -> Result<Lease, TaskPersistenceError> {
+    let resource = match record.resource_type.as_str() {
+        "checkout" => LeaseResource::Checkout(CheckoutId::parse(&record.resource_id)?),
+        "task" => LeaseResource::Task(TaskId::parse(&record.resource_id).map_err(|source| {
+            TaskPersistenceError::InvalidTaskId {
+                input: record.resource_id,
+                source,
+            }
+        })?),
+        "workflow_run" => LeaseResource::WorkflowRun(WorkflowRunId(record.resource_id)),
+        other => {
+            return Err(TaskPersistenceError::UnknownLeaseResourceType {
+                resource_type: other.to_string(),
+            });
+        }
+    };
+
+    let kind = match record.lease_kind.as_str() {
+        "exclusive_write" => LeaseKind::ExclusiveWrite,
+        "shared_read" => LeaseKind::SharedRead,
+        "verification" => LeaseKind::Verification,
+        other => {
+            return Err(TaskPersistenceError::UnknownLeaseKind {
+                lease_kind: other.to_string(),
+            });
+        }
+    };
+
+    let state = match record.state.as_str() {
+        "active" => LeaseState::Active,
+        "expired" => LeaseState::Expired,
+        "superseded" => LeaseState::Superseded,
+        "released" => LeaseState::Released,
+        other => {
+            return Err(TaskPersistenceError::UnknownLeaseState {
+                state: other.to_string(),
+            });
+        }
+    };
+
+    Ok(Lease {
+        id: LeaseId::new(record.id),
+        resource,
+        kind,
+        holder: LeaseHolder {
+            holder_id: record.holder_id,
+            pid: record.holder_pid as u32,
+            host: record.holder_host,
+        },
+        fencing_token: record.fencing_token as u64,
+        acquired_at: record.acquired_at,
+        expires_at: record.expires_at,
+        state,
+    })
+}
+
+pub async fn acquire_durable_lease(
+    store: &SqliteStore,
+    id: &LeaseId,
+    resource: &LeaseResource,
+    kind: &LeaseKind,
+    holder: &LeaseHolder,
+    ttl_seconds: u64,
+) -> Result<Lease, TaskPersistenceError> {
+    let (resource_type, resource_id) = match resource {
+        LeaseResource::Checkout(chk) => ("checkout".to_string(), chk.to_string()),
+        LeaseResource::Task(tsk) => ("task".to_string(), tsk.to_string()),
+        LeaseResource::WorkflowRun(wfr) => ("workflow_run".to_string(), wfr.to_string()),
+    };
+
+    let lease_kind_str = match kind {
+        LeaseKind::ExclusiveWrite => "exclusive_write".to_string(),
+        LeaseKind::SharedRead => "shared_read".to_string(),
+        LeaseKind::Verification => "verification".to_string(),
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expires_at = (now + ttl_seconds).to_string();
+
+    let new_rec = NewResourceLeaseRecord {
+        id: id.to_string(),
+        resource_type,
+        resource_id,
+        lease_kind: lease_kind_str,
+        holder_id: holder.holder_id.clone(),
+        holder_pid: holder.pid as i64,
+        holder_host: holder.host.clone(),
+        expires_at,
+    };
+
+    let record = store.acquire_resource_lease(&new_rec).await?;
+    record_to_lease(record)
+}
+
+pub async fn release_durable_lease(
+    store: &SqliteStore,
+    lease_id: &LeaseId,
+    holder_id: &str,
+) -> Result<(), TaskPersistenceError> {
+    store
+        .release_resource_lease(&lease_id.to_string(), holder_id)
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]

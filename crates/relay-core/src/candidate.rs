@@ -42,9 +42,23 @@ pub enum CandidateError {
         observed: Box<CandidateFingerprint>,
     },
     #[error(
-        "lease expired or superseded: current fencing token is {current}, attempted {attempted}"
+        "lease fencing token mismatch: authoritative fencing token is {current}, attempted {attempted}"
     )]
     FencingConflict { current: u64, attempted: u64 },
+    #[error("lease has expired: expires_at {expires_at}")]
+    LeaseExpired { expires_at: String },
+    #[error("lease is not active: state is {state:?}")]
+    LeaseNotActive { state: LeaseState },
+    #[error("lease resource mismatch: expected {expected:?}, observed {observed:?}")]
+    LeaseResourceMismatch {
+        expected: LeaseResource,
+        observed: LeaseResource,
+    },
+    #[error("lease holder mismatch: expected {expected_holder}, observed {observed_holder}")]
+    LeaseHolderMismatch {
+        expected_holder: String,
+        observed_holder: String,
+    },
 }
 
 /// Computes a hex-encoded SHA-256 digest from bytes.
@@ -340,7 +354,7 @@ pub struct LeaseHolder {
     pub host: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LeaseState {
     Active,
@@ -386,18 +400,49 @@ impl Lease {
         }
     }
 
-    /// Verifies that a caller's fencing token is current, rejecting stale or superseded holders.
+    /// Verifies that a caller's fencing token is current, rejecting stale, superseded, expired, or mismatched holders.
     pub fn assert_valid(&self, candidate_fencing_token: u64) -> Result<(), CandidateError> {
         if self.state != LeaseState::Active {
+            return Err(CandidateError::LeaseNotActive { state: self.state });
+        }
+        if candidate_fencing_token != self.fencing_token {
             return Err(CandidateError::FencingConflict {
                 current: self.fencing_token,
                 attempted: candidate_fencing_token,
             });
         }
-        if candidate_fencing_token < self.fencing_token {
-            return Err(CandidateError::FencingConflict {
-                current: self.fencing_token,
-                attempted: candidate_fencing_token,
+        if let Ok(exp_secs) = self.expires_at.parse::<u64>() {
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if now_secs >= exp_secs {
+                return Err(CandidateError::LeaseExpired {
+                    expires_at: self.expires_at.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Verifies that a caller's fencing token, resource, and holder match this lease.
+    pub fn assert_valid_holder(
+        &self,
+        candidate_fencing_token: u64,
+        expected_resource: &LeaseResource,
+        expected_holder: &str,
+    ) -> Result<(), CandidateError> {
+        self.assert_valid(candidate_fencing_token)?;
+        if &self.resource != expected_resource {
+            return Err(CandidateError::LeaseResourceMismatch {
+                expected: expected_resource.clone(),
+                observed: self.resource.clone(),
+            });
+        }
+        if self.holder.holder_id != expected_holder {
+            return Err(CandidateError::LeaseHolderMismatch {
+                expected_holder: expected_holder.to_string(),
+                observed_holder: self.holder.holder_id.clone(),
             });
         }
         Ok(())
@@ -555,19 +600,41 @@ mod tests {
             300,
         );
 
-        // Current fencing token is valid
+        // Exact fencing token is valid
         assert!(lease.assert_valid(5).is_ok());
 
-        // Higher fencing token is valid
-        assert!(lease.assert_valid(6).is_ok());
+        // Forged or unissued higher fencing token is strictly rejected
+        assert!(matches!(
+            lease.assert_valid(6),
+            Err(CandidateError::FencingConflict {
+                current: 5,
+                attempted: 6
+            })
+        ));
 
-        // Stale fencing token (from earlier holder) is strictly rejected
+        // Stale lower fencing token is strictly rejected
         assert!(matches!(
             lease.assert_valid(4),
             Err(CandidateError::FencingConflict {
                 current: 5,
                 attempted: 4
             })
+        ));
+
+        // Expired lease is rejected
+        let mut expired_lease = lease.clone();
+        expired_lease.expires_at = "1000".to_string(); // In the past
+        assert!(matches!(
+            expired_lease.assert_valid(5),
+            Err(CandidateError::LeaseExpired { .. })
+        ));
+
+        // Released / non-active lease is rejected
+        let mut released_lease = lease.clone();
+        released_lease.state = LeaseState::Released;
+        assert!(matches!(
+            released_lease.assert_valid(5),
+            Err(CandidateError::LeaseNotActive { .. })
         ));
     }
 

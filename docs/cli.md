@@ -8,7 +8,7 @@ The executable is named `relay` (crate `relay-tui`).
 relay                  Start the TUI (default behavior with no arguments)
 relay run-tui          Explicitly start the TUI
 relay serve-mcp        Run the Relay Direct MCP server over stdio (headless)
-relay daemon           Run the durable Relay daemon (store-lease ownership; no client transport yet)
+relay daemon           Run the durable Relay daemon (store-lease ownership + named-pipe client transport)
 relay --help           Show usage
 relay --version        Show version
 ```

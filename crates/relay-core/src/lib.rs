@@ -11,6 +11,7 @@ pub mod daemon_runtime;
 pub mod daemon_transport;
 pub mod decision;
 pub mod delegation;
+pub mod digest;
 mod durable_state;
 pub mod effect_worker;
 pub mod exchange;
@@ -68,6 +69,7 @@ pub use delegation::{
     DelegationMode, DelegationOutcome, DelegationRequest, IndependenceRequirement,
     RoleDependencyGraph, RoleDependencyNode, RoleDependencyState,
 };
+pub use digest::sha256_digest;
 pub use durable_state::{
     SqliteStore, StoredTask, TaskPersistenceError, TaskState, default_database_path,
     get_stored_task, list_stored_tasks, list_stored_tasks_with_quarantined,

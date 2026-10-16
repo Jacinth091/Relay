@@ -52,6 +52,20 @@ fn test_candidate_fingerprint_and_invalidation() {
     let fp = CandidateFingerprint::capture(&repo_dir, None).unwrap();
     assert!(!fp.current_head.is_empty());
     assert_eq!(fp.base_head, fp.current_head);
+    assert_eq!(fp.index_digest.len(), 64);
+    assert_eq!(fp.tracked_diff_digest.len(), 64);
+    assert_eq!(fp.relevant_untracked_digest.len(), 64);
+    assert!(fp.index_digest.chars().all(|c| c.is_ascii_hexdigit()));
+    assert!(
+        fp.tracked_diff_digest
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+    );
+    assert!(
+        fp.relevant_untracked_digest
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+    );
 
     let proj_id = ProjectId::parse("test-project").unwrap();
     let checkout_id = CheckoutId::generate();
@@ -215,6 +229,8 @@ fn test_immutable_artifact_store_provenance_and_tamper_detection() {
         .unwrap();
 
     assert_eq!(meta.size_bytes, payload.len() as u64);
+    assert_eq!(meta.checksum.len(), 64);
+    assert!(meta.checksum.chars().all(|c| c.is_ascii_hexdigit()));
 
     // Fetch and verify content
     let retrieved = store.get(&meta).unwrap();

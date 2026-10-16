@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    ProjectId, RoleAttemptId, RoleInstanceId, TaskId, WorkflowRunId,
-    candidate::{CandidateId, compute_digest},
+    ProjectId, RoleAttemptId, RoleInstanceId, TaskId, WorkflowRunId, candidate::CandidateId,
+    digest::sha256_digest,
 };
 
 #[derive(Debug, Error)]
@@ -173,7 +173,7 @@ impl ArtifactStore {
         request: CreateArtifactRequest<'_>,
     ) -> Result<ArtifactMetadata, ArtifactError> {
         let id = ArtifactId::generate(&request.kind);
-        let checksum = compute_digest(request.payload);
+        let checksum = sha256_digest(request.payload);
         let size_bytes = request.payload.len() as u64;
 
         // Content-addressed subpath: <kind>/<id>.blob
@@ -240,7 +240,7 @@ impl ArtifactStore {
         let mut buf = Vec::with_capacity(metadata.size_bytes as usize);
         file.read_to_end(&mut buf)?;
 
-        let computed = compute_digest(&buf);
+        let computed = sha256_digest(&buf);
         if computed != metadata.checksum {
             return Err(ArtifactError::ChecksumMismatch {
                 expected: metadata.checksum.clone(),
@@ -332,6 +332,8 @@ mod tests {
 
         assert_eq!(meta.size_bytes, payload.len() as u64);
         assert_eq!(meta.kind, ArtifactKind::VerificationResult);
+        assert_eq!(meta.checksum.len(), 64);
+        assert!(meta.checksum.chars().all(|c| c.is_ascii_hexdigit()));
 
         // Retrieve and verify checksum
         let retrieved = store.get(&meta).unwrap();

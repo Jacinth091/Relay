@@ -8,8 +8,6 @@
 //! - Candidate invalidation verification when repo state diverges.
 
 use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
     io,
     path::{Path, PathBuf},
     process::Command,
@@ -21,7 +19,7 @@ use thiserror::Error;
 
 use crate::{
     Checkout, CheckoutId, ProjectId, RoleAttemptId, RoleInstanceId, TaskId, TrustClassification,
-    WorkflowRunId,
+    WorkflowRunId, digest::sha256_digest,
 };
 
 #[derive(Debug, Error)]
@@ -49,15 +47,9 @@ pub enum CandidateError {
     FencingConflict { current: u64, attempted: u64 },
 }
 
-/// Computes a hex-encoded SHA-like digest from bytes using standard hash + formatting.
+/// Computes a hex-encoded SHA-256 digest from bytes.
 pub fn compute_digest(bytes: &[u8]) -> String {
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    let h1 = hasher.finish();
-    let mut hasher2 = DefaultHasher::new();
-    h1.hash(&mut hasher2);
-    let h2 = hasher2.finish();
-    format!("{:016x}{:016x}", h1, h2)
+    sha256_digest(bytes)
 }
 
 fn now_timestamp() -> String {
@@ -577,5 +569,29 @@ mod tests {
                 attempted: 4
             })
         ));
+    }
+
+    #[test]
+    fn candidate_fingerprint_uses_sha256_digests() {
+        let repo_dir = unique_temp_dir("fp-sha256");
+        create_test_repo(&repo_dir);
+
+        let fp = CandidateFingerprint::capture(&repo_dir, None).unwrap();
+        // SHA-256 hex digests are exactly 64 characters
+        assert_eq!(fp.index_digest.len(), 64);
+        assert_eq!(fp.tracked_diff_digest.len(), 64);
+        assert_eq!(fp.relevant_untracked_digest.len(), 64);
+
+        assert!(fp.index_digest.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(
+            fp.tracked_diff_digest
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
+        );
+        assert!(
+            fp.relevant_untracked_digest
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
+        );
     }
 }

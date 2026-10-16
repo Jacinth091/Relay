@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    Checkout, CheckoutId, ProjectId, RoleAttemptId, RoleInstanceId, TaskId, WorkflowRunId,
+    Checkout, CheckoutId, ProjectId, RoleAttemptId, RoleInstanceId, TaskId, TrustClassification,
+    WorkflowRunId,
 };
 
 #[derive(Debug, Error)]
@@ -29,6 +30,8 @@ pub enum CandidateError {
     Git(String),
     #[error("io error: {0}")]
     Io(#[from] io::Error),
+    #[error("checkout is not trusted for worktree creation: {0}")]
+    UntrustedCheckout(String),
     #[error("unauthorized worktree path outside checkout root: {0}")]
     UnauthorizedWorktreePath(PathBuf),
     #[error("worktree creation failed: {0}")]
@@ -210,9 +213,27 @@ impl WorktreeManager {
     /// Creates an isolated worktree rooted strictly inside `checkout.allowed_worktree_root`.
     pub fn create_isolated_worktree(
         checkout: &Checkout,
+        trust: &TrustClassification,
         worktree_name: &str,
         base_commit: &str,
     ) -> Result<WorktreeHandle, CandidateError> {
+        match trust {
+            TrustClassification::TrustedAgainstRegistration {
+                project_id,
+                checkout_id,
+            } => {
+                if project_id != &checkout.project_id || checkout_id != checkout.id.as_str() {
+                    return Err(CandidateError::UntrustedCheckout(format!(
+                        "trust classification is for {project_id}/{checkout_id} but checkout is {}/{}",
+                        checkout.project_id, checkout.id
+                    )));
+                }
+            }
+            TrustClassification::UntrustedDeclaration { reason } => {
+                return Err(CandidateError::UntrustedCheckout(reason.clone()));
+            }
+        }
+
         let name_path = Path::new(worktree_name);
         if name_path.is_absolute()
             || name_path.components().any(|c| {
@@ -506,8 +527,14 @@ mod tests {
         )
         .unwrap();
 
+        let trust = TrustClassification::TrustedAgainstRegistration {
+            project_id: checkout.project_id.clone(),
+            checkout_id: checkout.id.to_string(),
+        };
+
         // 1. Valid isolated worktree within allowed root
-        let handle = WorktreeManager::create_isolated_worktree(&checkout, "wt-1", "HEAD").unwrap();
+        let handle =
+            WorktreeManager::create_isolated_worktree(&checkout, &trust, "wt-1", "HEAD").unwrap();
         assert!(handle.path.exists());
         assert!(handle.path.starts_with(&worktree_root));
 
@@ -517,7 +544,7 @@ mod tests {
 
         // 3. Reject worktree path outside allowed root (traversal attempt)
         let traversal_res =
-            WorktreeManager::create_isolated_worktree(&checkout, "../evil-escape", "HEAD");
+            WorktreeManager::create_isolated_worktree(&checkout, &trust, "../evil-escape", "HEAD");
         assert!(traversal_res.is_err());
     }
 

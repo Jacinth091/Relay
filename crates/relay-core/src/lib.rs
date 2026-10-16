@@ -120,7 +120,7 @@ pub use relay_store::PendingEffectRecord;
 pub use repository_safety::{
     BranchState, GitInspectionOperation, NormalizedRemote, RepositoryEligibility,
     RepositoryInspection, RepositorySafetyFailure, RepositoryStatus,
-    inspect_trusted_project_repository,
+    inspect_trusted_project_repository, read_repository_remote_origin,
 };
 pub use retention::{CleanupReport, RetentionError, RetentionManager, RetentionPolicy};
 pub use scheduler_v2::{

@@ -133,9 +133,14 @@ fn test_worktree_isolation_and_boundary_enforcement() {
         CheckoutTrustState::Trusted,
     )
     .unwrap();
+    let trust = relay_core::TrustClassification::TrustedAgainstRegistration {
+        project_id: checkout.project_id.clone(),
+        checkout_id: checkout.id.to_string(),
+    };
 
     // 1. Create valid isolated worktree
-    let handle = WorktreeManager::create_isolated_worktree(&checkout, "attempt-1", "HEAD").unwrap();
+    let handle =
+        WorktreeManager::create_isolated_worktree(&checkout, &trust, "attempt-1", "HEAD").unwrap();
     assert!(handle.path.exists());
     assert!(handle.path.starts_with(&wt_root));
 
@@ -148,7 +153,7 @@ fn test_worktree_isolation_and_boundary_enforcement() {
 
     // 3. Directory traversal attempt must be rejected
     let traversal_err =
-        WorktreeManager::create_isolated_worktree(&checkout, "../../outside", "HEAD");
+        WorktreeManager::create_isolated_worktree(&checkout, &trust, "../../outside", "HEAD");
     assert!(traversal_err.is_err());
 }
 

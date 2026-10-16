@@ -39,6 +39,13 @@ pub enum ProjectIdentityError {
         "remote fingerprint mismatch: checkout remote '{actual}' does not match expected '{expected}'"
     )]
     RemoteMismatch { expected: String, actual: String },
+    #[error("remote.origin.url is missing for checkout '{checkout_id}' (expected '{expected}')")]
+    MissingRemote {
+        checkout_id: String,
+        expected: String,
+    },
+    #[error("remote URL is malformed: '{remote}', reason: {reason}")]
+    MalformedRemote { remote: String, reason: String },
     #[error("checkout is untrusted or revoked")]
     CheckoutNotTrusted,
     #[error("project registry error: {0}")]
@@ -143,13 +150,25 @@ impl RemoteFingerprint {
         &self.0
     }
 
+    pub fn normalize(remote: &str) -> Result<String, String> {
+        let trimmed = remote.trim();
+        if trimmed.is_empty() {
+            return Err("remote URL is empty".to_owned());
+        }
+        if trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return Err("remote URL contains control characters or whitespace".to_owned());
+        }
+        let clean = trimmed.to_ascii_lowercase();
+        let clean = clean.trim_end_matches(".git");
+        Ok(clean.to_owned())
+    }
+
     /// Checks if an observed remote matches this expected fingerprint.
     pub fn matches(&self, observed: &str) -> bool {
-        let clean_expected = self.0.trim().to_ascii_lowercase();
-        let clean_expected = clean_expected.trim_end_matches(".git");
-        let clean_observed = observed.trim().to_ascii_lowercase();
-        let clean_observed = clean_observed.trim_end_matches(".git");
-        clean_expected == clean_observed
+        match (Self::normalize(&self.0), Self::normalize(observed)) {
+            (Ok(expected), Ok(observed)) => expected == observed,
+            _ => false,
+        }
     }
 }
 
@@ -252,7 +271,19 @@ impl Checkout {
     /// Verifies that an observed remote matches this checkout's expected remote (if configured).
     pub fn verify_remote(&self, observed_remote: &str) -> Result<(), ProjectIdentityError> {
         if let Some(expected) = &self.expected_remote {
-            if !expected.matches(observed_remote) {
+            let exp_norm = RemoteFingerprint::normalize(expected.as_str()).map_err(|reason| {
+                ProjectIdentityError::MalformedRemote {
+                    remote: expected.as_str().to_owned(),
+                    reason,
+                }
+            })?;
+            let obs_norm = RemoteFingerprint::normalize(observed_remote).map_err(|reason| {
+                ProjectIdentityError::MalformedRemote {
+                    remote: observed_remote.to_owned(),
+                    reason,
+                }
+            })?;
+            if exp_norm != obs_norm {
                 return Err(ProjectIdentityError::RemoteMismatch {
                     expected: expected.to_string(),
                     actual: observed_remote.to_owned(),
@@ -295,6 +326,25 @@ impl TrustedProjectRegistration {
             github,
             checkouts: Vec::new(),
         }
+    }
+
+    /// Resolves the expected remote fingerprint for a checkout from trusted local registration.
+    pub fn expected_remote_for(&self, checkout: &Checkout) -> Option<RemoteFingerprint> {
+        if let Some(r) = &checkout.expected_remote {
+            return Some(r.clone());
+        }
+        if let Some(registered) = self.get_checkout(&checkout.id) {
+            if let Some(r) = &registered.expected_remote {
+                return Some(r.clone());
+            }
+        }
+        if let Some(gh) = &self.github {
+            return Some(RemoteFingerprint::new(format!(
+                "https://github.com/{}/{}",
+                gh.owner, gh.repo
+            )));
+        }
+        None
     }
 
     pub fn primary_checkout(&self) -> Option<&Checkout> {

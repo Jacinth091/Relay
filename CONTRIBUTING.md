@@ -1,62 +1,35 @@
 # Contributing to Relay
 
-Relay is private during initial development.
+Relay is an **experimental personal hobby/development project**, made public so people can learn, try ideas, and propose improvements. Issues and pull requests are welcome, but there is no guarantee of review, acceptance, support, or response time. Be constructive and respectful.
 
-These rules establish the intended contribution style before public release.
+## Start here
 
-## Before Coding
+Read `README.md`, `docs/DEVELOPMENT.md`, `AGENTS.md`, `contexts/PROJECT_CONTEXT.md`, `docs/design-principles.md`, `docs/architecture.md`, and the relevant ADRs. Check existing issues before starting substantial work.
 
-Read:
+For larger changes, discuss the problem in an issue first. Keep PRs focused and avoid expanding the architecture to support purely hypothetical providers.
 
-1. `README.md`
-2. `contexts/PROJECT_CONTEXT.md`
-3. `docs/design-principles.md`
-4. `docs/architecture.md`
-5. relevant ADRs
+## Architecture and boundaries
 
-## Change Ownership
+Determine the owning layer: core, protocol, store, runtime, planner integration, or presentation. Core is provider-agnostic. Preserve explicit human approval, safe path/project resolution, durable state invariants, and fail-closed security behavior. Changes to contracts, product invariants, or persistence require corresponding documentation/ADR and boundary tests.
 
-Determine the correct layer before implementation:
+## Validation
 
-- core;
-- ingress;
-- runtime;
-- stack;
-- planner specification / provider adapter;
-- presentation client.
+Run:
 
-Do not put provider-specific shortcuts in core.
-
-## Architectural Changes
-
-If a change affects a product invariant, task protocol, security boundary, persistence strategy, runtime contract, or presentation independence:
-
-- add/update an ADR;
-- update relevant docs;
-- add boundary tests.
-
-## Expected Checks
-
-When Rust implementation exists:
-
-```text
-cargo fmt --check
-cargo clippy --workspace --all-targets --all-features
-cargo test --workspace
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked
+cargo test --workspace --locked
 ```
 
-## Pull Requests
+Clearly state which checks were run, skipped, or failed. Do not claim untested OS or provider compatibility.
 
-Prefer small, coherent changes.
+## Pull requests
 
-Describe:
+Include the problem, scope, affected architectural layers, risk/security implications, tests, and documentation updates. Be willing to split large PRs. Do not submit secrets, private logs, personal information, production credentials, private task handoffs, or unlicensed third-party content.
 
-- problem;
-- layer changed;
-- security implications;
-- tests;
-- documentation impact.
+## Licensing
 
-## Public Contribution Policy
+Unless otherwise noted, contributions submitted for inclusion in the repository are offered under its [MIT License](LICENSE). By contributing, you represent that you have the rights to submit the material and agree to its distribution under that license. No CLA is currently required.
 
-A public code of conduct, contribution workflow, and license policy will be added before open-source release.
+Security issues should be reported privately, following [SECURITY.md](SECURITY.md), rather than by opening public issues.

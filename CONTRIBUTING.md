@@ -36,8 +36,9 @@ while `apps/relay-tui` (`main.rs`, `state.rs`, `mcp/*`) imports those types
 unconditionally. Removing that blocker means either adding a platform-neutral
 transport or compiling the daemon path out behind a platform gate.
 
-A portability contribution is welcome. Until it lands, do not claim Linux or
-macOS support in code, documentation, or pull request descriptions.
+A portability contribution is welcome — [issue #17](https://github.com/Jacinth091/Relay/issues/17)
+tracks it. Until it lands, do not claim Linux or macOS support in code,
+documentation, or pull request descriptions.
 
 ## Architecture and boundaries
 

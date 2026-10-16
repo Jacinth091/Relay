@@ -33,13 +33,13 @@ Status: **LANDED, re-review pending**
 
 ## Wave B — Establish a real v2 execution vertical slice
 
-Status: **NOT STARTED**
+Status: **PARTIAL — R12-05, R12-06, R12-07 and R12-08 landed; R12-02 outstanding**
 
-- **R12-05** — Project trust classification can become trusted without verifying the expected remote
-- **R12-06** — Workflow, intent, and policy contracts are below the rebaseline specification
-- **R12-07** — Candidate/artifact/intent integrity digests are not stable cryptographic digests
-- **R12-08** — Lease fencing and expiry validation are incorrect
-- **R12-02** — The user-facing Run path still executes the v1 scheduler, not the v2 orchestrator
+- **R12-05** — Project trust classification can become trusted without verifying the expected remote — **landed** (`17866e6`)
+- **R12-06** — Workflow, intent, and policy contracts are below the rebaseline specification — **landed** (`9f96216`)
+- **R12-07** — Candidate/artifact/intent integrity digests are not stable cryptographic digests — **landed** (`b142aca`)
+- **R12-08** — Lease fencing and expiry validation are incorrect — **landed** (`db97bb4`)
+- **R12-02** — The user-facing Run path still executes the v1 scheduler, not the v2 orchestrator — **outstanding**
 
 ## Wave C — Harden runtime/provider semantics
 
@@ -78,3 +78,5 @@ Do **not** implement the Web UI merely to make `ROADMAP.md` look complete while 
 ## Re-review fixed point
 
 After all waves are remediated, pin a new exact head, rerun the governed review stack, verify every previously blocking finding against code and tests, and require exact-head quality gates before forwarding to staging.
+
+**Deferred by owner decision (2026-10-16).** The v2 branch was forwarded to `staging` (PR #12) with Wave A landed and Wave B partially landed, ahead of this fixed point, so the private repository could be prepared for experimental hobby/development use. The governed re-review and Waves C-F remain outstanding; they are the gate on claiming v2 complete and on publishing the repository, not merely on promoting `staging` to `main`. Nothing in this promotion resolves a previously blocking finding on its own, and no finding may be marked resolved except by the exact-head re-review defined above.

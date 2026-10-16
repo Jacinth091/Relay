@@ -39,10 +39,10 @@ CI. Do not present a module or test as proof that a path is production-ready.
 | Item | State |
 |---|---|
 | Historical v1 lineage (M0–M9) | Frozen as historical evidence; ADR-0017 superseded by ADR-0020 |
-| v2 phase table (00–15) | Recorded `DONE` per the dated roadmap (unit/integration evidence); see `ROADMAP.md` |
+| v2 phase table (00–15) | **No phase is `DONE`.** The audit reset the dated roadmap's `DONE` markings; every phase now carries an evidence-based verdict — read `ROADMAP.md` |
 | Working end-to-end path today | Local paste/file import (and `relay serve-mcp` `submit_handoff`) → TUI review → explicit Run approval → `ExecutionScheduler` → runtime → events/diff/logs/history |
 | A real Web UI | **Does not exist.** Phase 12's evidence was an in-process `DaemonClient` abstraction and integration tests, not a web application |
-| Daemon | `relay daemon` runs the durable daemon process (store lease ownership + fencing token, heartbeat renewal). It does not yet serve clients over a transport: the TUI and MCP server open the store directly |
+| Daemon | `relay daemon` runs the durable daemon process (store lease ownership + fencing token, heartbeat renewal) and serves clients over a **Windows named pipe**. The TUI and `relay serve-mcp` submit durable mutations through it, embedding one in-process when none is running (`connect_or_embed`). Windows-only at this revision — see issue #17 |
 | Herdr backplane | Reference/fake-protocol vertical slice; not a durable production transport |
 | Jev / semantic decisions | Optional advisory adapter behind a provider-neutral seam; not required for correctness |
 | Ingress reality | Local file/paste plus `relay serve-mcp` (local stdio). GitHub ingress descoped from v0.1 by ADR-0016 |
@@ -143,7 +143,8 @@ contexts/               Project-level context documents
 | `project_registry.rs` | Trusted local project registry: filesystem paths, expected Git remotes, default stacks. Remote/task input may reference projects by key only — never paths |
 | `repository_safety.rs` | Pre-run repository inspection/eligibility checks via git |
 | `durable_state.rs` | Stored-task state machine over relay-store; corrupt rows are quarantined, not fatal to listing |
-| `daemon.rs` | v2 Phase 01 daemon ownership: client protocol types, typed commands, monotonic events, durable effects, and a lease + fencing token. `relay daemon` acquires the store lease and renews a heartbeat; it does **not** yet serve clients over a transport — the TUI and MCP open the store directly |
+| `daemon.rs` | v2 Phase 01 daemon ownership: client protocol types, typed commands, monotonic events, durable effects, and a lease + fencing token. `relay daemon` acquires the store lease, renews a heartbeat, and serves `DaemonClient` requests |
+| `daemon_runtime.rs`, `daemon_transport.rs` | Wave A daemon client/lifecycle seam: `DaemonClientHandle`, `connect_or_embed`, `run_full_daemon`, and the Windows named-pipe transport + framing. Both modules are `#[cfg(windows)]`, which is why the Linux CI leg is advisory (issue #17) |
 | v2 domain modules (`workflow`, `policy`, `candidate`, `lease`, `artifact`, `exchange`, `delegation`, `privileged`, `scheduler_v2`, …) | v2 orchestration domain. Mostly `PARTIAL` and not yet on the production Run path — check `ROADMAP.md` before relying on any of it |
 
 ### apps/relay-tui — presentation (must not own policy)
@@ -290,9 +291,9 @@ Add focused integration tests for process boundaries, repository safety, recover
 ## 12. Next Up (so agents don't guess)
 
 1. **Relay Architecture v2 Rebaseline** — follow the 16-phase sequential implementation plan in `docs/v2_architecture_rebaseline/02-IMPLEMENTATION-SEQUENCE.md`. Per-phase status is tracked authoritatively in `docs/v2_architecture_rebaseline/ROADMAP.md` — read that table for current truth, do not rely on this section for phase status, and do not mark a phase `DONE` here or there until its production exit gate is proven.
-2. A governed external review found PR #12 could not merge: v2 modules existed but were not wired into the production path and most v2 state was memory-only. The correction plan is tracked wave-by-wave in `docs/v2_architecture_rebaseline/REMEDIATION-WAVES.md`. **Wave A (in progress)**: canonical daemon ownership actually wired into TUI/MCP, crash-safe command/effect idempotency, and durable state for the paths that wave touches.
-3. Do not start Wave B work (Run-path cutover to the v2 orchestrator, trust/workflow/policy/digest/lease corrections) until Wave A is accepted — see the remediation waves doc for the full ordering and dependency reasoning.
-4. The roadmap's `DONE` entries rest on unit and integration test evidence; most v2 proof runs use deterministic/fake infrastructure (`FakeBackplane`, fake runtime, in-process clients). The production **Run** path still executes the v1 `ExecutionScheduler`, and the cutover to the v2 orchestrator is **not implemented at this revision**. Do not describe the v2 orchestration domain as wired into the production path until that cutover lands and is proven end to end.
+2. A governed external review found PR #12 could not merge: v2 modules existed but were not wired into the production path and most v2 state was memory-only. The correction plan is tracked wave-by-wave in `docs/v2_architecture_rebaseline/REMEDIATION-WAVES.md`. **Wave A is landed**: canonical daemon ownership is wired into the TUI and MCP, command/effect handling is crash-safe, and the state that wave touches is durable. It still awaits the governed re-review, which the owner has deferred — see that doc before treating any finding as resolved.
+3. **Wave B is partially landed**: R12-05 (trust verifies the expected remote), R12-06 (workflow/intent/policy validation contract), R12-07 (SHA-256 integrity digests) and R12-08 (durable, fenced write leases) are committed. **R12-02 is outstanding** — the user-facing Run path still executes the v1 `ExecutionScheduler`. Waves C–F are not started; do not begin them until Wave B is complete.
+4. No v2 phase is marked `DONE` in `ROADMAP.md`; each carries an evidence-based verdict. Most v2 proof runs use deterministic/fake infrastructure (`FakeBackplane`, fake runtime, in-process clients). The production **Run** path still executes the v1 `ExecutionScheduler`, and the cutover to the v2 orchestrator is **not implemented at this revision**. Do not describe the v2 orchestration domain as wired into the production path until that cutover lands and is proven end to end.
 5. If committed work on a branch contradicts `ROADMAP.md`, **report the drift to the maintainer**; do not rewrite the status tables yourself.
 
 ## 13. Working on this repository as a public project

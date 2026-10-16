@@ -203,6 +203,25 @@ executions, clarification/decision requests, resolutions, and durable events so
 later milestones can add lifecycle behavior without replacing the canonical
 task store.
 
+### Daemon state identity and command resolution
+
+Migration `0007_v2_store_identity.sql` adds a `store_identity` table holding one
+value generated **inside** the database (`randomblob`) when the schema is
+created. It is the database's own identity: two databases can never share it, and
+opening the same file twice returns the same value. Relay derives the daemon's
+named pipe from it and verifies it in every client handshake, so a client bound
+to one database is refused by a daemon serving another. The store exposes it as
+`SqliteStore::store_identity`.
+
+Migration `0008_v2_serialized_command_resolution.sql` adds `claimed_at` to
+`commands`. A non-terminal command is claimed by exactly one caller
+(`claim_command`), which applies it and records the terminal result; a
+concurrent replay of the same command id loses the claim and waits for that
+committed result instead of applying the command a second time. Durable terminal
+status therefore cannot drift from the status a caller was told. Claims are
+cleared at startup before the listener accepts connections (`reconcile_on_startup`),
+because a claim can only be held by a live process.
+
 ## Export / Backup
 
 A future export command may package:

@@ -8,7 +8,7 @@ The executable is named `relay` (crate `relay-tui`).
 relay                  Start the TUI (default behavior with no arguments)
 relay run-tui          Explicitly start the TUI
 relay serve-mcp        Run the Relay Direct MCP server over stdio (headless)
-relay daemon           Run the durable Relay daemon (store-lease ownership; no client transport yet)
+relay daemon           Run the durable Relay daemon (store-lease ownership + named-pipe client transport)
 relay --help           Show usage
 relay --version        Show version
 ```
@@ -34,8 +34,12 @@ processes cannot reach a local Relay instance through it.
 
 Long-lived process that takes durable ownership of the local store: it acquires a
 lease, prints its fencing token, and renews a heartbeat until it is shut down.
-This is the v2 Phase 01 daemon-ownership slice. It does **not** yet serve clients
-over a transport — the TUI and `relay serve-mcp` open the store directly.
+This is the v2 Phase 01 daemon-ownership slice, extended by Wave A so that it is
+also the **sole canonical semantic writer** for task submission: the TUI and
+`relay serve-mcp` submit durable mutations through it instead of writing the
+store directly. The client transport is a **Windows named pipe** at this
+revision; portability is tracked separately (see
+[Supported platforms](CONTRIBUTING.md#supported-platforms)).
 
 | Flag | Default | Purpose |
 |---|---|---|
@@ -47,8 +51,9 @@ cargo run --locked -p relay-tui -- daemon
 cargo run --locked -p relay-tui -- daemon --lease-id relay-daemon-primary --lease-ttl 30
 ```
 
-Starting the daemon is **not required** for ordinary local use: the TUI opens the
-store directly and does not need a running daemon.
+Starting the daemon is **not required** for ordinary local use: when no daemon is
+already running, the TUI and `relay serve-mcp` embed one in-process
+(`connect_or_embed`), so neither needs a separately started daemon.
 
 ## Environment Variables
 

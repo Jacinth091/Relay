@@ -59,7 +59,7 @@ read it before trusting any claim below.
 | ✅ **Today** | Local handoff intake: JSON file / paste → validate → preview → persist `READY` | `HandoffTask v1` wire format |
 | ✅ **Today** | Explicit human **Run** approval before any execution | Execution grants are never automatic |
 | ✅ **Today** | `relay serve-mcp`: MCP over **stdio** exposing `submit_handoff` | Validates, resolves a trusted project, persists `READY`, **never auto-runs** |
-| ✅ **Today** | `relay daemon`: store-lease ownership with a fencing token and heartbeat renewal | Does not yet serve clients over a transport — the TUI and MCP open the store directly |
+| ✅ **Today** | `relay daemon`: store-lease ownership with a fencing token and heartbeat renewal, serving clients over a Windows named pipe | The TUI and `relay serve-mcp` submit task creation through the daemon instead of writing the store directly. The transport is Windows-only for now (see [Supported platforms](CONTRIBUTING.md#supported-platforms)) |
 | ✅ **Today** | Trusted local project registry + repository safety preflight | Tasks carry a project *key*, never filesystem paths |
 | ✅ **Today** | Deterministic fake runtime + fake backplane for tests | Hermetic: no network, no credentials, no provider quota |
 | ✅ **Today** | `NEEDS_CLARIFICATION` / `NEEDS_DECISION` escalation packets | Structured, not a vague question |

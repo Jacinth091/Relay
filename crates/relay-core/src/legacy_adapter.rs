@@ -17,8 +17,9 @@ use thiserror::Error;
 
 use crate::{
     ApprovedIntent, ConfigSnapshot, ExecutionBudget, ExecutionGrant, ExecutionGrantId,
-    RoleDefinitionId, StoredTask, TaskState, WorkflowDefinition, WorkflowDefinitionId,
-    WorkflowNodeDefinition, WorkflowRun, WorkflowRunState, WorkflowTransitionDefinition,
+    RoleDefinition, RoleDefinitionId, RoleWriteMode, StoredTask, TaskState, TransitionCondition,
+    WorkflowDefinition, WorkflowDefinitionId, WorkflowNodeDefinition, WorkflowRun,
+    WorkflowRunState, WorkflowTransitionDefinition,
 };
 
 #[derive(Debug, Error)]
@@ -32,23 +33,42 @@ pub enum LegacyAdapterError {
 /// The standard v1 compatibility workflow definition:
 /// Implementer -> Verifier (no hidden planner role!)
 pub fn v1_compatibility_workflow_definition() -> WorkflowDefinition {
+    let implementer_role = RoleDefinition {
+        id: RoleDefinitionId::new("implementer"),
+        purpose: "Implement approved intent in isolated worktree".to_owned(),
+        write_mode: RoleWriteMode::IsolatedWorktree,
+        allowed_delegations: vec![RoleDefinitionId::new("verifier")],
+    };
+    let verifier_role = RoleDefinition {
+        id: RoleDefinitionId::new("verifier"),
+        purpose: "Verify candidate against acceptance criteria".to_owned(),
+        write_mode: RoleWriteMode::ReadOnly,
+        allowed_delegations: vec![RoleDefinitionId::new("implementer")],
+    };
+
     WorkflowDefinition {
         id: WorkflowDefinitionId::new("v1-compatibility-workflow"),
         version: 1,
+        roles: vec![implementer_role, verifier_role],
         nodes: vec![
             WorkflowNodeDefinition {
                 id: "implementer".to_owned(),
                 role_id: RoleDefinitionId::new("implementer"),
+                consumed_artifact_types: vec![],
+                produced_artifact_types: vec!["candidate".to_owned()],
             },
             WorkflowNodeDefinition {
                 id: "verifier".to_owned(),
                 role_id: RoleDefinitionId::new("verifier"),
+                consumed_artifact_types: vec!["candidate".to_owned()],
+                produced_artifact_types: vec!["verification_report".to_owned()],
             },
         ],
         transitions: vec![WorkflowTransitionDefinition {
             from_node: "implementer".to_owned(),
             to_node: "verifier".to_owned(),
-            condition: "CandidateCreated".to_owned(),
+            condition: TransitionCondition::CandidateCreated,
+            required_artifact_types: vec!["candidate".to_owned()],
         }],
         default_budget: ExecutionBudget::default(),
         content_hash: "v1-default-hash".to_owned(),

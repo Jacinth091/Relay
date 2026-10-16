@@ -135,9 +135,9 @@ pub use workflow::{
     ApprovedIntent, ApprovedIntentId, ClarificationRequest, ConfigSnapshot, ConfigSnapshotId,
     DecisionRequest, ExecutionBudget, ExecutionGrant, ExecutionGrantId, ExecutionTarget,
     RoleAttempt, RoleAttemptId, RoleAttemptState, RoleDefinition, RoleDefinitionId, RoleInstance,
-    RoleInstanceId, RoleInstanceState, RoleWriteMode, ScopeExpansionRequest, WorkflowDefinition,
-    WorkflowDefinitionId, WorkflowError, WorkflowNodeDefinition, WorkflowRun, WorkflowRunId,
-    WorkflowRunState, WorkflowTransitionDefinition,
+    RoleInstanceId, RoleInstanceState, RoleWriteMode, ScopeExpansionRequest, TransitionCondition,
+    WorkflowDefinition, WorkflowDefinitionId, WorkflowError, WorkflowNodeDefinition, WorkflowRun,
+    WorkflowRunId, WorkflowRunState, WorkflowTransitionDefinition,
 };
 
 /// Minimal Relay application state.

@@ -1,5 +1,11 @@
 # Security Model
 
+> **Architecture generation note:** this document describes the original (v1)
+> security model. Relay Architecture v2 (ADR-0020) is accepted and partially
+> implemented, including truthfulness requirements about what Relay actually
+> enforces vs. advises; see `docs/v2_architecture_rebaseline/` and
+> `docs/v2_architecture_rebaseline/ROADMAP.md` for current per-phase status.
+
 Relay launches coding tools that can modify local repositories.
 
 Security is a core feature.

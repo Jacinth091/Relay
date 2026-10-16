@@ -82,9 +82,23 @@ pub(crate) async fn persist_imported_task(
     store: &SqliteStore,
     task: &ImportedTask,
 ) -> Result<StoredTask, TaskPersistenceError> {
+    record_to_stored_task(store.insert_task(&new_task_record(task)?).await?)
+}
+
+/// Persists an imported task idempotently: replaying the same task id (e.g.
+/// a daemon command retried after a crash) returns the existing row instead
+/// of erroring or duplicating the `task_ready` event.
+pub(crate) async fn persist_imported_task_if_absent(
+    store: &SqliteStore,
+    task: &ImportedTask,
+) -> Result<StoredTask, TaskPersistenceError> {
+    record_to_stored_task(store.insert_task_if_absent(&new_task_record(task)?).await?)
+}
+
+fn new_task_record(task: &ImportedTask) -> Result<NewTaskRecord, TaskPersistenceError> {
     let handoff = task.handoff();
     let source = handoff.source.as_ref();
-    let record = NewTaskRecord {
+    Ok(NewTaskRecord {
         id: task.id().to_string(),
         project_key: task.project_key().as_str().to_owned(),
         title: handoff.title.clone(),
@@ -95,9 +109,7 @@ pub(crate) async fn persist_imported_task(
         state: TaskState::Ready.as_str().to_owned(),
         protocol_version: i64::from(handoff.protocol_version),
         handoff_json: serde_json::to_string(handoff)?,
-    };
-
-    record_to_stored_task(store.insert_task(&record).await?)
+    })
 }
 
 pub async fn get_stored_task(

@@ -5,9 +5,14 @@
 pub mod artifact;
 pub mod candidate;
 pub mod daemon;
+#[cfg(windows)]
+pub mod daemon_runtime;
+#[cfg(windows)]
+pub mod daemon_transport;
 pub mod decision;
 pub mod delegation;
 mod durable_state;
+pub mod effect_worker;
 pub mod exchange;
 mod execution;
 mod execution_planning;
@@ -45,6 +50,12 @@ pub use daemon::{
     DaemonRequest, DaemonResponse, DaemonServer, DaemonSnapshot, DaemonTaskSummary,
     InProcessDaemonClient,
 };
+#[cfg(windows)]
+pub use daemon_runtime::{
+    DaemonClientHandle, EmbeddedDaemon, connect_or_embed, new_command_id, run_full_daemon,
+};
+#[cfg(windows)]
+pub use daemon_transport::{NamedPipeDaemonClient, default_pipe_name};
 pub use decision::{
     ChoiceProbability, DecisionAuditRecord, DecisionChoice, DecisionEngineId, DecisionFuture,
     DecisionManager, DecisionManagerConfig, DecisionOutcome, DecisionResolution,
@@ -62,6 +73,7 @@ pub use durable_state::{
     get_stored_task, list_stored_tasks, list_stored_tasks_with_quarantined,
     update_stored_task_state,
 };
+pub use effect_worker::{EffectHandler, EffectOutcome, EffectWorkerRegistry, run_effect_worker};
 pub use exchange::{
     ExchangeError, ExchangeMessage, ExchangeMessageId, ExchangeMessageKind, ExchangeOperation,
     IssueCapabilityRequest, PublishResultRequest, RelayExchange, RoleInbox, RoleSessionCapability,
@@ -104,6 +116,7 @@ pub use project_registry::{
 pub use recovery_v2::{
     AttemptReconciliation, CandidateIntegrity, RecoveryCoordinator, RecoveryError, RecoveryReport,
 };
+pub use relay_store::PendingEffectRecord;
 pub use repository_safety::{
     BranchState, GitInspectionOperation, NormalizedRemote, RepositoryEligibility,
     RepositoryInspection, RepositorySafetyFailure, RepositoryStatus,

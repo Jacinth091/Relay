@@ -1,5 +1,12 @@
 # Architecture
 
+> **Architecture generation note:** this document describes the original (v1)
+> architecture. Relay Architecture v2 (ADR-0020) is accepted and partially
+> implemented; see `docs/v2_architecture_rebaseline/` and
+> `docs/v2_architecture_rebaseline/ROADMAP.md` for the current, per-phase
+> truth about what has actually cut over. Where the two disagree, the v2
+> ROADMAP is authoritative for current behavior.
+
 ## Architectural Statement
 
 Relay is **one local handoff engine** with replaceable planner integrations, ingresses, runtimes, stacks, and presentation clients.

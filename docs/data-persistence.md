@@ -120,15 +120,30 @@ Database schema version and Relay protocol versions are separate.
 
 ## Multi-Process Access
 
-Relay supports concurrent access to the same local database file from exactly
-two writer classes: the TUI and the `relay serve-mcp` process (implemented,
-M9). Anything more (additional writer processes, networked/shared databases)
-is out of scope until re-examined.
+> **v2 status (2026-09-18):** this section previously described the current
+> (v1/M9) topology as final. It is being superseded by the Relay Architecture
+> v2 daemon model (ADR-0020); see `docs/v2_architecture_rebaseline/ROADMAP.md`
+> Phase 01 and `REMEDIATION-WAVES.md` Wave A for the in-progress cutover.
+> The v1 description below remains accurate for the parts of Relay that have
+> not yet been cut over (notably the v1 Run/scheduler path — see Wave B), but
+> it is no longer the target end-state for task submission/mutation.
 
-This two-process behavior is proven by tests: interleaved writes across two
-store handles on one database file, busy-timeout retry under contention, and
-compare-and-set loser rejection (M9 phase 02). It does not claim anything
-beyond what those tests cover.
+Historically (v1/M9), Relay supported concurrent access to the same local
+database file from exactly two writer classes: the TUI and the
+`relay serve-mcp` process. That two-process behavior was proven by tests:
+interleaved writes across two store handles on one database file, busy-timeout
+retry under contention, and compare-and-set loser rejection (M9 phase 02). It
+does not claim anything beyond what those tests cover.
+
+Under Relay Architecture v2, the **daemon (`relay daemon`) is the sole
+canonical semantic writer**. TUI and `relay serve-mcp` become `DaemonClient`
+consumers for durable mutations (submitting commands such as
+`SubmitHandoff`) and keep local read-only `SqliteStore` handles only for
+reading snapshots/history. Direct production writes from TUI/MCP are being
+removed as part of Wave A. The one known, intentional exception during the
+transition is the v1 `ExecutionScheduler` Run path (task execution state),
+which still writes directly to the store pending the Wave B v2 orchestrator
+cutover (R12-02) — this is a tracked gap, not an oversight.
 
 Every Relay connection sets:
 

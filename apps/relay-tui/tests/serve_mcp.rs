@@ -23,13 +23,30 @@ fn unique_temp_prefix(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("relay-serve-mcp-{name}-{nanos}"))
 }
 
+/// Named pipes are a single OS-wide namespace, unlike per-test temp
+/// directories, so every spawned `relay` process must get a pipe name
+/// derived from its own isolated database path. Two sequential invocations
+/// against the *same* database path (deliberately, in the lifecycle test)
+/// get the same derived name, which is correct: each process only embeds a
+/// daemon for its own lifetime, never overlapping. Only a bare suffix
+/// crosses the environment variable boundary (never a full `\\.\pipe\...`
+/// path) - see `default_pipe_name`'s doc comment in `relay_core`.
+fn pipe_suffix_for(database_path: &std::path::Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    database_path.hash(&mut hasher);
+    format!("relay-test-{:x}", hasher.finish())
+}
+
 fn spawn_relay_isolated(name: &str) -> Child {
     let prefix = unique_temp_prefix(name);
+    let database_path = prefix.join("state.sqlite3");
     let mut command = Command::new(env!("CARGO_BIN_EXE_relay"));
     command
         .args(["serve-mcp"])
         .env("RELAY_CONFIG_PATH", prefix.join("config.toml"))
-        .env("RELAY_DATABASE_PATH", prefix.join("state.sqlite3"))
+        .env("RELAY_DAEMON_PIPE_SUFFIX", pipe_suffix_for(&database_path))
+        .env("RELAY_DATABASE_PATH", database_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -155,6 +172,7 @@ fn spawn_interactive(
     command
         .args(["serve-mcp"])
         .env("RELAY_CONFIG_PATH", config_path)
+        .env("RELAY_DAEMON_PIPE_SUFFIX", pipe_suffix_for(database_path))
         .env("RELAY_DATABASE_PATH", database_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

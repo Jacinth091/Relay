@@ -7,8 +7,8 @@
 
 use super::*;
 use relay_core::{
-    MAX_LOCAL_TASK_INPUT_BYTES, ProjectRegistry, ProjectRegistryError, RegisterProject,
-    TaskIngressError, TaskPersistenceError, TaskState, list_stored_tasks, update_stored_task_state,
+    DaemonError, DaemonServer, InProcessDaemonClient, MAX_LOCAL_TASK_INPUT_BYTES, ProjectRegistry,
+    ProjectRegistryError, RegisterProject, TaskIngressError, TaskState, list_stored_tasks,
 };
 use relay_protocol::ProtocolError;
 use serde_json::json;
@@ -41,10 +41,26 @@ fn relay_with_project(key: &str) -> Relay {
 }
 
 async fn test_server() -> McpServer {
-    McpServer::new(
-        relay_with_project("relay"),
-        SqliteStore::in_memory().await.unwrap(),
+    let relay = relay_with_project("relay");
+    let store = SqliteStore::in_memory().await.unwrap();
+    let daemon = embedded_daemon_for(&store, &relay).await;
+    McpServer::new(relay, store, daemon)
+}
+
+/// Builds an in-process daemon client over `store`, mirroring what
+/// `connect_or_embed` gives production `serve-mcp` when no daemon is already
+/// running. `relay`'s project registry must match the client-side one used
+/// for preview, since the daemon re-resolves the project independently.
+async fn embedded_daemon_for(store: &SqliteStore, relay: &Relay) -> DaemonClientHandle {
+    let server = DaemonServer::start(
+        store.clone(),
+        relay.clone(),
+        "mcp-test-daemon",
+        std::time::Duration::from_secs(60),
     )
+    .await
+    .unwrap();
+    DaemonClientHandle::InProcess(InProcessDaemonClient::new(std::sync::Arc::new(server)))
 }
 
 async fn exchange(server: &mut McpServer, raw: &str) -> Option<Value> {
@@ -230,27 +246,14 @@ fn error_code_mapping_table_is_stable() {
 }
 
 #[tokio::test]
-async fn persistence_store_failures_map_to_store_unavailable() {
-    let store = SqliteStore::in_memory().await.unwrap();
-    let error = update_stored_task_state(
-        &store,
-        relay_core::TaskId::new(),
-        TaskState::Ready,
-        TaskState::Done,
-    )
-    .await
-    .unwrap_err();
-    assert!(matches!(error, TaskPersistenceError::Store(_)));
-
-    let (code, message) = service::map_persistence_error(&error);
+async fn daemon_store_failures_map_to_store_unavailable() {
+    let (code, message) = service::map_daemon_error(&DaemonError::NotRunning);
     assert_eq!(code, protocol::STORE_UNAVAILABLE);
     assert!(!message.is_empty());
 
-    let non_store = TaskPersistenceError::UnknownTaskState {
-        state: "bogus".to_owned(),
-    };
+    let internal = DaemonError::Command("boom".to_owned());
     assert_eq!(
-        service::map_persistence_error(&non_store).0,
+        service::map_daemon_error(&internal).0,
         protocol::INTERNAL_ERROR
     );
 }

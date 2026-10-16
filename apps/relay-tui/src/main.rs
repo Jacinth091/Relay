@@ -33,7 +33,10 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
-use relay_core::{Relay, default_config_path, default_database_path};
+use relay_core::{
+    DEFAULT_LEASE_ID, DEFAULT_LEASE_TTL, Relay, connect_or_embed, default_config_path,
+    default_database_path, default_pipe_name,
+};
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -66,6 +69,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let database_path = default_database_path();
     let (store, durable_tasks, database_feedback) = bootstrap::open_store(&database_path).await;
+
+    let (daemon, embedded_daemon, daemon_feedback) = match &store {
+        Some(store) => match connect_or_embed(
+            store.clone(),
+            relay.clone(),
+            DEFAULT_LEASE_ID,
+            DEFAULT_LEASE_TTL,
+            &default_pipe_name(),
+        )
+        .await
+        {
+            Ok((handle, embedded)) => (Some(handle), embedded, String::new()),
+            Err(error) => (
+                None,
+                None,
+                format!(
+                    "Daemon error: {error}\nTask import is disabled until the daemon is reachable."
+                ),
+            ),
+        },
+        None => (None, None, String::new()),
+    };
+
+    let mut combined_feedback = format!("{feedback}\n{database_feedback}");
+    if !daemon_feedback.is_empty() {
+        combined_feedback.push('\n');
+        combined_feedback.push_str(&daemon_feedback);
+    }
+
     let mut state = AppState::new_with_store(
         relay,
         config_path,
@@ -73,14 +105,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         database_path,
         store,
         durable_tasks,
-        format!("{feedback}\n{database_feedback}"),
+        combined_feedback,
     );
+    state.attach_daemon(daemon);
     state.refresh_durable_tasks().await;
     state.begin_health_refresh(false);
     let mut terminal = initialize_terminal()?;
 
     let run_result = run(&mut terminal, &mut state).await;
     let restore_result = restore_terminal(&mut terminal);
+
+    if let Some(embedded) = embedded_daemon {
+        embedded.shutdown().await;
+    }
 
     run_result?;
     restore_result?;
@@ -114,7 +151,24 @@ async fn serve_mcp() -> Result<(), Box<dyn Error>> {
         error
     })?;
 
-    mcp::run(relay, store).await?;
+    let (daemon, embedded_daemon) = connect_or_embed(
+        store.clone(),
+        relay.clone(),
+        DEFAULT_LEASE_ID,
+        DEFAULT_LEASE_TTL,
+        &default_pipe_name(),
+    )
+    .await
+    .map_err(|error| {
+        eprintln!("relay: failed to connect to or embed the Relay daemon: {error}");
+        error
+    })?;
+
+    mcp::run(relay, store, daemon).await?;
+
+    if let Some(embedded) = embedded_daemon {
+        embedded.shutdown().await;
+    }
     Ok(())
 }
 
@@ -145,36 +199,23 @@ async fn run_daemon(lease_id: String, lease_ttl_secs: u64) -> Result<(), Box<dyn
     })?;
 
     let ttl = std::time::Duration::from_secs(lease_ttl_secs);
-    let mut daemon = relay_core::DaemonServer::start(store, relay, &lease_id, ttl)
-        .await
-        .map_err(|error| {
-            eprintln!("relay: failed to start daemon: {error}");
-            error
-        })?;
+    let (daemon, embedded) =
+        relay_core::run_full_daemon(store, relay, &lease_id, ttl, &default_pipe_name())
+            .await
+            .map_err(|error| {
+                eprintln!("relay: failed to start daemon: {error}");
+                error
+            })?;
 
     tracing::info!(
         lease_id = %lease_id,
         fencing_token = daemon.fencing_token(),
-        "Relay daemon running"
+        "Relay daemon running and serving requests"
     );
 
-    let heartbeat_interval = (ttl / 3).max(std::time::Duration::from_secs(1));
-    let mut interval = tokio::time::interval(heartbeat_interval);
-
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                if let Err(err) = daemon.heartbeat(ttl).await {
-                    tracing::error!(error = %err, "failed to renew daemon lease heartbeat");
-                    return Err(Box::new(err));
-                }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Relay daemon received shutdown signal");
-                break;
-            }
-        }
-    }
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("Relay daemon received shutdown signal");
+    embedded.shutdown().await;
 
     Ok(())
 }

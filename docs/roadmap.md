@@ -1,5 +1,9 @@
 # Roadmap
 
+> This is the pre-v2 (M1-M8.1) milestone ladder, kept for historical
+> reference. For Relay Architecture v2 phase status, see
+> `docs/v2_architecture_rebaseline/ROADMAP.md`.
+
 Milestone tracking has moved to the M-ladder (M1 through M8.1). See
 [docs/status-2026-08.md](status-2026-08.md) for a current end-to-end status
 summary and [docs/M8_1_PACK/RELAY_M8_1_SEQUENTIAL_IMPLEMENTATION_PACK/00-IMPLEMENTATION-SEQUENCE.md](M8_1_PACK/RELAY_M8_1_SEQUENTIAL_IMPLEMENTATION_PACK/00-IMPLEMENTATION-SEQUENCE.md)

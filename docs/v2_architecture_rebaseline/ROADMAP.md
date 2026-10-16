@@ -26,28 +26,45 @@
 
 ## 2. Implementation Sequence Status
 
+> **Status correction (2026-09-18):** the table below previously marked every phase `DONE`. An external governed review of PR #12 (fixed head `8fc1566d`) found that claim false against the phases' own exit gates — new v2 modules were largely built horizontally alongside the v1 store/scheduler/runtime topology rather than replacing it on the production path. The statuses below are reset to the audit's evidence-based assessment. See [REMEDIATION-WAVES.md](REMEDIATION-WAVES.md) for the ordered correction plan. Do not mark a phase `DONE` again until its exit gate is proven on the production path, not merely covered by a unit/integration test of an unwired module.
+
 Per [02-IMPLEMENTATION-SEQUENCE.md](02-IMPLEMENTATION-SEQUENCE.md):
 
-| Phase | Description | Status | Evidence / Deliverables |
+| Phase | Description | Status | Evidence-based assessment |
 |---|---|---|---|
-| **00** | **Governance Rebaseline & Historical Freeze** | **DONE** | ADR-0020 accepted, ADR-0017/0018 updated, M10 pack marked on-hold, v2 docs in-tree, roadmap established, preflight gates verified. |
-| **01** | **Canonical Daemon Ownership + Durable Effects / Events** | **DONE** | Single writer daemon process (`relay daemon`), client protocol (`DaemonRequest`/`DaemonResponse`), durable command idempotency, `PendingEffect`/`EffectResult` lifecycle, `EventRecord` monotonic sequencing, snapshot sync, lease fencing tokens + heartbeat renewal, full workspace tests PASS. |
-| **02** | **Project / Checkout / Trust Foundation** | **DONE** | `DeclaredProjectIdentity`, `TrustedProjectRegistration`, `CheckoutId`, `RemoteFingerprint`, `Checkout`, `.relay/` portable config loader (`PortableRepositoryConfig`), security tests for hijack prevention, path injection rejection, remote mismatch fail-closed, and policy clamping. Full workspace tests PASS. |
-| **03** | **Approved Intent, Execution Grant, Workflow, Roles, Policy** | **DONE** | `ApprovedIntent`, `ExecutionGrant`, `WorkflowRun`, `RoleInstance`, `RoleAttempt`, `ScopeExpansionRequest`, multi-layer policy compiler (`safety floor ∩ user ∩ project ∩ repo ∩ role`). Legacy adapter for `HandoffTask v1` (generation 1, single implementer node). Integration tests passing with 0 warnings. |
-| **04** | **Repository / Worktree, Candidate, Lease, Artifact Foundation** | **DONE** | Isolated worktrees (`WorktreeManager`), boundary traversal rejection, `Candidate` generation with full repo fingerprint (`base_head`, `current_head`, `index_digest`, `tracked_diff_digest`, `relevant_untracked_digest`), verification invalidation on manual mutations, monotonic `Lease` fencing tokens, immutable content-addressed `ArtifactStore` with tamper detection. Full workspace tests PASS. |
-| **05** | **Deterministic End-to-End Tracer Bullet (FakeBackplane)** | **DONE** | Implementer -> `Candidate 1` -> Verifier (FAIL) -> Remediation loop -> `Candidate 2` -> fresh Verifier (PASS) -> COMPLETE verified end-to-end. Process success alone does not complete role, candidate mutations break verification, budget caps attempts, cancellation leaves truthful state. Full workspace tests PASS. |
-| **06** | **RuntimeBackplane + LocalProcessBackplane** | **DONE** | Decoupled `RuntimeBackplane` seam (`provision`, `observe`, `send`, `interrupt`, `dispose`, `snapshot`, `reconcile`), async-safe `LocalProcessBackplane` with streaming I/O limits, and `FakeBackplane`. Integration tests passing with 0 warnings, full workspace tests PASS. |
-| **07** | **HerdrBackplane One-Role Vertical Slice** | **DONE** | Herdr client and transport protocol, capability negotiation and version checks, private internal topology planner (`Checkout -> Workspace`, `Task -> Tab`, `RoleAttempt -> Pane`), Relay metadata tags without secret exposure, `RuntimeBindingStore`, manual user intervention detection, bounded output capture, fake Herdr protocol test suite passing with 0 warnings, full workspace tests PASS. |
-| **08** | **Provider Adapters, Execution Targets, Resolver, Fallback** | **DONE** | `ProviderAdapter` contract, deterministic resolver, immutable `ExecutionTarget`, provider retry/fallback, Codex + Mock adapters, 8 integration tests passing cleanly. |
-| **09** | **Relay Exchange + Role-Session Capabilities** | **DONE** | Typed role communication (`ExchangeMessage`, `RoleInbox`), attempt-scoped ephemeral capability tokens (`RoleSessionCapability`), cross-task & cross-project isolation, structured result validation & candidate binding, provenance preservation (`ProviderClaim` vs `RelayObserved`), materialized session projection without secret token leakage, atomic outbox consumption. |
-| **10** | **Delegation, Consultation, Budgets, Deadlock Prevention** | **DONE** | Role dependency graph, deadlock/cycle detection, execution budget deduction, consultation read-only write protection, bounded delegation depth & count, cancellation cascade across children. |
-| **11** | **Multi-Project / Provider Scheduler v2** | **DONE** | Multi-project fair scheduling with starvation-preventing aging weight, global & per-project limits, exclusive checkout write serialization, provider capacity tracking & instant release, cancellation isolation across queues. |
-| **12** | **Web UI + Relay TUI as Daemon Clients** | **DONE** | `DaemonClient` trait, `InProcessDaemonClient`, version-negotiating handshake, multi-client state agreement, monotonic event catch-up, persistent state preservation across disconnects, 3 integration tests passing. |
-| **13** | **Privileged Action Executor + Exact Approvals** | **DONE** | `ApprovalRequest`/`ApprovalGrant`, SHA-256 parameter hashing, replay protection, deterministic executor, `GitOperationRunner`, 6 integration tests passing. |
-| **14** | **SemanticDecisionEngine + Optional Jev Shadow Mode** | **DONE** | Provider-neutral `SemanticDecisionEngine` interface (`Recommend \| Abstain \| Escalate`), `DecisionManager` with shadow mode, `RuleDecisionEngine`, `FakeDecisionEngine`, optional `JevDecisionAdapter`, 6 integration tests passing. |
-| **15** | **Integrated Recovery, Retention, Security Truthfulness, Docs Cutover** | **DONE** | Crash recovery with pending effect reconciliation, lease fencing verification, candidate working-tree integrity invalidation, `RetentionManager` with safe worktree pruning and expired artifact collection, 5 integration tests passing. |
+| **00** | **Governance Rebaseline & Historical Freeze** | **PARTIAL** | ADR-0020 and v2 docs exist, but current-status docs and scope claims conflicted (being corrected in this pass). |
+| **01** | **Canonical Daemon Ownership + Durable Effects / Events** | **PARTIAL (Wave A landed)** | Wave A is implemented: `relay daemon` now runs a real Windows named-pipe request listener (not just a lease heartbeat), TUI and `relay serve-mcp` submit task creation through a `DaemonClient` (`connect_or_embed`) instead of writing `SqliteStore` directly, commands are crash-safe (deterministic task ids derived from the command id, idempotent inserts, `needs_reconciliation` for corrupted payloads, startup reconciliation), and a daemon-owned effect worker reconciles stale `in_flight` effects. Still **not DONE**: the v1 `ExecutionScheduler` Run path is unchanged and still writes directly to the store (Wave B / R12-02), and no v2 aggregate beyond commands/effects/leases is durable yet (by design - nothing on the corrected path needs it yet). |
+| **02** | **Project / Checkout / Trust Foundation** | **PARTIAL / GATE FAIL** | Core types and portable config exist; trusted classification does not yet prove expected-remote match end-to-end. Not in Wave A scope. |
+| **03** | **Approved Intent, Execution Grant, Workflow, Roles, Policy** | **PARTIAL / GATE FAIL** | Basic types exist; validation/policy contract incomplete and canonical state is not durable. Not in Wave A scope. |
+| **04** | **Repository / Worktree, Candidate, Lease, Artifact Foundation** | **PARTIAL / UNSAFE** | Useful foundations exist; digest and lease/fencing contracts are invalid and durability is incomplete. Not in Wave A scope. |
+| **05** | **Deterministic End-to-End Tracer Bullet (FakeBackplane)** | **NOT IMPLEMENTED AS SPECIFIED** | Existing test simulates state/files manually; no FakeBackplane + daemon/store + restart vertical slice yet. Not in Wave A scope. |
+| **06** | **RuntimeBackplane + LocalProcessBackplane** | **PARTIAL** | Seam and adapters exist; containment, environment, and idempotency semantics need hardening. Not in Wave A scope. |
+| **07** | **HerdrBackplane One-Role Vertical Slice** | **PARTIAL / TEST-ONLY** | Topology/client abstractions exist; production transport and durable RuntimeBinding recovery are absent. Not in Wave A scope. |
+| **08** | **Provider Adapters, Execution Targets, Resolver, Fallback** | **PARTIAL / SEMANTIC BUG** | Codex + mock resolver foundation exists; process exit success is conflated with semantic result publication. Not in Wave A scope. |
+| **09** | **Relay Exchange + Role-Session Capabilities** | **PARTIAL / PROTOTYPE** | Capability/result logic exists; communication is memory-only and outbox ingestion is not crash-idempotent. Not in Wave A scope. |
+| **10** | **Delegation, Consultation, Budgets, Deadlock Prevention** | **PARTIAL** | Algorithms/tests exist; state/budgets are memory-only and not restart-recoverable. Not in Wave A scope. |
+| **11** | **Multi-Project / Provider Scheduler v2** | **PARTIAL** | Fairness/capacity algorithm exists; queues/allocations are memory-only and real leases are not used. Not in Wave A scope. |
+| **12** | **Web UI + Relay TUI as Daemon Clients** | **NOT IMPLEMENTED AS SPECIFIED** | No Web app; tests used `InProcessDaemonClient` only. Wave A wires TUI/MCP task submission through a real `DaemonClient`, but the Web UI itself is out of scope until Waves A-E are accepted (see remediation policy). |
+| **13** | **Privileged Action Executor + Exact Approvals** | **PARTIAL / SECURITY BUG** | Typed actions + SHA-256 exist; checkout binding and durable replay/audit are missing. Not in Wave A scope. |
+| **14** | **SemanticDecisionEngine + Optional Jev Shadow Mode** | **FOUNDATION ONLY** | Decision seam/fakes exist and Jev safely degrades, but decision audit/integration is memory-only and upstream v2 path is not operational. Not in Wave A scope. |
+| **15** | **Integrated Recovery, Retention, Security Truthfulness, Docs Cutover** | **NOT IMPLEMENTED AS GATE** | Small recovery/retention tests exist; recovery/cleanup logic has correctness defects, failure matrix is incomplete, and docs cutover did not happen (this pass begins the docs correction only). Not in Wave A scope. |
 
 ---
+
+## 2a. Governed Audit Findings (Wave Tracking)
+
+A governed external review of PR #12 (fixed head `8fc1566d`) produced 19 P1 findings grouped into 6 dependency waves. Full source material and one detailed correction plan per finding are archived outside this repository; the wave structure and Wave A scope are recorded in-tree at [REMEDIATION-WAVES.md](REMEDIATION-WAVES.md) so later work has an authoritative in-repo reference instead of relying on an out-of-band review.
+
+| Wave | Theme | Status |
+|---|---|---|
+| **A** | Restore architectural truth and one owner (docs truth, daemon ownership, command/effect idempotency, durable v2 state) | **LANDED** (re-review pending; see acceptance checklist in REMEDIATION-WAVES.md) |
+| **B** | Establish a real v2 execution vertical slice (trust classification, workflow/policy contracts, integrity digests, lease fencing, Run-path cutover) | **NOT STARTED** |
+| **C** | Harden runtime/provider semantics (process containment, exit-vs-result semantics, Herdr production backplane) | **NOT STARTED** |
+| **D** | Make orchestration durable/recoverable (Exchange, delegation/scheduler v2, policy enforcement truthfulness) | **NOT STARTED** |
+| **E** | Privilege and failure correctness (approval binding, startup recovery uncertainty, retention safety) | **NOT STARTED** |
+| **F** | User surfaces and final acceptance (exact-head quality-gate evidence) | **NOT STARTED** |
+
+Do not implement the Phase 12 Web UI merely to make this table look complete while Waves B-E are outstanding — see the remediation policy in `REMEDIATION-WAVES.md`.
 
 ## 3. Preserved Invariants & Boundary Commitments
 

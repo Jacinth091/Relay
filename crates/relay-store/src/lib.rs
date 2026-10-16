@@ -272,6 +272,79 @@ impl SqliteStore {
         Ok(task)
     }
 
+    /// Inserts a task only if its id is not already present, returning the
+    /// existing row unchanged on a replay instead of erroring or duplicating
+    /// the `task_ready` event. Used by daemon command replay so that
+    /// resuming a non-terminal command after a crash is idempotent.
+    pub async fn insert_task_if_absent(
+        &self,
+        task: &NewTaskRecord,
+    ) -> Result<TaskRecord, StoreError> {
+        retry_on_transient_lock(|| self.insert_task_if_absent_once(task)).await
+    }
+
+    async fn insert_task_if_absent_once(
+        &self,
+        task: &NewTaskRecord,
+    ) -> Result<TaskRecord, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        let result = sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO tasks (
+                id,
+                project_key,
+                title,
+                requested_stack,
+                submission_transport,
+                source_kind,
+                source_provider,
+                state,
+                protocol_version,
+                handoff_json
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+        )
+        .bind(&task.id)
+        .bind(&task.project_key)
+        .bind(&task.title)
+        .bind(task.requested_stack.as_deref())
+        .bind(&task.submission_transport)
+        .bind(task.source_kind.as_deref())
+        .bind(task.source_provider.as_deref())
+        .bind(&task.state)
+        .bind(task.protocol_version)
+        .bind(&task.handoff_json)
+        .execute(&mut *transaction)
+        .await?;
+
+        if result.rows_affected() > 0 {
+            sqlx::query(
+                r#"
+                INSERT INTO events (task_id, event_kind, event_json)
+                VALUES (?1, ?2, ?3)
+                "#,
+            )
+            .bind(&task.id)
+            .bind("task_ready")
+            .bind(format!(
+                r#"{{"submission_transport":"{}"}}"#,
+                task.submission_transport
+            ))
+            .execute(&mut *transaction)
+            .await?;
+        }
+
+        let task = fetch_task(&mut *transaction, &task.id)
+            .await?
+            .ok_or_else(|| StoreError::TaskMissingAfterInsert {
+                id: task.id.clone(),
+            })?;
+        transaction.commit().await?;
+        Ok(task)
+    }
+
     /// Append a bounded, structured event without exposing the SQL event table
     /// to Core callers. Event payloads are caller-validated JSON strings.
     pub async fn append_event(
@@ -956,6 +1029,45 @@ impl SqliteStore {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Lists commands that have not reached a terminal status (`applied` or
+    /// `failed`), for startup reconciliation after a crash or restart.
+    pub async fn list_incomplete_commands(&self) -> Result<Vec<CommandRecord>, StoreError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, command_type, payload_json, status, response_json, created_at, updated_at
+            FROM commands
+            WHERE status IN ('received', 'needs_reconciliation')
+            ORDER BY created_at ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(CommandRecord {
+                    id: r.try_get("id")?,
+                    command_type: r.try_get("command_type")?,
+                    payload_json: r.try_get("payload_json")?,
+                    status: r.try_get("status")?,
+                    response_json: r.try_get("response_json")?,
+                    created_at: r.try_get("created_at")?,
+                    updated_at: r.try_get("updated_at")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Counts commands currently in the given status, for operator/test
+    /// visibility (e.g. how many are stuck `needs_reconciliation`).
+    pub async fn count_commands_with_status(&self, status: &str) -> Result<i64, StoreError> {
+        let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM commands WHERE status = ?1")
+            .bind(status)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
     pub async fn get_command(&self, id: &str) -> Result<Option<CommandRecord>, StoreError> {
         let row = sqlx::query(
             r#"
@@ -1029,9 +1141,11 @@ impl SqliteStore {
         &self,
         effect: &NewPendingEffectRecord,
     ) -> Result<PendingEffectRecord, StoreError> {
+        // OR IGNORE makes replaying the same QueuePendingEffect command (same
+        // effect id) after a crash idempotent instead of erroring.
         sqlx::query(
             r#"
-            INSERT INTO pending_effects (id, effect_type, idempotency_key, payload_json, state)
+            INSERT OR IGNORE INTO pending_effects (id, effect_type, idempotency_key, payload_json, state)
             VALUES (?1, ?2, ?3, ?4, 'pending')
             "#,
         )
@@ -1116,6 +1230,31 @@ impl SqliteStore {
         rows.into_iter().map(row_to_pending_effect_record).collect()
     }
 
+    /// Lists effects stuck `in_flight` for at least `stale_seconds`, for the
+    /// effect worker to reconcile after a crash (nothing resumed them).
+    /// Comparison happens in SQL against the store's own ISO-8601 timestamps,
+    /// which sort lexicographically in time order, rather than parsing
+    /// timestamps back out in application code.
+    pub async fn list_stale_in_flight_effects(
+        &self,
+        stale_seconds: i64,
+    ) -> Result<Vec<PendingEffectRecord>, StoreError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, effect_type, idempotency_key, payload_json, state, attempts, last_error, created_at, updated_at
+            FROM pending_effects
+            WHERE state = 'in_flight'
+              AND updated_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1 || ' seconds')
+            ORDER BY updated_at ASC
+            "#,
+        )
+        .bind(format!("-{stale_seconds}"))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_pending_effect_record).collect()
+    }
+
     pub async fn update_effect_state(
         &self,
         id: &str,
@@ -1175,9 +1314,12 @@ impl SqliteStore {
     ) -> Result<EffectResultRecord, StoreError> {
         let mut transaction = self.pool.begin().await?;
 
+        // OR IGNORE makes replaying the same CompleteEffect command (same
+        // result id) after a crash idempotent: the subsequent SELECT below
+        // still finds the row committed by the original attempt.
         sqlx::query(
             r#"
-            INSERT INTO effect_results (id, effect_id, outcome, result_json)
+            INSERT OR IGNORE INTO effect_results (id, effect_id, outcome, result_json)
             VALUES (?1, ?2, ?3, ?4)
             "#,
         )

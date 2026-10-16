@@ -1,7 +1,7 @@
 # Installation
 
 > [!NOTE]
-> Relay is not implemented yet. This document describes the intended installation experience and is a product/UX target, not a claim that release packages already exist.
+> This page describes **future release installation goals**, not currently published installer packages. The default branch contains an experimental Rust TUI prototype; to build and run it today, use [DEVELOPMENT.md](DEVELOPMENT.md). The capabilities below are not a promise that a packaged or production-ready release exists.
 
 ## Goal
 

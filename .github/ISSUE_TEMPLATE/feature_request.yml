@@ -1,0 +1,27 @@
+name: Idea or feature request
+description: Propose a small, practical improvement to this experimental project.
+title: "idea: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: "Ideas are welcome, but this is a personal hobby/development project. There is no roadmap or implementation commitment."
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe your actual workflow and obstacle.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help?
+      description: Include a simple approach and why existing functionality is not sufficient.
+    validations:
+      required: true
+  - type: textarea
+    id: implications
+    attributes:
+      label: Compatibility or safety considerations (optional)
+      description: Note any changes to approved intent, runtime/provider boundaries, security, or persistence.

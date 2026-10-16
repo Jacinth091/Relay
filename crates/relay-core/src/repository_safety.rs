@@ -260,6 +260,24 @@ fn inspect_trusted_project_repository_with_env(
     RepositoryInspection::eligible(project, expected, actual, status)
 }
 
+/// Reads the actual `remote.origin.url` from a local checkout repository using git inspection.
+pub fn read_repository_remote_origin(
+    path: &Path,
+) -> Result<Option<String>, RepositorySafetyFailure> {
+    ensure_git_available()?;
+    ensure_worktree(path, &[])?;
+    match git_output(
+        Some(path),
+        GitInspectionOperation::RemoteUrl,
+        ["config", "--local", "--get", "remote.origin.url"],
+        &[],
+    ) {
+        Ok(remote) if !remote.trim().is_empty() => Ok(Some(remote.trim().to_owned())),
+        Ok(_) | Err(GitOutputError::CommandFailed { .. }) => Ok(None),
+        Err(error) => Err(error.into_failure(GitInspectionOperation::RemoteUrl)),
+    }
+}
+
 fn ensure_git_available() -> Result<(), RepositorySafetyFailure> {
     let output = git_output(None, GitInspectionOperation::Version, ["--version"], &[])
         .map_err(|_| RepositorySafetyFailure::GitUnavailable)?;

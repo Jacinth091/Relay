@@ -10,9 +10,12 @@ use std::{sync::Arc, time::Duration};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{Relay, SqliteStore, StoredTask, durable_state::list_stored_tasks};
+use crate::{
+    Relay, SqliteStore, StoredTask, SubmissionTransport, TaskId, durable_state::list_stored_tasks,
+};
 use relay_store::{
-    DaemonLeaseRecord, EventRecord, NewPendingEffectRecord, PendingEffectRecord, StoreError,
+    CommandRecord, DaemonLeaseRecord, EventRecord, NewPendingEffectRecord, PendingEffectRecord,
+    StoreError,
 };
 
 pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
@@ -37,6 +40,10 @@ pub enum DaemonError {
     Command(String),
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("no daemon is currently running")]
+    NotRunning,
+    #[error("daemon transport error: {0}")]
+    Transport(String),
 }
 
 /// A client request sent to the Relay Daemon.
@@ -198,6 +205,10 @@ pub struct DaemonSnapshot {
     pub tasks: Vec<DaemonTaskSummary>,
     pub pending_effects: Vec<DaemonPendingEffect>,
     pub fencing_token: i64,
+    /// Commands whose payload could not be safely replayed during startup
+    /// reconciliation (e.g. corrupted JSON) and were parked instead of
+    /// silently left stuck. Should be `0` under healthy operation.
+    pub stuck_commands_needing_reconciliation: i64,
 }
 
 /// The Relay Daemon server managing the single-writer database lease,
@@ -205,7 +216,11 @@ pub struct DaemonSnapshot {
 pub struct DaemonServer {
     store: SqliteStore,
     relay: Arc<Relay>,
-    lease_record: DaemonLeaseRecord,
+    // A std Mutex (not tokio's) because it is only ever held briefly across a
+    // plain field read/write, never across an `.await` point. This lets the
+    // server be shared behind an `Arc` (request handling and the lease
+    // heartbeat run concurrently) while `heartbeat` still only needs `&self`.
+    lease_record: std::sync::Mutex<DaemonLeaseRecord>,
 }
 
 impl DaemonServer {
@@ -236,7 +251,7 @@ impl DaemonServer {
         Ok(Self {
             store,
             relay: Arc::new(relay),
-            lease_record,
+            lease_record: std::sync::Mutex::new(lease_record),
         })
     }
 
@@ -244,18 +259,47 @@ impl DaemonServer {
         &self.store
     }
 
+    pub fn lease_id(&self) -> String {
+        self.lease_record
+            .lock()
+            .expect("lease record lock poisoned")
+            .lease_id
+            .clone()
+    }
+
     pub fn fencing_token(&self) -> i64 {
-        self.lease_record.fencing_token
+        self.lease_record
+            .lock()
+            .expect("lease record lock poisoned")
+            .fencing_token
+    }
+
+    /// Releases the daemon lease this process holds, so a subsequent process
+    /// does not have to wait out the full TTL before it can become the
+    /// daemon. Safe to call only after the heartbeat loop has stopped (a
+    /// concurrent heartbeat could otherwise re-acquire the row right after
+    /// this deletes it).
+    pub async fn release_lease(&self) -> Result<(), DaemonError> {
+        let lease_id = self.lease_id();
+        self.store
+            .release_daemon_lease(&lease_id, std::process::id() as i64)
+            .await?;
+        Ok(())
     }
 
     /// Renews the active lease heartbeat.
-    pub async fn heartbeat(&mut self, ttl: Duration) -> Result<(), DaemonError> {
+    pub async fn heartbeat(&self, ttl: Duration) -> Result<(), DaemonError> {
+        let lease_id = self.lease_id();
         let pid = std::process::id() as i64;
         let host = hostname();
-        self.lease_record = self
+        let renewed = self
             .store
-            .acquire_or_renew_daemon_lease(&self.lease_record.lease_id, pid, &host, ttl)
+            .acquire_or_renew_daemon_lease(&lease_id, pid, &host, ttl)
             .await?;
+        *self
+            .lease_record
+            .lock()
+            .expect("lease record lock poisoned") = renewed;
         Ok(())
     }
 
@@ -274,7 +318,7 @@ impl DaemonServer {
                 DaemonResponse::HandshakeAck {
                     daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
                     protocol_version: DAEMON_PROTOCOL_VERSION,
-                    fencing_token: self.lease_record.fencing_token,
+                    fencing_token: self.fencing_token(),
                 }
             }
             DaemonRequest::Ping => DaemonResponse::Pong,
@@ -304,6 +348,10 @@ impl DaemonServer {
             .await
             .map_err(|e| DaemonError::Command(e.to_string()))?;
         let pending_effects = self.store.list_pending_effects(None).await?;
+        let stuck_commands_needing_reconciliation = self
+            .store
+            .count_commands_with_status("needs_reconciliation")
+            .await?;
 
         Ok(DaemonSnapshot {
             latest_event_sequence,
@@ -312,53 +360,102 @@ impl DaemonServer {
                 .into_iter()
                 .map(DaemonPendingEffect::from)
                 .collect(),
-            fencing_token: self.lease_record.fencing_token,
+            fencing_token: self.fencing_token(),
+            stuck_commands_needing_reconciliation,
         })
     }
 
-    async fn execute_command(&self, command_id: String, command: DaemonCommand) -> DaemonResponse {
-        let command_type = match &command {
+    fn command_type_of(command: &DaemonCommand) -> &'static str {
+        match command {
             DaemonCommand::SubmitHandoff { .. } => "submit_handoff",
             DaemonCommand::UpdateTaskState { .. } => "update_task_state",
             DaemonCommand::QueuePendingEffect { .. } => "queue_pending_effect",
             DaemonCommand::CompleteEffect { .. } => "complete_effect",
-        };
+        }
+    }
+
+    async fn execute_command(&self, command_id: String, command: DaemonCommand) -> DaemonResponse {
+        let command_type = Self::command_type_of(&command);
 
         let payload_json = match serde_json::to_string(&command) {
             Ok(json) => json,
             Err(err) => return DaemonResponse::Error(err.to_string()),
         };
 
-        // Record command for idempotency
-        let is_new = match self
-            .store
-            .record_command(&command_id, command_type, &payload_json)
+        if let Err(err) = self
+            .record_command_checked(&command_id, command_type, &payload_json)
             .await
         {
-            Ok(is_new) => is_new,
+            return DaemonResponse::Error(err.to_string());
+        }
+
+        self.resolve_command(&command_id, &command).await
+    }
+
+    /// Records a command for idempotency, failing closed if the same command
+    /// id was already recorded with a *different* payload (id reuse across
+    /// distinct requests must never be silently accepted as a duplicate).
+    async fn record_command_checked(
+        &self,
+        command_id: &str,
+        command_type: &str,
+        payload_json: &str,
+    ) -> Result<(), DaemonError> {
+        let is_new = self
+            .store
+            .record_command(command_id, command_type, payload_json)
+            .await?;
+
+        if !is_new {
+            if let Some(existing) = self.store.get_command(command_id).await? {
+                if existing.payload_json != payload_json {
+                    return Err(DaemonError::Command(format!(
+                        "command id {command_id} was already recorded with a different payload"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Resolves a recorded command to a terminal outcome. Terminal commands
+    /// (`applied`/`failed`) return their cached result. Non-terminal commands
+    /// (`received`, or `needs_reconciliation` during startup reconciliation)
+    /// are (re-)applied now: this is safe because every mutation
+    /// `apply_command` performs is idempotent on the command id / deterministic
+    /// derived ids, so re-running it after a crash never duplicates the
+    /// underlying effect.
+    async fn resolve_command(&self, command_id: &str, command: &DaemonCommand) -> DaemonResponse {
+        let existing = match self.store.get_command(command_id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                return DaemonResponse::Error(format!(
+                    "command {command_id} vanished after being recorded"
+                ));
+            }
             Err(err) => return DaemonResponse::Error(err.to_string()),
         };
 
-        if !is_new {
-            // Already recorded, fetch existing result
-            if let Ok(Some(existing)) = self.store.get_command(&command_id).await {
+        match existing.status.as_str() {
+            "applied" | "failed" => {
                 return DaemonResponse::CommandResult {
-                    command_id,
+                    command_id: command_id.to_owned(),
                     status: CommandStatus::Duplicate,
                     result_json: existing.response_json,
                 };
             }
+            _ => {}
         }
 
-        // Execute command intent
-        match self.apply_command(&command).await {
+        match self.apply_command(command_id, command).await {
             Ok(result_json) => {
                 let _ = self
                     .store
-                    .complete_command(&command_id, "applied", result_json.as_deref())
+                    .complete_command(command_id, "applied", result_json.as_deref())
                     .await;
                 DaemonResponse::CommandResult {
-                    command_id,
+                    command_id: command_id.to_owned(),
                     status: CommandStatus::Applied,
                     result_json,
                 }
@@ -367,10 +464,10 @@ impl DaemonServer {
                 let err_str = err.to_string();
                 let _ = self
                     .store
-                    .complete_command(&command_id, "failed", Some(&err_str))
+                    .complete_command(command_id, "failed", Some(&err_str))
                     .await;
                 DaemonResponse::CommandResult {
-                    command_id,
+                    command_id: command_id.to_owned(),
                     status: CommandStatus::Failed,
                     result_json: Some(err_str),
                 }
@@ -378,31 +475,80 @@ impl DaemonServer {
         }
     }
 
-    async fn apply_command(&self, command: &DaemonCommand) -> Result<Option<String>, DaemonError> {
+    /// Scans for commands stuck in a non-terminal status (e.g. the daemon
+    /// crashed between `apply_command` succeeding and `complete_command`
+    /// being recorded) and resolves each one. A command whose payload cannot
+    /// be deserialized is parked as `needs_reconciliation` with a logged
+    /// reason instead of being silently left stuck or guessed at.
+    pub async fn reconcile_on_startup(&self) -> Result<(), DaemonError> {
+        let incomplete = self.store.list_incomplete_commands().await?;
+        for row in incomplete {
+            self.reconcile_one_command(&row).await;
+        }
+        Ok(())
+    }
+
+    async fn reconcile_one_command(&self, row: &CommandRecord) {
+        let command: DaemonCommand = match serde_json::from_str(&row.payload_json) {
+            Ok(command) => command,
+            Err(err) => {
+                tracing::error!(
+                    command_id = %row.id,
+                    error = %err,
+                    "daemon startup reconciliation: command payload cannot be safely replayed"
+                );
+                let reason = format!("payload deserialization failed: {err}");
+                let _ = self
+                    .store
+                    .complete_command(&row.id, "needs_reconciliation", Some(&reason))
+                    .await;
+                return;
+            }
+        };
+
+        let response = self.resolve_command(&row.id, &command).await;
+        if let DaemonResponse::CommandResult {
+            status: CommandStatus::Failed,
+            result_json,
+            ..
+        } = &response
+        {
+            tracing::error!(
+                command_id = %row.id,
+                result = ?result_json,
+                "daemon startup reconciliation: command re-application failed"
+            );
+        }
+    }
+
+    async fn apply_command(
+        &self,
+        command_id: &str,
+        command: &DaemonCommand,
+    ) -> Result<Option<String>, DaemonError> {
         match command {
             DaemonCommand::SubmitHandoff {
                 project_key: _,
                 handoff_json,
                 submission_transport,
             } => {
-                let candidate = match submission_transport.as_str() {
-                    "relay-mcp" => self.relay.preview_mcp_submission(handoff_json),
-                    "local-file" => {
-                        let path = std::path::Path::new(handoff_json);
-                        if path.is_file() {
-                            self.relay.preview_local_file(path)
-                        } else {
-                            self.relay.preview_local_paste(handoff_json)
-                        }
-                    }
-                    _ => self.relay.preview_local_paste(handoff_json),
-                }
-                .map_err(|e| DaemonError::Command(e.to_string()))?;
-
-                let imported = candidate.into_imported_task();
-                let stored = crate::durable_state::persist_imported_task(&self.store, &imported)
-                    .await
+                let transport =
+                    SubmissionTransport::parse(submission_transport).ok_or_else(|| {
+                        DaemonError::Command(format!(
+                            "unknown submission transport '{submission_transport}'"
+                        ))
+                    })?;
+                let candidate = self
+                    .relay
+                    .resolve_task_import_candidate(handoff_json, transport)
                     .map_err(|e| DaemonError::Command(e.to_string()))?;
+
+                let imported = candidate
+                    .into_imported_task_with_id(TaskId::deterministic_from_command_id(command_id));
+                let stored =
+                    crate::durable_state::persist_imported_task_if_absent(&self.store, &imported)
+                        .await
+                        .map_err(|e| DaemonError::Command(e.to_string()))?;
 
                 Ok(Some(
                     serde_json::json!({

@@ -13,12 +13,15 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use relay_store::SqliteStore;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
     CheckoutId, ProjectId, RoleAttemptId, RoleInstanceId, TaskId, WorkflowRunId,
-    candidate::LeaseId, policy::Capability,
+    candidate::{LeaseHolder, LeaseId, LeaseKind, LeaseResource},
+    durable_state::{acquire_durable_lease, release_durable_lease},
+    policy::Capability,
 };
 
 #[derive(Debug, Error)]
@@ -130,7 +133,6 @@ pub struct SchedulerV2 {
     project_queues: Arc<Mutex<HashMap<ProjectId, ProjectQueueState>>>,
     provider_trackers: Arc<Mutex<HashMap<String, ProviderCapacityTracker>>>,
     active_slots: Arc<Mutex<HashMap<String, ActiveExecutionSlot>>>,
-    exclusive_checkout_locks: Arc<Mutex<HashMap<CheckoutId, String>>>, // checkout_id -> slot_id
     current_tick: Arc<Mutex<u64>>,
 }
 
@@ -141,7 +143,6 @@ impl SchedulerV2 {
             project_queues: Arc::new(Mutex::new(HashMap::new())),
             provider_trackers: Arc::new(Mutex::new(HashMap::new())),
             active_slots: Arc::new(Mutex::new(HashMap::new())),
-            exclusive_checkout_locks: Arc::new(Mutex::new(HashMap::new())),
             current_tick: Arc::new(Mutex::new(0)),
         }
     }
@@ -155,126 +156,188 @@ impl SchedulerV2 {
 
     /// Advances the deterministic scheduler tick and schedules eligible tasks.
     /// Uses an aging algorithm so older tasks in busy projects don't starve.
-    pub fn schedule_next(&self) -> Vec<ActiveExecutionSlot> {
-        let mut tick = self.current_tick.lock().unwrap();
-        *tick += 1;
-        let current_tick_val = *tick;
-        drop(tick);
+    pub async fn schedule_next(&self, store: &SqliteStore) -> Vec<ActiveExecutionSlot> {
+        let current_tick_val = {
+            let mut tick = self.current_tick.lock().unwrap();
+            *tick += 1;
+            *tick
+        };
 
         let mut newly_allocated = Vec::new();
 
-        let mut queues = self.project_queues.lock().unwrap();
-        let mut providers = self.provider_trackers.lock().unwrap();
-        let mut active_slots = self.active_slots.lock().unwrap();
-        let mut checkout_locks = self.exclusive_checkout_locks.lock().unwrap();
-
-        // 1. Global capacity check
-        if active_slots.len() >= self.config.global_max_parallel {
-            return newly_allocated;
-        }
-
-        // 2. Collect candidate items from all projects with aging score
-        // Effective score = (priority as u64 * 100) + age_weight
-        let mut project_keys: Vec<ProjectId> = queues.keys().cloned().collect();
-        // Deterministic sort of project keys to avoid random hash order
-        project_keys.sort();
-
-        // Age queued items
-        for proj_id in &project_keys {
-            if let Some(state) = queues.get_mut(proj_id) {
-                for item in state.queue.iter_mut() {
-                    item.age_weight = (item.age_weight + self.config.aging_increment_per_tick)
-                        .min(self.config.max_aging_boost);
-                }
-            }
-        }
-
         // Try scheduling across projects with fair round-robin + aging prioritization
         'scheduling_loop: loop {
-            if active_slots.len() >= self.config.global_max_parallel {
+            let (active_len, mut project_keys) = {
+                let active = self.active_slots.lock().unwrap();
+                if active.len() >= self.config.global_max_parallel {
+                    break 'scheduling_loop;
+                }
+                let queues = self.project_queues.lock().unwrap();
+                let keys: Vec<ProjectId> = queues.keys().cloned().collect();
+                (active.len(), keys)
+            };
+
+            if active_len >= self.config.global_max_parallel {
                 break 'scheduling_loop;
             }
 
-            let mut best_candidate_index: Option<(ProjectId, usize, u64)> = None;
+            project_keys.sort();
 
-            for proj_id in &project_keys {
-                let state = match queues.get(proj_id) {
-                    Some(s) => s,
-                    None => continue,
-                };
+            // Age queued items and collect candidates
+            let mut candidates: Vec<(ProjectId, usize, u64)> = Vec::new();
+            {
+                let mut queues = self.project_queues.lock().unwrap();
+                let providers = self.provider_trackers.lock().unwrap();
 
-                // Check per-project capacity limit
-                if state.active_count >= self.config.per_project_max_parallel {
-                    continue;
-                }
-
-                for (idx, item) in state.queue.iter().enumerate() {
-                    // Check exclusive checkout availability
-                    if item.requires_exclusive_checkout
-                        && checkout_locks.contains_key(&item.checkout_id)
-                    {
-                        continue; // Locked by another active attempt!
-                    }
-
-                    // Check provider capacity limit
-                    let prov_limit = self
-                        .config
-                        .provider_capacity_limits
-                        .get(&item.target_provider)
-                        .cloned()
-                        .unwrap_or(4);
-                    let prov_active = providers
-                        .get(&item.target_provider)
-                        .map(|p| p.active_count)
-                        .unwrap_or(0);
-                    if prov_active >= prov_limit {
-                        continue;
-                    }
-
-                    let effective_score = (item.priority as u64 * 100) + item.age_weight;
-
-                    match &best_candidate_index {
-                        None => {
-                            best_candidate_index = Some((proj_id.clone(), idx, effective_score));
+                for proj_id in &project_keys {
+                    if let Some(state) = queues.get_mut(proj_id) {
+                        for item in state.queue.iter_mut() {
+                            item.age_weight = (item.age_weight
+                                + self.config.aging_increment_per_tick)
+                                .min(self.config.max_aging_boost);
                         }
-                        Some((_, _, best_score)) => {
-                            if effective_score > *best_score {
-                                best_candidate_index =
-                                    Some((proj_id.clone(), idx, effective_score));
+
+                        // Check per-project capacity limit
+                        if state.active_count >= self.config.per_project_max_parallel {
+                            continue;
+                        }
+
+                        for (idx, item) in state.queue.iter().enumerate() {
+                            let prov_limit = self
+                                .config
+                                .provider_capacity_limits
+                                .get(&item.target_provider)
+                                .cloned()
+                                .unwrap_or(4);
+                            let prov_active = providers
+                                .get(&item.target_provider)
+                                .map(|p| p.active_count)
+                                .unwrap_or(0);
+                            if prov_active >= prov_limit {
+                                continue;
                             }
+
+                            let effective_score = (item.priority as u64 * 100) + item.age_weight;
+                            candidates.push((proj_id.clone(), idx, effective_score));
                         }
                     }
                 }
             }
 
-            // If we found an eligible candidate, allocate its execution slot
-            if let Some((best_proj, best_idx, _)) = best_candidate_index {
-                let state = queues.get_mut(&best_proj).unwrap();
-                let item = state.queue.remove(best_idx).unwrap();
-                state.active_count += 1;
+            // Sort candidates by effective_score descending
+            candidates.sort_by_key(|b| std::cmp::Reverse(b.2));
 
-                // Track provider capacity
-                let prov_tracker = providers.entry(item.target_provider.clone()).or_default();
-                prov_tracker.active_count += 1;
+            let mut scheduled_any = false;
 
-                // Allocate slot ID
-                let slot_id = format!("slot-{}-{}", item.task_id, uuid::Uuid::new_v4().simple());
-
-                // Lock checkout exclusively if required
-                if item.requires_exclusive_checkout {
-                    checkout_locks.insert(item.checkout_id.clone(), slot_id.clone());
-                }
-
-                let slot = ActiveExecutionSlot {
-                    slot_id: slot_id.clone(),
-                    work_item: item,
-                    lease_id: None,
-                    allocated_at: current_tick_val,
+            for (proj_id, idx, _) in candidates {
+                let item = {
+                    let queues = self.project_queues.lock().unwrap();
+                    let state = match queues.get(&proj_id) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    if state.active_count >= self.config.per_project_max_parallel {
+                        continue;
+                    }
+                    match state.queue.get(idx) {
+                        Some(it) => it.clone(),
+                        None => continue,
+                    }
                 };
 
-                active_slots.insert(slot_id, slot.clone());
-                newly_allocated.push(slot);
-            } else {
+                let mut allocated_lease_id = None;
+                // Each work item is its own lease holder: the store's "same
+                // holder renewing" path would otherwise treat two different
+                // items competing for the same checkout as one holder
+                // extending its own lease, silently defeating exclusivity.
+                let holder_id = item.task_id.to_string();
+                let holder = LeaseHolder {
+                    holder_id: holder_id.clone(),
+                    pid: std::process::id(),
+                    host: "localhost".to_string(),
+                };
+
+                if item.requires_exclusive_checkout {
+                    match acquire_durable_lease(
+                        store,
+                        &LeaseId::generate(),
+                        &LeaseResource::Checkout(item.checkout_id.clone()),
+                        &LeaseKind::ExclusiveWrite,
+                        &holder,
+                        300,
+                    )
+                    .await
+                    {
+                        Ok(lease) => {
+                            allocated_lease_id = Some(lease.id);
+                        }
+                        Err(_) => {
+                            // Resource contention or locked by another active lease, skip this candidate
+                            continue;
+                        }
+                    }
+                }
+
+                // If acquired or not required, remove from queue and allocate slot
+                let removed_item = {
+                    let mut queues = self.project_queues.lock().unwrap();
+                    let mut providers = self.provider_trackers.lock().unwrap();
+                    let mut active_slots = self.active_slots.lock().unwrap();
+
+                    if active_slots.len() >= self.config.global_max_parallel {
+                        None
+                    } else if let Some(state) = queues.get_mut(&proj_id) {
+                        if state.active_count >= self.config.per_project_max_parallel {
+                            None
+                        } else {
+                            let item_pos =
+                                state.queue.iter().position(|it| it.task_id == item.task_id);
+                            if let Some(pos) = item_pos {
+                                let item = state.queue.remove(pos).unwrap();
+                                state.active_count += 1;
+
+                                let prov_tracker =
+                                    providers.entry(item.target_provider.clone()).or_default();
+                                prov_tracker.active_count += 1;
+
+                                let slot_id = format!(
+                                    "slot-{}-{}",
+                                    item.task_id,
+                                    uuid::Uuid::new_v4().simple()
+                                );
+                                let slot = ActiveExecutionSlot {
+                                    slot_id: slot_id.clone(),
+                                    work_item: item.clone(),
+                                    lease_id: allocated_lease_id.clone(),
+                                    allocated_at: current_tick_val,
+                                };
+                                active_slots.insert(slot_id, slot.clone());
+                                Some(slot)
+                            } else {
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                match removed_item {
+                    Some(slot) => {
+                        newly_allocated.push(slot);
+                        scheduled_any = true;
+                        break;
+                    }
+                    None => {
+                        if let Some(ref lid) = allocated_lease_id {
+                            let _ = release_durable_lease(store, lid, &holder_id).await;
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            if !scheduled_any {
                 // No more candidates can be scheduled in this cycle
                 break 'scheduling_loop;
             }
@@ -284,64 +347,77 @@ impl SchedulerV2 {
     }
 
     /// Releases an active execution slot upon completion, failure, or cancellation.
-    /// Unlocks exclusive checkouts and frees provider/project capacity immediately.
-    pub fn release_slot(&self, slot_id: &str) -> Option<ActiveExecutionSlot> {
-        let mut active_slots = self.active_slots.lock().unwrap();
-        let slot = active_slots.remove(slot_id)?;
-        drop(active_slots);
+    /// Releases durable leases and frees provider/project capacity immediately.
+    pub async fn release_slot(
+        &self,
+        slot_id: &str,
+        store: &SqliteStore,
+    ) -> Option<ActiveExecutionSlot> {
+        let slot = {
+            let mut active_slots = self.active_slots.lock().unwrap();
+            active_slots.remove(slot_id)?
+        };
 
         // 1. Release project capacity
-        let mut queues = self.project_queues.lock().unwrap();
-        if let Some(state) = queues.get_mut(&slot.work_item.project_id) {
-            state.active_count = state.active_count.saturating_sub(1);
+        {
+            let mut queues = self.project_queues.lock().unwrap();
+            if let Some(state) = queues.get_mut(&slot.work_item.project_id) {
+                state.active_count = state.active_count.saturating_sub(1);
+            }
         }
-        drop(queues);
 
         // 2. Release provider capacity
-        let mut providers = self.provider_trackers.lock().unwrap();
-        if let Some(tracker) = providers.get_mut(&slot.work_item.target_provider) {
-            tracker.active_count = tracker.active_count.saturating_sub(1);
+        {
+            let mut providers = self.provider_trackers.lock().unwrap();
+            if let Some(tracker) = providers.get_mut(&slot.work_item.target_provider) {
+                tracker.active_count = tracker.active_count.saturating_sub(1);
+            }
         }
-        drop(providers);
 
-        // 3. Release checkout locks
-        let mut checkout_locks = self.exclusive_checkout_locks.lock().unwrap();
-        if checkout_locks.get(&slot.work_item.checkout_id) == Some(&slot.slot_id) {
-            checkout_locks.remove(&slot.work_item.checkout_id);
+        // 3. Release durable lease if present. Must match the holder id used
+        // to acquire it in schedule_next (the work item's task id).
+        if let Some(ref lease_id) = slot.lease_id {
+            let holder_id = slot.work_item.task_id.to_string();
+            let _ = release_durable_lease(store, lease_id, &holder_id).await;
         }
-        drop(checkout_locks);
 
         Some(slot)
     }
 
     /// Cancels all queued work items and active slots for a specific project.
     /// Guarantees that cancellation of one project does NOT affect or corrupt any other project queue.
-    pub fn cancel_project(&self, project_id: &ProjectId) -> (usize, Vec<ActiveExecutionSlot>) {
+    pub async fn cancel_project(
+        &self,
+        project_id: &ProjectId,
+        store: &SqliteStore,
+    ) -> (usize, Vec<ActiveExecutionSlot>) {
         // 1. Drain queued items in this project
-        let mut queues = self.project_queues.lock().unwrap();
-        let drained_queued_count = if let Some(state) = queues.get_mut(project_id) {
-            let count = state.queue.len();
-            state.queue.clear();
-            count
-        } else {
-            0
+        let drained_queued_count = {
+            let mut queues = self.project_queues.lock().unwrap();
+            if let Some(state) = queues.get_mut(project_id) {
+                let count = state.queue.len();
+                state.queue.clear();
+                count
+            } else {
+                0
+            }
         };
-        drop(queues);
 
-        // 2. Find and release all active slots belonging to this project
-        let mut slots_to_release = Vec::new();
-        {
+        // 2. Find all active slots belonging to this project
+        let slots_to_release = {
             let active = self.active_slots.lock().unwrap();
+            let mut to_release = Vec::new();
             for (slot_id, slot) in active.iter() {
                 if &slot.work_item.project_id == project_id {
-                    slots_to_release.push(slot_id.clone());
+                    to_release.push(slot_id.clone());
                 }
             }
-        }
+            to_release
+        };
 
         let mut released_slots = Vec::new();
         for slot_id in slots_to_release {
-            if let Some(slot) = self.release_slot(&slot_id) {
+            if let Some(slot) = self.release_slot(&slot_id, store).await {
                 released_slots.push(slot);
             }
         }

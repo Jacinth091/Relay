@@ -174,7 +174,9 @@ async fn paste_import_validation_preview_and_confirm_create_reviewable_task() {
 async fn durable_tasks_are_visible_after_reopen_without_reviewed_task() {
     let store = SqliteStore::in_memory().await.unwrap();
     let mut state = app_state_with_project();
+    let daemon = embedded_daemon_for(&store, &state.relay).await;
     state.store = Some(store.clone());
+    state.attach_daemon(Some(daemon));
 
     state.start_paste_task();
     state.paste_text = task_json();
@@ -986,20 +988,41 @@ fn app_state_with_project() -> AppState {
 
 async fn app_state_with_project_with_store() -> AppState {
     let state = app_state_with_project();
+    let store = SqliteStore::in_memory().await.unwrap();
+    let daemon = embedded_daemon_for(&store, &state.relay).await;
     let mut state = AppState::new_with_store(
         state.relay,
         state.config_path,
         state.registry_writable,
         unique_temp_path("state").join("relay.sqlite3"),
-        Some(SqliteStore::in_memory().await.unwrap()),
+        Some(store),
         Vec::new(),
         "ready".to_owned(),
     );
+    state.attach_daemon(Some(daemon));
     state.runtime_health = CodexRuntimeHealth::Available {
         version: "test runtime".to_owned(),
         account: None,
     };
     state
+}
+
+/// Builds an in-process daemon client over `store`, mirroring what
+/// `connect_or_embed` gives production TUI/MCP when no daemon is already
+/// running. `relay`'s project registry must match the client-side one used
+/// for preview, since the daemon re-resolves the project independently.
+async fn embedded_daemon_for(store: &SqliteStore, relay: &Relay) -> relay_core::DaemonClientHandle {
+    let server = relay_core::DaemonServer::start(
+        store.clone(),
+        relay.clone(),
+        "test-daemon",
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    relay_core::DaemonClientHandle::InProcess(relay_core::InProcessDaemonClient::new(
+        std::sync::Arc::new(server),
+    ))
 }
 
 async fn app_state_with_eligible_project_with_store() -> AppState {
@@ -1043,15 +1066,19 @@ async fn app_state_with_eligible_project_with_store() -> AppState {
             github: None,
         })
         .unwrap();
+    let relay = Relay::with_project_registry(registry);
+    let store = SqliteStore::in_memory().await.unwrap();
+    let daemon = embedded_daemon_for(&store, &relay).await;
     let mut state = AppState::new_with_store(
-        Relay::with_project_registry(registry),
+        relay,
         unique_temp_path("config").join("relay.toml"),
         true,
         unique_temp_path("state").join("relay.sqlite3"),
-        Some(SqliteStore::in_memory().await.unwrap()),
+        Some(store),
         Vec::new(),
         "ready".to_owned(),
     );
+    state.attach_daemon(Some(daemon));
     state.runtime_health = CodexRuntimeHealth::Available {
         version: "test runtime".to_owned(),
         account: None,

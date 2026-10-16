@@ -127,7 +127,7 @@ fn policy_intersection_cannot_broaden_built_in_or_user_hard_deny() {
             "repo wants auto-push",
         );
 
-    let decisions = PolicyCompiler::compile(Some(&user_layer), None, Some(&repo_layer), None);
+    let decisions = PolicyCompiler::compile(Some(&user_layer), None, Some(&repo_layer), None, None);
 
     // 1. Built-in hard deny on GitPush cannot be broadened
     let push_decision = decisions
@@ -207,4 +207,152 @@ fn cancellation_transition_truthfully_persists() {
     assert_eq!(run.state, WorkflowRunState::Cancelled);
     assert!(run.completed_at.is_some());
     assert!(run.state.is_terminal());
+}
+
+#[test]
+fn approved_intent_content_hash_covers_all_fields_deterministically() {
+    let task_id = TaskId::generate();
+    let intent1 = relay_core::ApprovedIntent::new(
+        task_id,
+        1,
+        "Implement feature".to_string(),
+        vec!["Criterion A".to_string()],
+        vec!["Constraint X".to_string()],
+        vec!["Non-goal Z".to_string()],
+        "user1".to_string(),
+    );
+
+    // Identical fields produce identical hash
+    let intent1_dup = relay_core::ApprovedIntent::new(
+        task_id,
+        1,
+        "Implement feature".to_string(),
+        vec!["Criterion A".to_string()],
+        vec!["Constraint X".to_string()],
+        vec!["Non-goal Z".to_string()],
+        "user2".to_string(),
+    );
+    assert_eq!(intent1.content_hash, intent1_dup.content_hash);
+
+    // Changing objective changes hash
+    let intent_diff_obj = relay_core::ApprovedIntent::new(
+        task_id,
+        1,
+        "Different objective".to_string(),
+        vec!["Criterion A".to_string()],
+        vec!["Constraint X".to_string()],
+        vec!["Non-goal Z".to_string()],
+        "user1".to_string(),
+    );
+    assert_ne!(intent1.content_hash, intent_diff_obj.content_hash);
+
+    // Changing criteria changes hash
+    let intent_diff_crit = relay_core::ApprovedIntent::new(
+        task_id,
+        1,
+        "Implement feature".to_string(),
+        vec!["Criterion B".to_string()],
+        vec!["Constraint X".to_string()],
+        vec!["Non-goal Z".to_string()],
+        "user1".to_string(),
+    );
+    assert_ne!(intent1.content_hash, intent_diff_crit.content_hash);
+
+    // Changing constraints changes hash
+    let intent_diff_cons = relay_core::ApprovedIntent::new(
+        task_id,
+        1,
+        "Implement feature".to_string(),
+        vec!["Criterion A".to_string()],
+        vec!["Constraint Y".to_string()],
+        vec!["Non-goal Z".to_string()],
+        "user1".to_string(),
+    );
+    assert_ne!(intent1.content_hash, intent_diff_cons.content_hash);
+
+    // Changing non-goals changes hash
+    let intent_diff_ng = relay_core::ApprovedIntent::new(
+        task_id,
+        1,
+        "Implement feature".to_string(),
+        vec!["Criterion A".to_string()],
+        vec!["Constraint X".to_string()],
+        vec!["Non-goal W".to_string()],
+        "user1".to_string(),
+    );
+    assert_ne!(intent1.content_hash, intent_diff_ng.content_hash);
+
+    // Changing generation changes hash
+    let intent_diff_gen = relay_core::ApprovedIntent::new(
+        task_id,
+        2,
+        "Implement feature".to_string(),
+        vec!["Criterion A".to_string()],
+        vec!["Constraint X".to_string()],
+        vec!["Non-goal Z".to_string()],
+        "user1".to_string(),
+    );
+    assert_ne!(intent1.content_hash, intent_diff_gen.content_hash);
+}
+
+#[test]
+fn workflow_run_creation_rejects_invalid_workflow_definitions() {
+    let task_id = TaskId::generate();
+    let grant_id = relay_core::ExecutionGrantId::generate();
+    let snap_id = relay_core::ConfigSnapshotId::generate();
+
+    // 1. Invalid role reference
+    let wf_invalid_role = relay_core::WorkflowDefinition {
+        id: WorkflowDefinitionId::new("bad-role"),
+        version: 1,
+        roles: vec![],
+        nodes: vec![relay_core::WorkflowNodeDefinition {
+            id: "step1".to_string(),
+            role_id: relay_core::RoleDefinitionId::new("bogus-role"),
+            consumed_artifact_types: vec![],
+            produced_artifact_types: vec![],
+        }],
+        transitions: vec![],
+        default_budget: ExecutionBudget::default(),
+        content_hash: "hash".to_string(),
+    };
+    assert!(
+        wf_invalid_role
+            .create_run(task_id, grant_id.clone(), snap_id.clone())
+            .is_err()
+    );
+
+    // 2. Unreachable node
+    let wf_unreachable = relay_core::WorkflowDefinition {
+        id: WorkflowDefinitionId::new("unreachable"),
+        version: 1,
+        roles: vec![],
+        nodes: vec![
+            relay_core::WorkflowNodeDefinition {
+                id: "start".to_string(),
+                role_id: relay_core::RoleDefinitionId::new("implementer"),
+                consumed_artifact_types: vec![],
+                produced_artifact_types: vec![],
+            },
+            relay_core::WorkflowNodeDefinition {
+                id: "island".to_string(),
+                role_id: relay_core::RoleDefinitionId::new("verifier"),
+                consumed_artifact_types: vec![],
+                produced_artifact_types: vec![],
+            },
+        ],
+        transitions: vec![],
+        default_budget: ExecutionBudget::default(),
+        content_hash: "hash".to_string(),
+    };
+    assert!(
+        wf_unreachable
+            .create_run(task_id, grant_id.clone(), snap_id.clone())
+            .is_err()
+    );
+
+    // 3. Valid workflow creates run successfully
+    let valid_wf = relay_core::v1_compatibility_workflow_definition();
+    let run = valid_wf.create_run(task_id, grant_id, snap_id).unwrap();
+    assert_eq!(run.state, WorkflowRunState::Pending);
 }

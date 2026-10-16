@@ -193,7 +193,14 @@ impl ApprovedIntent {
         non_goals: Vec<String>,
         approved_by: String,
     ) -> Self {
-        let content_hash = format!("{:x}", md5_or_simple_hash(&objective));
+        let content_hash = compute_intent_hash(
+            &task_id,
+            generation,
+            &objective,
+            &acceptance_criteria,
+            &constraints,
+            &non_goals,
+        );
         Self {
             id: ApprovedIntentId::generate(),
             task_id,
@@ -218,9 +225,7 @@ impl ApprovedIntent {
         new_constraints: Vec<String>,
         approved_by: String,
     ) -> Self {
-        Self::new(
-            self.task_id,
-            self.generation + 1,
+        self.create_next_generation_with_non_goals(
             new_objective,
             new_acceptance_criteria,
             new_constraints,
@@ -228,13 +233,51 @@ impl ApprovedIntent {
             approved_by,
         )
     }
+
+    /// Creates a successor generation with updated non-goals.
+    pub fn create_next_generation_with_non_goals(
+        &self,
+        new_objective: String,
+        new_acceptance_criteria: Vec<String>,
+        new_constraints: Vec<String>,
+        new_non_goals: Vec<String>,
+        approved_by: String,
+    ) -> Self {
+        Self::new(
+            self.task_id,
+            self.generation + 1,
+            new_objective,
+            new_acceptance_criteria,
+            new_constraints,
+            new_non_goals,
+            approved_by,
+        )
+    }
 }
 
-fn md5_or_simple_hash(input: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    input.hash(&mut hasher);
-    hasher.finish()
+fn compute_intent_hash(
+    task_id: &TaskId,
+    generation: u32,
+    objective: &str,
+    acceptance_criteria: &[String],
+    constraints: &[String],
+    non_goals: &[String],
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(task_id.to_string().as_bytes());
+    hasher.update(generation.to_le_bytes());
+    hasher.update(objective.as_bytes());
+    for ac in acceptance_criteria {
+        hasher.update(ac.as_bytes());
+    }
+    for c in constraints {
+        hasher.update(c.as_bytes());
+    }
+    for ng in non_goals {
+        hasher.update(ng.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 // ---------------------------------------------------------------------------
@@ -299,26 +342,52 @@ impl ExecutionGrant {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TransitionCondition {
+    Always,
+    RoleAttemptSucceeded,
+    RoleAttemptFailed,
+    CandidateCreated,
+    ArtifactProduced { kind: String },
+    RemediationNeeded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowNodeDefinition {
     pub id: String,
     pub role_id: RoleDefinitionId,
+    #[serde(default)]
+    pub consumed_artifact_types: Vec<String>,
+    #[serde(default)]
+    pub produced_artifact_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowTransitionDefinition {
     pub from_node: String,
     pub to_node: String,
-    pub condition: String,
+    pub condition: TransitionCondition,
+    #[serde(default)]
+    pub required_artifact_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowDefinition {
     pub id: WorkflowDefinitionId,
     pub version: u32,
+    #[serde(default)]
+    pub roles: Vec<RoleDefinition>,
     pub nodes: Vec<WorkflowNodeDefinition>,
     pub transitions: Vec<WorkflowTransitionDefinition>,
     pub default_budget: ExecutionBudget,
     pub content_hash: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DfsState {
+    Unvisited,
+    Visiting,
+    Visited,
 }
 
 impl WorkflowDefinition {
@@ -329,7 +398,32 @@ impl WorkflowDefinition {
             });
         }
 
-        // Validate transition nodes exist
+        // 1. Unique node IDs
+        let mut seen_node_ids = std::collections::HashSet::new();
+        for node in &self.nodes {
+            if !seen_node_ids.insert(&node.id) {
+                return Err(WorkflowError::Validation {
+                    reason: format!("duplicate node id '{}'", node.id),
+                });
+            }
+        }
+
+        // 2. Role resolution: each node.role_id must resolve to a known role definition
+        for node in &self.nodes {
+            let role_known = self.roles.iter().any(|r| r.id == node.role_id)
+                || node.role_id.0 == "implementer"
+                || node.role_id.0 == "verifier";
+            if !role_known {
+                return Err(WorkflowError::Validation {
+                    reason: format!(
+                        "unknown role reference '{}' in node '{}'",
+                        node.role_id, node.id
+                    ),
+                });
+            }
+        }
+
+        // 3. Transition endpoints exist
         for t in &self.transitions {
             if !self.nodes.iter().any(|n| n.id == t.from_node) {
                 return Err(WorkflowError::Validation {
@@ -341,16 +435,201 @@ impl WorkflowDefinition {
                     reason: format!("transition to unknown node '{}'", t.to_node),
                 });
             }
-            // Transition conditions must not contain arbitrary executable expressions
-            if t.condition.contains("eval(") || t.condition.contains("exec(") {
+        }
+
+        // 4. Reachability: every node must be reachable from the start node (nodes[0])
+        let start_node = &self.nodes[0].id;
+        let mut reachable = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        reachable.insert(start_node.clone());
+        queue.push_back(start_node.clone());
+
+        while let Some(current) = queue.pop_front() {
+            for t in &self.transitions {
+                if t.from_node == current && reachable.insert(t.to_node.clone()) {
+                    queue.push_back(t.to_node.clone());
+                }
+            }
+        }
+
+        for node in &self.nodes {
+            if !reachable.contains(&node.id) {
                 return Err(WorkflowError::Validation {
-                    reason: "arbitrary executable expressions in transitions are forbidden"
-                        .to_owned(),
+                    reason: format!(
+                        "unreachable node '{}' from start node '{}'",
+                        node.id, start_node
+                    ),
                 });
             }
         }
 
+        // 5. Typed I/O compatibility:
+        // Transition required_artifact_types must be produced by from_node.
+        // Node consumed_artifact_types must be produced by from_node or transition.
+        for t in &self.transitions {
+            let from_node = self.nodes.iter().find(|n| n.id == t.from_node).unwrap();
+            let to_node = self.nodes.iter().find(|n| n.id == t.to_node).unwrap();
+
+            for req in &t.required_artifact_types {
+                if !from_node.produced_artifact_types.contains(req) {
+                    return Err(WorkflowError::Validation {
+                        reason: format!(
+                            "type mismatch: transition from '{}' to '{}' requires artifact '{}' which is not produced by '{}'",
+                            t.from_node, t.to_node, req, t.from_node
+                        ),
+                    });
+                }
+            }
+
+            for consumed in &to_node.consumed_artifact_types {
+                if !from_node.produced_artifact_types.contains(consumed)
+                    && !t.required_artifact_types.contains(consumed)
+                {
+                    return Err(WorkflowError::Validation {
+                        reason: format!(
+                            "type mismatch: node '{}' consumes artifact '{}' which is not produced by predecessor '{}'",
+                            t.to_node, consumed, t.from_node
+                        ),
+                    });
+                }
+            }
+        }
+
+        // 6. Delegation edges: if transition crosses roles, role_a must allow delegation to role_b
+        for t in &self.transitions {
+            let from_node = self.nodes.iter().find(|n| n.id == t.from_node).unwrap();
+            let to_node = self.nodes.iter().find(|n| n.id == t.to_node).unwrap();
+
+            if from_node.role_id != to_node.role_id {
+                let from_role_def = self.roles.iter().find(|r| r.id == from_node.role_id);
+                if let Some(role) = from_role_def {
+                    if !role.allowed_delegations.contains(&to_node.role_id) {
+                        return Err(WorkflowError::Validation {
+                            reason: format!(
+                                "undeclared delegation edge: role '{}' in node '{}' cannot delegate to role '{}' in node '{}'",
+                                from_node.role_id, t.from_node, to_node.role_id, t.to_node
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        // 7. Cycle detection and bound validation
+        self.validate_cycle_bounds()?;
+
         Ok(())
+    }
+
+    fn validate_cycle_bounds(&self) -> Result<(), WorkflowError> {
+        // Reject unconditional self-loops
+        for t in &self.transitions {
+            if t.from_node == t.to_node && matches!(t.condition, TransitionCondition::Always) {
+                return Err(WorkflowError::Validation {
+                    reason: format!(
+                        "unbounded cycle detected: unconditional self-loop on node '{}'",
+                        t.from_node
+                    ),
+                });
+            }
+        }
+
+        // Check each node for cycles
+        let mut states: std::collections::HashMap<&str, DfsState> = self
+            .nodes
+            .iter()
+            .map(|n| (n.id.as_str(), DfsState::Unvisited))
+            .collect();
+
+        for node in &self.nodes {
+            if states[node.id.as_str()] == DfsState::Unvisited {
+                let mut path = Vec::new();
+                self.dfs_cycle_check(node.id.as_str(), &mut states, &mut path)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn dfs_cycle_check<'a>(
+        &'a self,
+        current: &'a str,
+        states: &mut std::collections::HashMap<&'a str, DfsState>,
+        path: &mut Vec<&'a str>,
+    ) -> Result<(), WorkflowError> {
+        states.insert(current, DfsState::Visiting);
+        path.push(current);
+
+        for t in &self.transitions {
+            if t.from_node == current && t.from_node != t.to_node {
+                let target = t.to_node.as_str();
+                match states.get(target) {
+                    Some(DfsState::Visiting) => {
+                        let cycle_start_idx = path.iter().position(|&x| x == target).unwrap_or(0);
+                        let cycle_nodes = &path[cycle_start_idx..];
+
+                        // All transitions along the cycle must not be unconditional Always
+                        for i in 0..cycle_nodes.len() {
+                            let u = cycle_nodes[i];
+                            let v = if i + 1 < cycle_nodes.len() {
+                                cycle_nodes[i + 1]
+                            } else {
+                                target
+                            };
+                            let trans = self
+                                .transitions
+                                .iter()
+                                .find(|tr| tr.from_node == u && tr.to_node == v);
+                            if let Some(tr) = trans {
+                                if matches!(tr.condition, TransitionCondition::Always) {
+                                    return Err(WorkflowError::Validation {
+                                        reason: format!(
+                                            "unbounded cycle detected: unconditional transition from '{}' to '{}' in cycle",
+                                            u, v
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+
+                        // Cycle requires finite execution bounds
+                        if self.default_budget.max_role_activations == 0
+                            || self.default_budget.max_attempts_per_role == 0
+                        {
+                            return Err(WorkflowError::Validation {
+                                reason:
+                                    "unbounded cycle: budget has zero activation or attempt limit"
+                                        .to_owned(),
+                            });
+                        }
+                    }
+                    Some(DfsState::Unvisited) => {
+                        self.dfs_cycle_check(target, states, path)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        path.pop();
+        states.insert(current, DfsState::Visited);
+        Ok(())
+    }
+
+    /// Creates and validates a new `WorkflowRun` under this workflow definition.
+    pub fn create_run(
+        &self,
+        task_id: TaskId,
+        execution_grant_id: ExecutionGrantId,
+        config_snapshot_id: ConfigSnapshotId,
+    ) -> Result<WorkflowRun, WorkflowError> {
+        self.validate()?;
+        Ok(WorkflowRun::new(
+            task_id,
+            execution_grant_id,
+            self.id.clone(),
+            config_snapshot_id,
+        ))
     }
 }
 
@@ -536,6 +815,8 @@ impl RoleInstance {
             attempt_no: self.attempts_count,
             execution_target: target,
             state: RoleAttemptState::Queued,
+            lease_id: None,
+            fencing_token: None,
             runtime_outcome: None,
             result_artifact_id: None,
             started_at: Some(now_timestamp()),
@@ -593,6 +874,8 @@ pub struct RoleAttempt {
     pub attempt_no: u32,
     pub execution_target: ExecutionTarget,
     pub state: RoleAttemptState,
+    pub lease_id: Option<String>,
+    pub fencing_token: Option<u64>,
     pub runtime_outcome: Option<String>,
     pub result_artifact_id: Option<String>,
     pub started_at: Option<String>,
@@ -743,41 +1026,250 @@ mod tests {
     }
 
     #[test]
-    fn workflow_definition_validation_rejects_eval_or_broken_nodes() {
+    fn workflow_definition_validation_rejects_missing_node() {
         let wf = WorkflowDefinition {
             id: WorkflowDefinitionId::new("default"),
             version: 1,
+            roles: vec![],
             nodes: vec![WorkflowNodeDefinition {
                 id: "implement".to_owned(),
                 role_id: RoleDefinitionId::new("implementer"),
+                consumed_artifact_types: vec![],
+                produced_artifact_types: vec![],
             }],
             transitions: vec![WorkflowTransitionDefinition {
                 from_node: "implement".to_owned(),
                 to_node: "missing_node".to_owned(),
-                condition: "PASS".to_owned(),
+                condition: TransitionCondition::RoleAttemptSucceeded,
+                required_artifact_types: vec![],
             }],
             default_budget: ExecutionBudget::default(),
             content_hash: "hash".to_owned(),
         };
 
         assert!(wf.validate().is_err());
+    }
 
-        let wf_eval = WorkflowDefinition {
-            id: WorkflowDefinitionId::new("malicious"),
+    #[test]
+    fn workflow_definition_validation_rejects_unknown_role() {
+        let wf = WorkflowDefinition {
+            id: WorkflowDefinitionId::new("unknown-role"),
             version: 1,
+            roles: vec![],
             nodes: vec![WorkflowNodeDefinition {
-                id: "implement".to_owned(),
-                role_id: RoleDefinitionId::new("implementer"),
+                id: "step1".to_owned(),
+                role_id: RoleDefinitionId::new("unknown-arbitrary-role"),
+                consumed_artifact_types: vec![],
+                produced_artifact_types: vec![],
             }],
+            transitions: vec![],
+            default_budget: ExecutionBudget::default(),
+            content_hash: "hash".to_owned(),
+        };
+
+        match wf.validate() {
+            Err(WorkflowError::Validation { reason }) => {
+                assert!(reason.contains("unknown role reference"));
+            }
+            other => panic!("expected unknown role validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workflow_definition_validation_rejects_unreachable_node() {
+        let wf = WorkflowDefinition {
+            id: WorkflowDefinitionId::new("unreachable"),
+            version: 1,
+            roles: vec![],
+            nodes: vec![
+                WorkflowNodeDefinition {
+                    id: "node-a".to_owned(),
+                    role_id: RoleDefinitionId::new("implementer"),
+                    consumed_artifact_types: vec![],
+                    produced_artifact_types: vec![],
+                },
+                WorkflowNodeDefinition {
+                    id: "node-b".to_owned(),
+                    role_id: RoleDefinitionId::new("verifier"),
+                    consumed_artifact_types: vec![],
+                    produced_artifact_types: vec![],
+                },
+                WorkflowNodeDefinition {
+                    id: "orphan".to_owned(),
+                    role_id: RoleDefinitionId::new("implementer"),
+                    consumed_artifact_types: vec![],
+                    produced_artifact_types: vec![],
+                },
+            ],
             transitions: vec![WorkflowTransitionDefinition {
-                from_node: "implement".to_owned(),
-                to_node: "implement".to_owned(),
-                condition: "eval(malicious_code)".to_owned(),
+                from_node: "node-a".to_owned(),
+                to_node: "node-b".to_owned(),
+                condition: TransitionCondition::RoleAttemptSucceeded,
+                required_artifact_types: vec![],
             }],
             default_budget: ExecutionBudget::default(),
             content_hash: "hash".to_owned(),
         };
 
-        assert!(wf_eval.validate().is_err());
+        match wf.validate() {
+            Err(WorkflowError::Validation { reason }) => {
+                assert!(reason.contains("unreachable node 'orphan'"));
+            }
+            other => panic!("expected unreachable node error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workflow_definition_validation_rejects_artifact_type_mismatch() {
+        let wf = WorkflowDefinition {
+            id: WorkflowDefinitionId::new("mismatch"),
+            version: 1,
+            roles: vec![],
+            nodes: vec![
+                WorkflowNodeDefinition {
+                    id: "node-a".to_owned(),
+                    role_id: RoleDefinitionId::new("implementer"),
+                    consumed_artifact_types: vec![],
+                    produced_artifact_types: vec!["code_diff".to_owned()],
+                },
+                WorkflowNodeDefinition {
+                    id: "node-b".to_owned(),
+                    role_id: RoleDefinitionId::new("verifier"),
+                    consumed_artifact_types: vec!["binary_release".to_owned()],
+                    produced_artifact_types: vec![],
+                },
+            ],
+            transitions: vec![WorkflowTransitionDefinition {
+                from_node: "node-a".to_owned(),
+                to_node: "node-b".to_owned(),
+                condition: TransitionCondition::RoleAttemptSucceeded,
+                required_artifact_types: vec!["binary_release".to_owned()],
+            }],
+            default_budget: ExecutionBudget::default(),
+            content_hash: "hash".to_owned(),
+        };
+
+        match wf.validate() {
+            Err(WorkflowError::Validation { reason }) => {
+                assert!(reason.contains("type mismatch"));
+            }
+            other => panic!("expected type mismatch error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workflow_definition_validation_rejects_undeclared_delegation() {
+        let role_a = RoleDefinition {
+            id: RoleDefinitionId::new("role-a"),
+            purpose: "Purpose A".to_owned(),
+            write_mode: RoleWriteMode::ReadOnly,
+            allowed_delegations: vec![], // No delegation allowed!
+        };
+        let role_b = RoleDefinition {
+            id: RoleDefinitionId::new("role-b"),
+            purpose: "Purpose B".to_owned(),
+            write_mode: RoleWriteMode::ReadOnly,
+            allowed_delegations: vec![],
+        };
+
+        let wf = WorkflowDefinition {
+            id: WorkflowDefinitionId::new("undeclared-delegation"),
+            version: 1,
+            roles: vec![role_a, role_b],
+            nodes: vec![
+                WorkflowNodeDefinition {
+                    id: "node-a".to_owned(),
+                    role_id: RoleDefinitionId::new("role-a"),
+                    consumed_artifact_types: vec![],
+                    produced_artifact_types: vec![],
+                },
+                WorkflowNodeDefinition {
+                    id: "node-b".to_owned(),
+                    role_id: RoleDefinitionId::new("role-b"),
+                    consumed_artifact_types: vec![],
+                    produced_artifact_types: vec![],
+                },
+            ],
+            transitions: vec![WorkflowTransitionDefinition {
+                from_node: "node-a".to_owned(),
+                to_node: "node-b".to_owned(),
+                condition: TransitionCondition::RoleAttemptSucceeded,
+                required_artifact_types: vec![],
+            }],
+            default_budget: ExecutionBudget::default(),
+            content_hash: "hash".to_owned(),
+        };
+
+        match wf.validate() {
+            Err(WorkflowError::Validation { reason }) => {
+                assert!(reason.contains("undeclared delegation edge"));
+            }
+            other => panic!("expected undeclared delegation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workflow_definition_validation_rejects_unbounded_cycles() {
+        // Unconditional Always self-loop
+        let wf_self = WorkflowDefinition {
+            id: WorkflowDefinitionId::new("self-loop"),
+            version: 1,
+            roles: vec![],
+            nodes: vec![WorkflowNodeDefinition {
+                id: "loop-node".to_owned(),
+                role_id: RoleDefinitionId::new("implementer"),
+                consumed_artifact_types: vec![],
+                produced_artifact_types: vec![],
+            }],
+            transitions: vec![WorkflowTransitionDefinition {
+                from_node: "loop-node".to_owned(),
+                to_node: "loop-node".to_owned(),
+                condition: TransitionCondition::Always,
+                required_artifact_types: vec![],
+            }],
+            default_budget: ExecutionBudget::default(),
+            content_hash: "hash".to_owned(),
+        };
+
+        assert!(wf_self.validate().is_err());
+
+        // Unconditional cycle A -> B -> A
+        let wf_cycle = WorkflowDefinition {
+            id: WorkflowDefinitionId::new("unconditional-cycle"),
+            version: 1,
+            roles: vec![],
+            nodes: vec![
+                WorkflowNodeDefinition {
+                    id: "node-a".to_owned(),
+                    role_id: RoleDefinitionId::new("implementer"),
+                    consumed_artifact_types: vec![],
+                    produced_artifact_types: vec![],
+                },
+                WorkflowNodeDefinition {
+                    id: "node-b".to_owned(),
+                    role_id: RoleDefinitionId::new("verifier"),
+                    consumed_artifact_types: vec![],
+                    produced_artifact_types: vec![],
+                },
+            ],
+            transitions: vec![
+                WorkflowTransitionDefinition {
+                    from_node: "node-a".to_owned(),
+                    to_node: "node-b".to_owned(),
+                    condition: TransitionCondition::Always,
+                    required_artifact_types: vec![],
+                },
+                WorkflowTransitionDefinition {
+                    from_node: "node-b".to_owned(),
+                    to_node: "node-a".to_owned(),
+                    condition: TransitionCondition::Always,
+                    required_artifact_types: vec![],
+                },
+            ],
+            default_budget: ExecutionBudget::default(),
+            content_hash: "hash".to_owned(),
+        };
+
+        assert!(wf_cycle.validate().is_err());
     }
 }

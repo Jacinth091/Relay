@@ -4,7 +4,7 @@
 **Date:** 2026-09-17  
 **Product:** Relay  
 **Architecture generation:** v2  
-**Implementation status:** per-phase status tracked in [ROADMAP.md](ROADMAP.md); no phase is complete until its production exit gate is proven  
+**Implementation status:** per-phase status tracked in [ROADMAP.md](ROADMAP.md); no phase is complete until its production exit gate is proven — see [REMEDIATION-WAVES.md](REMEDIATION-WAVES.md) for the current correction plan  
 
 > **Reading note:** this pack is the 2026-09-17 proposal. The documents below
 > describe the intended v2 architecture, not a claim about current behavior.

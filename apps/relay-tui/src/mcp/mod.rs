@@ -31,7 +31,7 @@ pub(crate) mod service;
 #[cfg(test)]
 mod tests;
 
-use relay_core::{MAX_LOCAL_TASK_INPUT_BYTES, Relay, SqliteStore};
+use relay_core::{DaemonClientHandle, MAX_LOCAL_TASK_INPUT_BYTES, Relay, SqliteStore};
 use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, BufReader};
 
@@ -50,7 +50,12 @@ const SERVER_NAME: &str = "relay";
 /// because the specifications do not gate client requests on initialize).
 pub(crate) struct McpServer {
     relay: Relay,
+    /// Read-only handle, used for test/listing views only (see
+    /// `store_list_view`); durable mutations (`submit_handoff`) go through
+    /// `daemon` instead.
+    #[allow(dead_code)]
     store: SqliteStore,
+    daemon: DaemonClientHandle,
     /// Legacy-era session state: negotiated revision, if any.
     negotiated_legacy_version: Option<&'static str>,
     /// Legacy-era session state: set once `notifications/initialized` lands.
@@ -58,10 +63,11 @@ pub(crate) struct McpServer {
 }
 
 impl McpServer {
-    pub(crate) fn new(relay: Relay, store: SqliteStore) -> Self {
+    pub(crate) fn new(relay: Relay, store: SqliteStore, daemon: DaemonClientHandle) -> Self {
         Self {
             relay,
             store,
+            daemon,
             negotiated_legacy_version: None,
             legacy_initialized: false,
         }
@@ -318,7 +324,7 @@ impl McpServer {
         id: RpcId,
         era: McpProtocolEra,
     ) -> RpcResponse {
-        match service::execute_submit_handoff(&mut self.relay, &self.store, raw_params_json).await {
+        match service::execute_submit_handoff(&self.relay, &self.daemon, raw_params_json).await {
             Ok(task_id) => success_response(id, submit_result(task_id, era)),
             Err((code, message)) => failure_response(Some(id), code, message),
         }
@@ -418,8 +424,12 @@ pub(crate) const MAX_FRAME_BYTES: usize = MAX_LOCAL_TASK_INPUT_BYTES as usize * 
 /// Frames are read with an explicit byte budget: over-limit frames are
 /// drained (through their newline) and rejected with a structured error, so
 /// framing stays intact and the process never buffers an unbounded line.
-pub(crate) async fn run(relay: Relay, store: SqliteStore) -> std::io::Result<()> {
-    let mut server = McpServer::new(relay, store);
+pub(crate) async fn run(
+    relay: Relay,
+    store: SqliteStore,
+    daemon: DaemonClientHandle,
+) -> std::io::Result<()> {
+    let mut server = McpServer::new(relay, store, daemon);
     let mut reader = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
 

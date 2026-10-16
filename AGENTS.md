@@ -290,8 +290,10 @@ Add focused integration tests for process boundaries, repository safety, recover
 ## 12. Next Up (so agents don't guess)
 
 1. **Relay Architecture v2 Rebaseline** — follow the 16-phase sequential implementation plan in `docs/v2_architecture_rebaseline/02-IMPLEMENTATION-SEQUENCE.md`. Per-phase status is tracked authoritatively in `docs/v2_architecture_rebaseline/ROADMAP.md` — read that table for current truth, do not rely on this section for phase status, and do not mark a phase `DONE` here or there until its production exit gate is proven.
-2. The roadmap's `DONE` entries rest on unit and integration test evidence; most v2 proof runs use deterministic/fake infrastructure (`FakeBackplane`, fake runtime, in-process clients). The production **Run** path still executes the v1 `ExecutionScheduler`, and the cutover to the v2 orchestrator is **not implemented at this revision**. Do not describe the v2 orchestration domain as wired into the production path until that cutover lands and is proven end to end.
-3. If committed work on a branch contradicts `ROADMAP.md`, **report the drift to the maintainer**; do not rewrite the status tables yourself.
+2. A governed external review found PR #12 could not merge: v2 modules existed but were not wired into the production path and most v2 state was memory-only. The correction plan is tracked wave-by-wave in `docs/v2_architecture_rebaseline/REMEDIATION-WAVES.md`. **Wave A (in progress)**: canonical daemon ownership actually wired into TUI/MCP, crash-safe command/effect idempotency, and durable state for the paths that wave touches.
+3. Do not start Wave B work (Run-path cutover to the v2 orchestrator, trust/workflow/policy/digest/lease corrections) until Wave A is accepted — see the remediation waves doc for the full ordering and dependency reasoning.
+4. The roadmap's `DONE` entries rest on unit and integration test evidence; most v2 proof runs use deterministic/fake infrastructure (`FakeBackplane`, fake runtime, in-process clients). The production **Run** path still executes the v1 `ExecutionScheduler`, and the cutover to the v2 orchestrator is **not implemented at this revision**. Do not describe the v2 orchestration domain as wired into the production path until that cutover lands and is proven end to end.
+5. If committed work on a branch contradicts `ROADMAP.md`, **report the drift to the maintainer**; do not rewrite the status tables yourself.
 
 ## 13. Working on this repository as a public project
 

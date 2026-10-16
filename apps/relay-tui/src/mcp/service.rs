@@ -12,8 +12,8 @@
 //! explicit local Run approval in the TUI.
 
 use relay_core::{
-    MAX_LOCAL_TASK_INPUT_BYTES, Relay, SqliteStore, StoredTask, TaskIngressError,
-    TaskPersistenceError,
+    CommandStatus, DaemonClient, DaemonClientHandle, DaemonCommand, DaemonError,
+    MAX_LOCAL_TASK_INPUT_BYTES, Relay, TaskId, TaskIngressError, new_command_id,
 };
 use relay_protocol::ProtocolError;
 use serde::Deserialize;
@@ -107,10 +107,10 @@ struct ToolCallParams<'a> {
 /// success, or a final `(error code, message)` pair — every failure branch
 /// leaves nothing persisted.
 pub(crate) async fn execute_submit_handoff(
-    relay: &mut Relay,
-    store: &SqliteStore,
+    relay: &Relay,
+    daemon: &DaemonClientHandle,
     raw_params_json: &str,
-) -> Result<relay_core::TaskId, (i64, String)> {
+) -> Result<TaskId, (i64, String)> {
     let envelope: ToolCallEnvelope<'_> = match serde_json::from_str(raw_params_json) {
         Ok(envelope) => envelope,
         Err(error) => {
@@ -156,13 +156,33 @@ pub(crate) async fn execute_submit_handoff(
         Err(error) => return Err(map_ingress_error(&error)),
     };
 
-    // Never claim success unless the store confirmed durability.
-    let stored: StoredTask = match relay.confirm_task_import_with_store(store, candidate).await {
-        Ok(stored) => stored,
-        Err(error) => return Err(map_persistence_error(&error)),
+    let handoff_json = match serde_json::to_string(candidate.handoff()) {
+        Ok(json) => json,
+        Err(error) => {
+            return Err((
+                p::INTERNAL_ERROR,
+                format!("failed to serialize validated task: {error}"),
+            ));
+        }
+    };
+    let command_id = new_command_id();
+    let command = DaemonCommand::SubmitHandoff {
+        project_key: candidate.project_key().as_str().to_owned(),
+        handoff_json,
+        submission_transport: candidate.submission_transport().as_str().to_owned(),
     };
 
-    Ok(stored.id)
+    // Never claim success unless the daemon confirmed durability.
+    match daemon.submit_command(&command_id, command).await {
+        Ok(CommandStatus::Applied | CommandStatus::Duplicate) => {
+            Ok(TaskId::deterministic_from_command_id(&command_id))
+        }
+        Ok(CommandStatus::Failed) => Err((
+            p::STORE_UNAVAILABLE,
+            "the daemon rejected the submit_handoff command".to_owned(),
+        )),
+        Err(error) => Err(map_daemon_error(&error)),
+    }
 }
 
 fn ensure_payload_within_size_cap(raw_payload: &str) -> Result<(), (i64, String)> {
@@ -208,12 +228,15 @@ pub(crate) fn map_ingress_error(error: &TaskIngressError) -> (i64, String) {
     }
 }
 
-/// Maps persistence failures; any store problem means durability was NOT
-/// confirmed and must surface as STORE_UNAVAILABLE rather than success.
-pub(crate) fn map_persistence_error(error: &TaskPersistenceError) -> (i64, String) {
+/// Maps daemon command failures; any transport or store problem means
+/// durability was NOT confirmed and must surface as STORE_UNAVAILABLE rather
+/// than success.
+pub(crate) fn map_daemon_error(error: &DaemonError) -> (i64, String) {
     use crate::mcp::protocol as p;
     match error {
-        TaskPersistenceError::Store(_) => (p::STORE_UNAVAILABLE, error.to_string()),
+        DaemonError::NotRunning | DaemonError::Transport(_) | DaemonError::Store(_) => {
+            (p::STORE_UNAVAILABLE, error.to_string())
+        }
         _ => (p::INTERNAL_ERROR, error.to_string()),
     }
 }

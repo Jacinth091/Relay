@@ -216,3 +216,130 @@ disallowed_tools = ["sudo", "curl", "arbitrary_script"]
 
     let _ = fs::remove_dir_all(repo_dir);
 }
+
+#[test]
+fn trust_classification_verifies_expected_remote_and_gates_worktree_creation() {
+    let repo_dir = unique_temp_repo("trust-remote-gate");
+    let relay_dir = repo_dir.join(".relay");
+    fs::create_dir_all(&relay_dir).unwrap();
+
+    // 1. Initialize git repo
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo_dir)
+        .arg("init")
+        .output()
+        .expect("git init");
+    assert!(status.status.success());
+
+    // Valid declared identity
+    fs::write(
+        relay_dir.join("project.toml"),
+        r#"
+[project]
+schema_version = 1
+project_id = "verified-project"
+name = "Verified Project"
+"#,
+    )
+    .unwrap();
+
+    let loaded = PortableRepositoryConfig::load_from_dir(&repo_dir)
+        .unwrap()
+        .expect("loaded .relay configuration");
+
+    let pid = ProjectId::parse("verified-project").unwrap();
+    let expected = RemoteFingerprint::new("https://github.com/legitimate-org/relay.git");
+
+    let checkout = Checkout::new(
+        CheckoutId::parse("co-verified").unwrap(),
+        pid.clone(),
+        repo_dir.clone(),
+        Some(expected.clone()),
+        None,
+        CheckoutTrustState::Trusted,
+    )
+    .unwrap();
+
+    let registration = TrustedProjectRegistration::new(
+        pid.clone(),
+        Some("Verified Project".to_string()),
+        None,
+        None,
+    );
+
+    // Case 1: Missing remote (no remote added to git)
+    let res_missing = loaded.validate_and_classify(&registration, &checkout);
+    match res_missing {
+        Err(PortableConfigError::Identity(ProjectIdentityError::MissingRemote {
+            checkout_id,
+            expected: exp,
+        })) => {
+            assert_eq!(checkout_id, "co-verified");
+            assert_eq!(exp, expected.to_string());
+        }
+        other => panic!("expected MissingRemote, got {other:?}"),
+    }
+
+    // Worktree creation refuses to proceed with an untrusted classification
+    let untrusted = relay_core::TrustClassification::UntrustedDeclaration {
+        reason: "Remote verification failed".to_string(),
+    };
+    let wt_err = relay_core::WorktreeManager::create_isolated_worktree(
+        &checkout, &untrusted, "wt-test", "HEAD",
+    );
+    assert!(wt_err.is_err());
+
+    // Case 2: Wrong remote added
+    let add_out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo_dir)
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/attacker-org/relay.git",
+        ])
+        .output()
+        .expect("git remote add");
+    assert!(add_out.status.success());
+
+    let res_mismatch = loaded.validate_and_classify(&registration, &checkout);
+    match res_mismatch {
+        Err(PortableConfigError::Identity(ProjectIdentityError::RemoteMismatch {
+            expected: exp,
+            actual,
+        })) => {
+            assert!(exp.contains("legitimate-org"));
+            assert!(actual.contains("attacker-org"));
+        }
+        other => panic!("expected RemoteMismatch, got {other:?}"),
+    }
+
+    // Case 3: Normalized-equivalent remote succeeds
+    let set_out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo_dir)
+        .args([
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/legitimate-org/relay",
+        ])
+        .output()
+        .expect("git remote set-url");
+    assert!(set_out.status.success());
+
+    let res_ok = loaded.validate_and_classify(&registration, &checkout);
+    assert!(res_ok.is_ok());
+    let trust = res_ok.unwrap();
+    assert_eq!(
+        trust,
+        relay_core::TrustClassification::TrustedAgainstRegistration {
+            project_id: pid,
+            checkout_id: "co-verified".to_string(),
+        }
+    );
+
+    let _ = fs::remove_dir_all(repo_dir);
+}

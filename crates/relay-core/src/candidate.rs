@@ -8,8 +8,6 @@
 //! - Candidate invalidation verification when repo state diverges.
 
 use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
     io,
     path::{Path, PathBuf},
     process::Command,
@@ -20,7 +18,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    Checkout, CheckoutId, ProjectId, RoleAttemptId, RoleInstanceId, TaskId, WorkflowRunId,
+    Checkout, CheckoutId, ProjectId, RoleAttemptId, RoleInstanceId, TaskId, TrustClassification,
+    WorkflowRunId, digest::sha256_digest,
 };
 
 #[derive(Debug, Error)]
@@ -29,6 +28,8 @@ pub enum CandidateError {
     Git(String),
     #[error("io error: {0}")]
     Io(#[from] io::Error),
+    #[error("checkout is not trusted for worktree creation: {0}")]
+    UntrustedCheckout(String),
     #[error("unauthorized worktree path outside checkout root: {0}")]
     UnauthorizedWorktreePath(PathBuf),
     #[error("worktree creation failed: {0}")]
@@ -41,20 +42,28 @@ pub enum CandidateError {
         observed: Box<CandidateFingerprint>,
     },
     #[error(
-        "lease expired or superseded: current fencing token is {current}, attempted {attempted}"
+        "lease fencing token mismatch: authoritative fencing token is {current}, attempted {attempted}"
     )]
     FencingConflict { current: u64, attempted: u64 },
+    #[error("lease has expired: expires_at {expires_at}")]
+    LeaseExpired { expires_at: String },
+    #[error("lease is not active: state is {state:?}")]
+    LeaseNotActive { state: LeaseState },
+    #[error("lease resource mismatch: expected {expected:?}, observed {observed:?}")]
+    LeaseResourceMismatch {
+        expected: LeaseResource,
+        observed: LeaseResource,
+    },
+    #[error("lease holder mismatch: expected {expected_holder}, observed {observed_holder}")]
+    LeaseHolderMismatch {
+        expected_holder: String,
+        observed_holder: String,
+    },
 }
 
-/// Computes a hex-encoded SHA-like digest from bytes using standard hash + formatting.
+/// Computes a hex-encoded SHA-256 digest from bytes.
 pub fn compute_digest(bytes: &[u8]) -> String {
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    let h1 = hasher.finish();
-    let mut hasher2 = DefaultHasher::new();
-    h1.hash(&mut hasher2);
-    let h2 = hasher2.finish();
-    format!("{:016x}{:016x}", h1, h2)
+    sha256_digest(bytes)
 }
 
 fn now_timestamp() -> String {
@@ -210,9 +219,27 @@ impl WorktreeManager {
     /// Creates an isolated worktree rooted strictly inside `checkout.allowed_worktree_root`.
     pub fn create_isolated_worktree(
         checkout: &Checkout,
+        trust: &TrustClassification,
         worktree_name: &str,
         base_commit: &str,
     ) -> Result<WorktreeHandle, CandidateError> {
+        match trust {
+            TrustClassification::TrustedAgainstRegistration {
+                project_id,
+                checkout_id,
+            } => {
+                if project_id != &checkout.project_id || checkout_id != checkout.id.as_str() {
+                    return Err(CandidateError::UntrustedCheckout(format!(
+                        "trust classification is for {project_id}/{checkout_id} but checkout is {}/{}",
+                        checkout.project_id, checkout.id
+                    )));
+                }
+            }
+            TrustClassification::UntrustedDeclaration { reason } => {
+                return Err(CandidateError::UntrustedCheckout(reason.clone()));
+            }
+        }
+
         let name_path = Path::new(worktree_name);
         if name_path.is_absolute()
             || name_path.components().any(|c| {
@@ -327,7 +354,7 @@ pub struct LeaseHolder {
     pub host: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LeaseState {
     Active,
@@ -373,18 +400,49 @@ impl Lease {
         }
     }
 
-    /// Verifies that a caller's fencing token is current, rejecting stale or superseded holders.
+    /// Verifies that a caller's fencing token is current, rejecting stale, superseded, expired, or mismatched holders.
     pub fn assert_valid(&self, candidate_fencing_token: u64) -> Result<(), CandidateError> {
         if self.state != LeaseState::Active {
+            return Err(CandidateError::LeaseNotActive { state: self.state });
+        }
+        if candidate_fencing_token != self.fencing_token {
             return Err(CandidateError::FencingConflict {
                 current: self.fencing_token,
                 attempted: candidate_fencing_token,
             });
         }
-        if candidate_fencing_token < self.fencing_token {
-            return Err(CandidateError::FencingConflict {
-                current: self.fencing_token,
-                attempted: candidate_fencing_token,
+        if let Ok(exp_secs) = self.expires_at.parse::<u64>() {
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if now_secs >= exp_secs {
+                return Err(CandidateError::LeaseExpired {
+                    expires_at: self.expires_at.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Verifies that a caller's fencing token, resource, and holder match this lease.
+    pub fn assert_valid_holder(
+        &self,
+        candidate_fencing_token: u64,
+        expected_resource: &LeaseResource,
+        expected_holder: &str,
+    ) -> Result<(), CandidateError> {
+        self.assert_valid(candidate_fencing_token)?;
+        if &self.resource != expected_resource {
+            return Err(CandidateError::LeaseResourceMismatch {
+                expected: expected_resource.clone(),
+                observed: self.resource.clone(),
+            });
+        }
+        if self.holder.holder_id != expected_holder {
+            return Err(CandidateError::LeaseHolderMismatch {
+                expected_holder: expected_holder.to_string(),
+                observed_holder: self.holder.holder_id.clone(),
             });
         }
         Ok(())
@@ -506,8 +564,14 @@ mod tests {
         )
         .unwrap();
 
+        let trust = TrustClassification::TrustedAgainstRegistration {
+            project_id: checkout.project_id.clone(),
+            checkout_id: checkout.id.to_string(),
+        };
+
         // 1. Valid isolated worktree within allowed root
-        let handle = WorktreeManager::create_isolated_worktree(&checkout, "wt-1", "HEAD").unwrap();
+        let handle =
+            WorktreeManager::create_isolated_worktree(&checkout, &trust, "wt-1", "HEAD").unwrap();
         assert!(handle.path.exists());
         assert!(handle.path.starts_with(&worktree_root));
 
@@ -517,7 +581,7 @@ mod tests {
 
         // 3. Reject worktree path outside allowed root (traversal attempt)
         let traversal_res =
-            WorktreeManager::create_isolated_worktree(&checkout, "../evil-escape", "HEAD");
+            WorktreeManager::create_isolated_worktree(&checkout, &trust, "../evil-escape", "HEAD");
         assert!(traversal_res.is_err());
     }
 
@@ -536,13 +600,19 @@ mod tests {
             300,
         );
 
-        // Current fencing token is valid
+        // Exact fencing token is valid
         assert!(lease.assert_valid(5).is_ok());
 
-        // Higher fencing token is valid
-        assert!(lease.assert_valid(6).is_ok());
+        // Forged or unissued higher fencing token is strictly rejected
+        assert!(matches!(
+            lease.assert_valid(6),
+            Err(CandidateError::FencingConflict {
+                current: 5,
+                attempted: 6
+            })
+        ));
 
-        // Stale fencing token (from earlier holder) is strictly rejected
+        // Stale lower fencing token is strictly rejected
         assert!(matches!(
             lease.assert_valid(4),
             Err(CandidateError::FencingConflict {
@@ -550,5 +620,45 @@ mod tests {
                 attempted: 4
             })
         ));
+
+        // Expired lease is rejected
+        let mut expired_lease = lease.clone();
+        expired_lease.expires_at = "1000".to_string(); // In the past
+        assert!(matches!(
+            expired_lease.assert_valid(5),
+            Err(CandidateError::LeaseExpired { .. })
+        ));
+
+        // Released / non-active lease is rejected
+        let mut released_lease = lease.clone();
+        released_lease.state = LeaseState::Released;
+        assert!(matches!(
+            released_lease.assert_valid(5),
+            Err(CandidateError::LeaseNotActive { .. })
+        ));
+    }
+
+    #[test]
+    fn candidate_fingerprint_uses_sha256_digests() {
+        let repo_dir = unique_temp_dir("fp-sha256");
+        create_test_repo(&repo_dir);
+
+        let fp = CandidateFingerprint::capture(&repo_dir, None).unwrap();
+        // SHA-256 hex digests are exactly 64 characters
+        assert_eq!(fp.index_digest.len(), 64);
+        assert_eq!(fp.tracked_diff_digest.len(), 64);
+        assert_eq!(fp.relevant_untracked_digest.len(), 64);
+
+        assert!(fp.index_digest.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(
+            fp.tracked_diff_digest
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
+        );
+        assert!(
+            fp.relevant_untracked_digest
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
+        );
     }
 }

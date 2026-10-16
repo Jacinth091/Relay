@@ -52,6 +52,20 @@ fn test_candidate_fingerprint_and_invalidation() {
     let fp = CandidateFingerprint::capture(&repo_dir, None).unwrap();
     assert!(!fp.current_head.is_empty());
     assert_eq!(fp.base_head, fp.current_head);
+    assert_eq!(fp.index_digest.len(), 64);
+    assert_eq!(fp.tracked_diff_digest.len(), 64);
+    assert_eq!(fp.relevant_untracked_digest.len(), 64);
+    assert!(fp.index_digest.chars().all(|c| c.is_ascii_hexdigit()));
+    assert!(
+        fp.tracked_diff_digest
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+    );
+    assert!(
+        fp.relevant_untracked_digest
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+    );
 
     let proj_id = ProjectId::parse("test-project").unwrap();
     let checkout_id = CheckoutId::generate();
@@ -133,9 +147,14 @@ fn test_worktree_isolation_and_boundary_enforcement() {
         CheckoutTrustState::Trusted,
     )
     .unwrap();
+    let trust = relay_core::TrustClassification::TrustedAgainstRegistration {
+        project_id: checkout.project_id.clone(),
+        checkout_id: checkout.id.to_string(),
+    };
 
     // 1. Create valid isolated worktree
-    let handle = WorktreeManager::create_isolated_worktree(&checkout, "attempt-1", "HEAD").unwrap();
+    let handle =
+        WorktreeManager::create_isolated_worktree(&checkout, &trust, "attempt-1", "HEAD").unwrap();
     assert!(handle.path.exists());
     assert!(handle.path.starts_with(&wt_root));
 
@@ -148,7 +167,7 @@ fn test_worktree_isolation_and_boundary_enforcement() {
 
     // 3. Directory traversal attempt must be rejected
     let traversal_err =
-        WorktreeManager::create_isolated_worktree(&checkout, "../../outside", "HEAD");
+        WorktreeManager::create_isolated_worktree(&checkout, &trust, "../../outside", "HEAD");
     assert!(traversal_err.is_err());
 }
 
@@ -167,19 +186,43 @@ fn test_lease_monotonic_fencing_tokens() {
         60,
     );
 
-    // Current token is 10
+    // Exact token is valid
     assert!(lease.assert_valid(10).is_ok());
-    // Advanced token is valid
-    assert!(lease.assert_valid(11).is_ok());
+
+    // Unissued higher token is strictly rejected
+    let forged = lease.assert_valid(11);
+    assert!(matches!(
+        forged,
+        Err(CandidateError::FencingConflict {
+            current: 10,
+            attempted: 11
+        })
+    ));
 
     // Stale token (e.g. 9 or earlier) is rejected
-    let res = lease.assert_valid(9);
+    let stale = lease.assert_valid(9);
     assert!(matches!(
-        res,
+        stale,
         Err(CandidateError::FencingConflict {
             current: 10,
             attempted: 9
         })
+    ));
+
+    // Expired lease is rejected
+    let mut expired = lease.clone();
+    expired.expires_at = "100".to_string();
+    assert!(matches!(
+        expired.assert_valid(10),
+        Err(CandidateError::LeaseExpired { .. })
+    ));
+
+    // Released lease is rejected
+    let mut released = lease.clone();
+    released.state = relay_core::LeaseState::Released;
+    assert!(matches!(
+        released.assert_valid(10),
+        Err(CandidateError::LeaseNotActive { .. })
     ));
 }
 
@@ -210,6 +253,8 @@ fn test_immutable_artifact_store_provenance_and_tamper_detection() {
         .unwrap();
 
     assert_eq!(meta.size_bytes, payload.len() as u64);
+    assert_eq!(meta.checksum.len(), 64);
+    assert!(meta.checksum.chars().all(|c| c.is_ascii_hexdigit()));
 
     // Fetch and verify content
     let retrieved = store.get(&meta).unwrap();

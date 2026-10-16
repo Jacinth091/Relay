@@ -21,6 +21,24 @@ Read, in this order:
 Check existing issues before starting substantial work, and open an issue to
 discuss anything large before writing code.
 
+## Supported platforms
+
+**Windows with the MSVC toolchain is the only supported host today**, and CI
+gates merges on it. The other leg of the CI matrix (`ubuntu-latest`) is
+*advisory*: it is labelled `[advisory]`, its build steps tolerate their own
+failure, and it never blocks a merge. Read its logs for the real errors, not its
+check mark.
+
+Linux fails for one concrete reason. The local Relay Daemon transport is a
+Windows named pipe, gated `#![cfg(windows)]`
+(`crates/relay-core/src/daemon_transport.rs` and the `daemon_runtime` module),
+while `apps/relay-tui` (`main.rs`, `state.rs`, `mcp/*`) imports those types
+unconditionally. Removing that blocker means either adding a platform-neutral
+transport or compiling the daemon path out behind a platform gate.
+
+A portability contribution is welcome. Until it lands, do not claim Linux or
+macOS support in code, documentation, or pull request descriptions.
+
 ## Architecture and boundaries
 
 Decide which layer owns a change before implementing it:

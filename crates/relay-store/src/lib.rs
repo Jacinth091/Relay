@@ -27,6 +27,11 @@ const WRITE_RETRY_ATTEMPTS: usize = 5;
 const WRITE_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(20);
 const WRITE_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(160);
 
+/// Bounded retry budget applied when two Relay processes race to apply the
+/// same migration while opening a shared database for the first time.
+const MIGRATION_RACE_ATTEMPTS: usize = 5;
+const MIGRATION_RACE_BACKOFF: Duration = Duration::from_millis(50);
+
 // Primary SQLite result codes treated as transient lock contention. Extended
 // codes (for example SQLITE_BUSY_SNAPSHOT) share the low byte.
 const SQLITE_BUSY_PRIMARY_CODE: i32 = 5;
@@ -142,6 +147,33 @@ pub struct DaemonLeaseRecord {
     pub acquired_at: String,
     pub heartbeat_at: String,
     pub fencing_token: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewResourceLeaseRecord {
+    pub id: String,
+    pub resource_type: String,
+    pub resource_id: String,
+    pub lease_kind: String,
+    pub holder_id: String,
+    pub holder_pid: i64,
+    pub holder_host: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceLeaseRecord {
+    pub id: String,
+    pub resource_type: String,
+    pub resource_id: String,
+    pub lease_kind: String,
+    pub holder_id: String,
+    pub holder_pid: i64,
+    pub holder_host: String,
+    pub fencing_token: i64,
+    pub acquired_at: String,
+    pub expires_at: String,
+    pub state: String,
 }
 
 #[derive(Debug, Clone)]
@@ -262,6 +294,79 @@ impl SqliteStore {
         ))
         .execute(&mut *transaction)
         .await?;
+
+        let task = fetch_task(&mut *transaction, &task.id)
+            .await?
+            .ok_or_else(|| StoreError::TaskMissingAfterInsert {
+                id: task.id.clone(),
+            })?;
+        transaction.commit().await?;
+        Ok(task)
+    }
+
+    /// Inserts a task only if its id is not already present, returning the
+    /// existing row unchanged on a replay instead of erroring or duplicating
+    /// the `task_ready` event. Used by daemon command replay so that
+    /// resuming a non-terminal command after a crash is idempotent.
+    pub async fn insert_task_if_absent(
+        &self,
+        task: &NewTaskRecord,
+    ) -> Result<TaskRecord, StoreError> {
+        retry_on_transient_lock(|| self.insert_task_if_absent_once(task)).await
+    }
+
+    async fn insert_task_if_absent_once(
+        &self,
+        task: &NewTaskRecord,
+    ) -> Result<TaskRecord, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        let result = sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO tasks (
+                id,
+                project_key,
+                title,
+                requested_stack,
+                submission_transport,
+                source_kind,
+                source_provider,
+                state,
+                protocol_version,
+                handoff_json
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+        )
+        .bind(&task.id)
+        .bind(&task.project_key)
+        .bind(&task.title)
+        .bind(task.requested_stack.as_deref())
+        .bind(&task.submission_transport)
+        .bind(task.source_kind.as_deref())
+        .bind(task.source_provider.as_deref())
+        .bind(&task.state)
+        .bind(task.protocol_version)
+        .bind(&task.handoff_json)
+        .execute(&mut *transaction)
+        .await?;
+
+        if result.rows_affected() > 0 {
+            sqlx::query(
+                r#"
+                INSERT INTO events (task_id, event_kind, event_json)
+                VALUES (?1, ?2, ?3)
+                "#,
+            )
+            .bind(&task.id)
+            .bind("task_ready")
+            .bind(format!(
+                r#"{{"submission_transport":"{}"}}"#,
+                task.submission_transport
+            ))
+            .execute(&mut *transaction)
+            .await?;
+        }
 
         let task = fetch_task(&mut *transaction, &task.id)
             .await?
@@ -956,6 +1061,45 @@ impl SqliteStore {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Lists commands that have not reached a terminal status (`applied` or
+    /// `failed`), for startup reconciliation after a crash or restart.
+    pub async fn list_incomplete_commands(&self) -> Result<Vec<CommandRecord>, StoreError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, command_type, payload_json, status, response_json, created_at, updated_at
+            FROM commands
+            WHERE status IN ('received', 'needs_reconciliation')
+            ORDER BY created_at ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(CommandRecord {
+                    id: r.try_get("id")?,
+                    command_type: r.try_get("command_type")?,
+                    payload_json: r.try_get("payload_json")?,
+                    status: r.try_get("status")?,
+                    response_json: r.try_get("response_json")?,
+                    created_at: r.try_get("created_at")?,
+                    updated_at: r.try_get("updated_at")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Counts commands currently in the given status, for operator/test
+    /// visibility (e.g. how many are stuck `needs_reconciliation`).
+    pub async fn count_commands_with_status(&self, status: &str) -> Result<i64, StoreError> {
+        let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM commands WHERE status = ?1")
+            .bind(status)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
     pub async fn get_command(&self, id: &str) -> Result<Option<CommandRecord>, StoreError> {
         let row = sqlx::query(
             r#"
@@ -1029,9 +1173,11 @@ impl SqliteStore {
         &self,
         effect: &NewPendingEffectRecord,
     ) -> Result<PendingEffectRecord, StoreError> {
+        // OR IGNORE makes replaying the same QueuePendingEffect command (same
+        // effect id) after a crash idempotent instead of erroring.
         sqlx::query(
             r#"
-            INSERT INTO pending_effects (id, effect_type, idempotency_key, payload_json, state)
+            INSERT OR IGNORE INTO pending_effects (id, effect_type, idempotency_key, payload_json, state)
             VALUES (?1, ?2, ?3, ?4, 'pending')
             "#,
         )
@@ -1116,6 +1262,31 @@ impl SqliteStore {
         rows.into_iter().map(row_to_pending_effect_record).collect()
     }
 
+    /// Lists effects stuck `in_flight` for at least `stale_seconds`, for the
+    /// effect worker to reconcile after a crash (nothing resumed them).
+    /// Comparison happens in SQL against the store's own ISO-8601 timestamps,
+    /// which sort lexicographically in time order, rather than parsing
+    /// timestamps back out in application code.
+    pub async fn list_stale_in_flight_effects(
+        &self,
+        stale_seconds: i64,
+    ) -> Result<Vec<PendingEffectRecord>, StoreError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, effect_type, idempotency_key, payload_json, state, attempts, last_error, created_at, updated_at
+            FROM pending_effects
+            WHERE state = 'in_flight'
+              AND updated_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1 || ' seconds')
+            ORDER BY updated_at ASC
+            "#,
+        )
+        .bind(format!("-{stale_seconds}"))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_pending_effect_record).collect()
+    }
+
     pub async fn update_effect_state(
         &self,
         id: &str,
@@ -1175,9 +1346,12 @@ impl SqliteStore {
     ) -> Result<EffectResultRecord, StoreError> {
         let mut transaction = self.pool.begin().await?;
 
+        // OR IGNORE makes replaying the same CompleteEffect command (same
+        // result id) after a crash idempotent: the subsequent SELECT below
+        // still finds the row committed by the original attempt.
         sqlx::query(
             r#"
-            INSERT INTO effect_results (id, effect_id, outcome, result_json)
+            INSERT OR IGNORE INTO effect_results (id, effect_id, outcome, result_json)
             VALUES (?1, ?2, ?3, ?4)
             "#,
         )
@@ -1411,6 +1585,248 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Acquires a durable lease on a protected resource with monotonic fencing token allocation.
+    ///
+    /// If an active lease already exists on the resource:
+    /// - If held by the same holder, updates expiry and returns the existing lease.
+    /// - If expired (current time >= expires_at), marks the existing lease 'expired',
+    ///   increments the fencing token monotonically, and inserts the new active lease.
+    /// - If active and unexpired, returns `StoreError::ResourceLeaseHeld`.
+    ///
+    /// If no prior lease exists for the resource, inserts with fencing_token = 1.
+    pub async fn acquire_resource_lease(
+        &self,
+        new_lease: &NewResourceLeaseRecord,
+    ) -> Result<ResourceLeaseRecord, StoreError> {
+        retry_on_transient_lock(|| self.acquire_resource_lease_once(new_lease)).await
+    }
+
+    async fn acquire_resource_lease_once(
+        &self,
+        new_lease: &NewResourceLeaseRecord,
+    ) -> Result<ResourceLeaseRecord, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        // 1. Find the most recent lease for this resource (active or otherwise) to determine max fencing token
+        let latest_token_row = sqlx::query(
+            r#"
+            SELECT COALESCE(MAX(fencing_token), 0) as max_token
+            FROM resource_leases
+            WHERE resource_type = ?1 AND resource_id = ?2
+            "#,
+        )
+        .bind(&new_lease.resource_type)
+        .bind(&new_lease.resource_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let max_token: i64 = latest_token_row.try_get("max_token")?;
+
+        // 2. Check if there is currently an active lease on this resource
+        let active_row = sqlx::query(
+            r#"
+            SELECT id, resource_type, resource_id, lease_kind, holder_id, holder_pid, holder_host,
+                   fencing_token, acquired_at, expires_at, state,
+                   CAST((strftime('%s', 'now') - strftime('%s', expires_at)) AS INTEGER) as expired_diff
+            FROM resource_leases
+            WHERE resource_type = ?1 AND resource_id = ?2 AND state = 'active'
+            ORDER BY fencing_token DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(&new_lease.resource_type)
+        .bind(&new_lease.resource_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+
+        if let Some(row) = active_row {
+            let active_id: String = row.try_get("id")?;
+            let active_holder: String = row.try_get("holder_id")?;
+            let active_expires: String = row.try_get("expires_at")?;
+            let expired_diff: Option<i64> = row.try_get("expired_diff")?;
+            let is_expired = expired_diff.is_some_and(|diff| diff >= 0);
+
+            if active_holder == new_lease.holder_id && !is_expired {
+                // Same holder renewing / extending active lease
+                sqlx::query(
+                    r#"
+                    UPDATE resource_leases
+                    SET expires_at = ?1
+                    WHERE id = ?2
+                    "#,
+                )
+                .bind(&new_lease.expires_at)
+                .bind(&active_id)
+                .execute(&mut *transaction)
+                .await?;
+
+                let updated = sqlx::query(
+                    r#"
+                    SELECT id, resource_type, resource_id, lease_kind, holder_id, holder_pid, holder_host,
+                           fencing_token, acquired_at, expires_at, state
+                    FROM resource_leases
+                    WHERE id = ?1
+                    "#,
+                )
+                .bind(&active_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+
+                let record = row_to_resource_lease_record(updated)?;
+                transaction.commit().await?;
+                return Ok(record);
+            } else if is_expired {
+                // Mark earlier lease as expired
+                sqlx::query(
+                    r#"
+                    UPDATE resource_leases
+                    SET state = 'expired'
+                    WHERE id = ?1
+                    "#,
+                )
+                .bind(&active_id)
+                .execute(&mut *transaction)
+                .await?;
+            } else {
+                // Still active and held by someone else
+                return Err(StoreError::ResourceLeaseHeld {
+                    resource_type: new_lease.resource_type.clone(),
+                    resource_id: new_lease.resource_id.clone(),
+                    holder_id: active_holder,
+                    expires_at: active_expires,
+                });
+            }
+        }
+
+        // Allocate monotonically incremented fencing token
+        let next_token = max_token + 1;
+
+        sqlx::query(
+            r#"
+            INSERT INTO resource_leases (
+                id, resource_type, resource_id, lease_kind,
+                holder_id, holder_pid, holder_host,
+                fencing_token, expires_at, state
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active')
+            "#,
+        )
+        .bind(&new_lease.id)
+        .bind(&new_lease.resource_type)
+        .bind(&new_lease.resource_id)
+        .bind(&new_lease.lease_kind)
+        .bind(&new_lease.holder_id)
+        .bind(new_lease.holder_pid)
+        .bind(&new_lease.holder_host)
+        .bind(next_token)
+        .bind(&new_lease.expires_at)
+        .execute(&mut *transaction)
+        .await?;
+
+        let inserted = sqlx::query(
+            r#"
+            SELECT id, resource_type, resource_id, lease_kind, holder_id, holder_pid, holder_host,
+                   fencing_token, acquired_at, expires_at, state
+            FROM resource_leases
+            WHERE id = ?1
+            "#,
+        )
+        .bind(&new_lease.id)
+        .fetch_one(&mut *transaction)
+        .await?;
+
+        let record = row_to_resource_lease_record(inserted)?;
+        transaction.commit().await?;
+        Ok(record)
+    }
+
+    /// Releases a resource lease, setting its state to 'released'.
+    pub async fn release_resource_lease(
+        &self,
+        lease_id: &str,
+        holder_id: &str,
+    ) -> Result<(), StoreError> {
+        retry_on_transient_lock(|| self.release_resource_lease_once(lease_id, holder_id)).await
+    }
+
+    async fn release_resource_lease_once(
+        &self,
+        lease_id: &str,
+        holder_id: &str,
+    ) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE resource_leases
+            SET state = 'released'
+            WHERE id = ?1 AND holder_id = ?2 AND state = 'active'
+            "#,
+        )
+        .bind(lease_id)
+        .bind(holder_id)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            // Check if lease exists
+            let exists =
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM resource_leases WHERE id = ?1")
+                    .bind(lease_id)
+                    .fetch_one(&self.pool)
+                    .await?;
+
+            if exists == 0 {
+                return Err(StoreError::ResourceLeaseNotFound {
+                    id: lease_id.to_string(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Fetches a resource lease record by its ID.
+    pub async fn get_resource_lease(
+        &self,
+        lease_id: &str,
+    ) -> Result<Option<ResourceLeaseRecord>, StoreError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, resource_type, resource_id, lease_kind, holder_id, holder_pid, holder_host,
+                   fencing_token, acquired_at, expires_at, state
+            FROM resource_leases
+            WHERE id = ?1
+            "#,
+        )
+        .bind(lease_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(row_to_resource_lease_record).transpose()
+    }
+
+    /// Fetches the currently active lease for a resource, if any.
+    pub async fn get_active_resource_lease(
+        &self,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Result<Option<ResourceLeaseRecord>, StoreError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, resource_type, resource_id, lease_kind, holder_id, holder_pid, holder_host,
+                   fencing_token, acquired_at, expires_at, state
+            FROM resource_leases
+            WHERE resource_type = ?1 AND resource_id = ?2 AND state = 'active'
+            ORDER BY fencing_token DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(resource_type)
+        .bind(resource_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(row_to_resource_lease_record).transpose()
+    }
+
     #[cfg(test)]
     async fn task_event_count(&self, id: &str) -> Result<i64, StoreError> {
         let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events WHERE task_id = ?1")
@@ -1483,27 +1899,53 @@ fn map_migration_error(error: sqlx::migrate::MigrateError) -> StoreError {
     }
 }
 
-/// Runs migrations, tolerating a benign cross-process race.
+/// Runs migrations, tolerating benign cross-process races.
 ///
-/// Two Relay processes (TUI + serve-mcp) may open a database that has never
-/// been migrated at the same moment. sqlx serializes each migration in its own
-/// transaction but not the applied-version bookkeeping across processes, so
-/// the loser of the race sees a UNIQUE constraint on `_sqlx_migrations.version`.
-/// The winner has then finished migrating; one bounded retry observes the
-/// completed migration history and succeeds. Any other failure fails closed.
+/// Relay processes (TUI, `relay daemon`, serve-mcp) may open a database that
+/// has never been migrated at the same moment. sqlx serializes each
+/// migration's DDL in its own transaction but not the applied-version
+/// bookkeeping across processes, so the loser of the race can surface either
+/// symptom:
+///
+/// - a UNIQUE constraint on `_sqlx_migrations.version`, when both processes
+///   raced the version bookkeeping; or
+/// - `... already exists`, when the loser read the migration history before the
+///   winner committed, then blocked on the winner's write lock and finally
+///   re-ran DDL the winner had committed in the meantime. Migrations
+///   deliberately avoid `IF NOT EXISTS` so that a genuinely partial schema
+///   cannot be silently accepted.
+///
+/// In both cases the winner has finished applying that migration, so a bounded
+/// retry re-reads the completed history and succeeds without re-running DDL.
+/// Every other failure - including a real schema conflict that reproduces on
+/// every attempt - fails closed.
 async fn run_migrations(pool: &SqlitePool) -> Result<(), StoreError> {
-    if let Err(error) = MIGRATOR.run(pool).await {
-        let display = error.to_string();
-        if !display.contains("_sqlx_migrations") || !display.contains("UNIQUE constraint") {
-            return Err(map_migration_error(error));
+    let mut attempt = 1usize;
+
+    loop {
+        match MIGRATOR.run(pool).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if attempt >= MIGRATION_RACE_ATTEMPTS || !is_migration_race(&error) {
+                    return Err(map_migration_error(error));
+                }
+
+                // relay-store deliberately avoids a tracing dependency; the
+                // retry is observable only as normal latency.
+                tokio::time::sleep(MIGRATION_RACE_BACKOFF * attempt as u32).await;
+                attempt += 1;
+            }
         }
-
-        // relay-store deliberately avoids a tracing dependency; the retry is
-        // observable only as normal latency.
-        MIGRATOR.run(pool).await.map_err(map_migration_error)?;
     }
+}
 
-    Ok(())
+/// Recognizes the two symptoms of two processes racing to apply the same
+/// migration (see [`run_migrations`]).
+fn is_migration_race(error: &sqlx::migrate::MigrateError) -> bool {
+    let display = error.to_string();
+
+    (display.contains("_sqlx_migrations") && display.contains("UNIQUE constraint"))
+        || display.contains("already exists")
 }
 
 async fn insert_event(
@@ -1659,6 +2101,24 @@ fn row_to_pending_effect_record(
     })
 }
 
+fn row_to_resource_lease_record(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<ResourceLeaseRecord, StoreError> {
+    Ok(ResourceLeaseRecord {
+        id: row.try_get("id")?,
+        resource_type: row.try_get("resource_type")?,
+        resource_id: row.try_get("resource_id")?,
+        lease_kind: row.try_get("lease_kind")?,
+        holder_id: row.try_get("holder_id")?,
+        holder_pid: row.try_get("holder_pid")?,
+        holder_host: row.try_get("holder_host")?,
+        fencing_token: row.try_get("fencing_token")?,
+        acquired_at: row.try_get("acquired_at")?,
+        expires_at: row.try_get("expires_at")?,
+        state: row.try_get("state")?,
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("failed to create Relay database directory '{path}': {source}")]
@@ -1686,6 +2146,17 @@ pub enum StoreError {
         holder_pid: i64,
         holder_host: String,
     },
+    #[error(
+        "resource lease on {resource_type}:{resource_id} is active and held by {holder_id} (expires {expires_at})"
+    )]
+    ResourceLeaseHeld {
+        resource_type: String,
+        resource_id: String,
+        holder_id: String,
+        expires_at: String,
+    },
+    #[error("resource lease '{id}' not found")]
+    ResourceLeaseNotFound { id: String },
     #[error("task {id} state conflict: expected '{expected_state}', found '{actual_state}'")]
     StateConflict {
         id: String,
@@ -2355,6 +2826,87 @@ mod tests {
             .unwrap();
         assert_eq!(fresh.holder_pid, 1001);
         assert_eq!(fresh.fencing_token, 1);
+    }
+
+    #[tokio::test]
+    async fn durable_resource_lease_fencing_and_lifecycle() {
+        let store = SqliteStore::in_memory().await.unwrap();
+
+        let expires_future = "2099-01-01T00:00:00.000Z".to_string();
+        let expires_past = "2000-01-01T00:00:00.000Z".to_string();
+
+        let lease_req1 = NewResourceLeaseRecord {
+            id: "lease-1".to_string(),
+            resource_type: "checkout".to_string(),
+            resource_id: "chk-1".to_string(),
+            lease_kind: "exclusive_write".to_string(),
+            holder_id: "holder-1".to_string(),
+            holder_pid: 101,
+            holder_host: "localhost".to_string(),
+            expires_at: expires_future.clone(),
+        };
+
+        // 1. Acquire initial lease -> fencing_token = 1
+        let l1 = store.acquire_resource_lease(&lease_req1).await.unwrap();
+        assert_eq!(l1.fencing_token, 1);
+        assert_eq!(l1.state, "active");
+
+        // 2. Different holder attempting concurrent active lease -> rejected
+        let lease_req2 = NewResourceLeaseRecord {
+            id: "lease-2".to_string(),
+            resource_type: "checkout".to_string(),
+            resource_id: "chk-1".to_string(),
+            lease_kind: "exclusive_write".to_string(),
+            holder_id: "holder-2".to_string(),
+            holder_pid: 102,
+            holder_host: "localhost".to_string(),
+            expires_at: expires_future.clone(),
+        };
+        let err = store.acquire_resource_lease(&lease_req2).await.unwrap_err();
+        assert!(matches!(err, StoreError::ResourceLeaseHeld { .. }));
+
+        // 3. Same holder can renew/extend
+        let l1_renewed = store.acquire_resource_lease(&lease_req1).await.unwrap();
+        assert_eq!(l1_renewed.fencing_token, 1);
+        assert_eq!(l1_renewed.id, "lease-1");
+
+        // 4. Release lease
+        store
+            .release_resource_lease("lease-1", "holder-1")
+            .await
+            .unwrap();
+        let released_record = store.get_resource_lease("lease-1").await.unwrap().unwrap();
+        assert_eq!(released_record.state, "released");
+
+        // 5. Now holder-2 can acquire -> fencing_token = 2 (monotonically incremented)
+        let l2 = store.acquire_resource_lease(&lease_req2).await.unwrap();
+        assert_eq!(l2.fencing_token, 2);
+        assert_eq!(l2.state, "active");
+
+        // 6. Expired lease allows takeover with incremented token
+        // Force expiry of lease-2
+        sqlx::query("UPDATE resource_leases SET expires_at = ?1 WHERE id = 'lease-2'")
+            .bind(&expires_past)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let lease_req3 = NewResourceLeaseRecord {
+            id: "lease-3".to_string(),
+            resource_type: "checkout".to_string(),
+            resource_id: "chk-1".to_string(),
+            lease_kind: "exclusive_write".to_string(),
+            holder_id: "holder-3".to_string(),
+            holder_pid: 103,
+            holder_host: "localhost".to_string(),
+            expires_at: expires_future,
+        };
+        let l3 = store.acquire_resource_lease(&lease_req3).await.unwrap();
+        assert_eq!(l3.fencing_token, 3);
+        assert_eq!(l3.state, "active");
+
+        let prev_l2 = store.get_resource_lease("lease-2").await.unwrap().unwrap();
+        assert_eq!(prev_l2.state, "expired");
     }
 
     fn task_record(id: &str, title: &str) -> NewTaskRecord {

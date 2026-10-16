@@ -1,0 +1,235 @@
+//! Relay Architecture v2 - Wave A: daemon process lifecycle.
+//!
+//! Owns starting a full daemon (lease heartbeat + request listener + effect
+//! worker + startup reconciliation) and the client-side logic for either
+//! connecting to an already-running daemon or embedding one in-process when
+//! none is running yet.
+
+use std::{sync::Arc, time::Duration};
+
+use tokio::sync::watch;
+
+use crate::{
+    Relay, SqliteStore,
+    daemon::{
+        CommandStatus, DaemonClient, DaemonCommand, DaemonError, DaemonEvent, DaemonServer,
+        DaemonSnapshot, InProcessDaemonClient,
+    },
+    daemon_transport::{self, NamedPipeDaemonClient},
+    effect_worker::{EffectWorkerRegistry, run_effect_worker},
+};
+
+/// A client handle to the canonical Relay Daemon, whether reached in-process
+/// (test harnesses, or this process embedding the daemon itself) or over the
+/// real local transport. `DaemonClient`'s methods use native `async fn`
+/// (RPITIT), which is not `dyn`-safe, so this enum is the minimal way to give
+/// callers one concrete type regardless of which transport won.
+pub enum DaemonClientHandle {
+    InProcess(InProcessDaemonClient),
+    Pipe(NamedPipeDaemonClient),
+}
+
+impl DaemonClient for DaemonClientHandle {
+    async fn handshake(&self, client_name: &str) -> Result<(String, i64), DaemonError> {
+        match self {
+            Self::InProcess(c) => c.handshake(client_name).await,
+            Self::Pipe(c) => c.handshake(client_name).await,
+        }
+    }
+
+    async fn get_snapshot(&self) -> Result<DaemonSnapshot, DaemonError> {
+        match self {
+            Self::InProcess(c) => c.get_snapshot().await,
+            Self::Pipe(c) => c.get_snapshot().await,
+        }
+    }
+
+    async fn get_events_after(
+        &self,
+        after_sequence: i64,
+        limit: i64,
+    ) -> Result<Vec<DaemonEvent>, DaemonError> {
+        match self {
+            Self::InProcess(c) => c.get_events_after(after_sequence, limit).await,
+            Self::Pipe(c) => c.get_events_after(after_sequence, limit).await,
+        }
+    }
+
+    async fn submit_command(
+        &self,
+        command_id: &str,
+        command: DaemonCommand,
+    ) -> Result<CommandStatus, DaemonError> {
+        match self {
+            Self::InProcess(c) => c.submit_command(command_id, command).await,
+            Self::Pipe(c) => c.submit_command(command_id, command).await,
+        }
+    }
+
+    async fn ping(&self) -> Result<(), DaemonError> {
+        match self {
+            Self::InProcess(c) => c.ping().await,
+            Self::Pipe(c) => c.ping().await,
+        }
+    }
+}
+
+/// A running embedded daemon (this process is acting as the daemon). Holds
+/// the background task handles and a shutdown signal; dropping or calling
+/// [`EmbeddedDaemon::shutdown`] stops the heartbeat, pipe listener, and
+/// effect worker cleanly.
+pub struct EmbeddedDaemon {
+    server: Arc<DaemonServer>,
+    shutdown_tx: watch::Sender<bool>,
+    heartbeat: tokio::task::JoinHandle<()>,
+    listener: tokio::task::JoinHandle<()>,
+    effect_worker: tokio::task::JoinHandle<()>,
+}
+
+impl EmbeddedDaemon {
+    pub async fn shutdown(self) {
+        let _ = self.shutdown_tx.send(true);
+        let _ = tokio::join!(self.heartbeat, self.listener, self.effect_worker);
+        // Release the lease only after the heartbeat loop has fully stopped,
+        // so nothing can renew the row right after this deletes it - a
+        // subsequent process does not have to wait out the full TTL before
+        // it can become the daemon.
+        if let Err(err) = self.server.release_lease().await {
+            tracing::warn!(error = %err, "failed to release daemon lease on shutdown");
+        }
+    }
+}
+
+/// Starts a full daemon: acquires the exclusive lease, runs startup command
+/// reconciliation once, then spawns the heartbeat loop, the named pipe
+/// request listener, and the effect worker under one shutdown signal.
+pub async fn run_full_daemon(
+    store: SqliteStore,
+    relay: Relay,
+    lease_id: &str,
+    lease_ttl: Duration,
+    pipe_name: &str,
+) -> Result<(Arc<DaemonServer>, EmbeddedDaemon), DaemonError> {
+    let daemon = DaemonServer::start(store, relay, lease_id, lease_ttl).await?;
+
+    daemon.reconcile_on_startup().await?;
+
+    let server = Arc::new(daemon);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let heartbeat = tokio::spawn(run_heartbeat_loop(
+        Arc::clone(&server),
+        lease_ttl,
+        shutdown_rx.clone(),
+    ));
+
+    let listener_server = Arc::clone(&server);
+    let listener_pipe_name = pipe_name.to_owned();
+    let listener_shutdown = shutdown_rx.clone();
+    let listener = tokio::spawn(async move {
+        if let Err(err) = daemon_transport::run_named_pipe_listener(
+            listener_server,
+            &listener_pipe_name,
+            listener_shutdown,
+        )
+        .await
+        {
+            tracing::error!(error = %err, "daemon pipe listener stopped with an error");
+        }
+    });
+
+    let worker_store = server.store().clone();
+    let effect_worker = tokio::spawn(run_effect_worker(
+        worker_store,
+        EffectWorkerRegistry::new(),
+        Duration::from_secs(5),
+        5,
+        shutdown_rx,
+    ));
+
+    Ok((
+        Arc::clone(&server),
+        EmbeddedDaemon {
+            server,
+            shutdown_tx,
+            heartbeat,
+            listener,
+            effect_worker,
+        },
+    ))
+}
+
+async fn run_heartbeat_loop(
+    server: Arc<DaemonServer>,
+    ttl: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let heartbeat_interval = (ttl / 3).max(Duration::from_secs(1));
+    let mut interval = tokio::time::interval(heartbeat_interval);
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                if let Err(err) = server.heartbeat(ttl).await {
+                    tracing::error!(error = %err, "failed to renew daemon lease heartbeat");
+                    return;
+                }
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Generates a fresh command id for a client submitting a `DaemonCommand`.
+pub fn new_command_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Connects to an already-running daemon over the local pipe; if none is
+/// running, embeds a daemon in this process instead. Returns the client
+/// handle and, when this process became the daemon, the embedded daemon
+/// guard (the caller keeps it alive for the process lifetime and shuts it
+/// down on exit).
+pub async fn connect_or_embed(
+    store: SqliteStore,
+    relay: Relay,
+    lease_id: &str,
+    lease_ttl: Duration,
+    pipe_name: &str,
+) -> Result<(DaemonClientHandle, Option<EmbeddedDaemon>), DaemonError> {
+    let pipe_client = NamedPipeDaemonClient::new(pipe_name);
+    match pipe_client.ping().await {
+        Ok(()) => return Ok((DaemonClientHandle::Pipe(pipe_client), None)),
+        Err(DaemonError::NotRunning) => {}
+        Err(other) => return Err(other),
+    }
+
+    match run_full_daemon(store, relay, lease_id, lease_ttl, pipe_name).await {
+        Ok((server, embedded)) => Ok((
+            DaemonClientHandle::InProcess(InProcessDaemonClient::new(server)),
+            Some(embedded),
+        )),
+        Err(DaemonError::LeaseHeld(_)) => {
+            // Another process won the race to become the daemon between our
+            // ping and our attempt to start one. Give it a moment to finish
+            // opening its pipe, then connect as a client.
+            const RETRY_ATTEMPTS: u32 = 10;
+            for attempt in 1..=RETRY_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(50 * u64::from(attempt))).await;
+                match pipe_client.ping().await {
+                    Ok(()) => return Ok((DaemonClientHandle::Pipe(pipe_client), None)),
+                    Err(DaemonError::NotRunning) => continue,
+                    Err(other) => return Err(other),
+                }
+            }
+            Err(DaemonError::Transport(
+                "another Relay process is starting the daemon; try again".to_owned(),
+            ))
+        }
+        Err(other) => Err(other),
+    }
+}

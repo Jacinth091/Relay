@@ -146,6 +146,7 @@ impl PolicyCompiler {
         user_layer: Option<&PolicyLayer>,
         project_layer: Option<&PolicyLayer>,
         repo_layer: Option<&PolicyLayer>,
+        workflow_layer: Option<&PolicyLayer>,
         role_layer: Option<&PolicyLayer>,
     ) -> Vec<PolicyDecision> {
         let floor = built_in_safety_floor();
@@ -190,6 +191,13 @@ impl PolicyCompiler {
                 if let Some(layer) = repo_layer {
                     if let Some((d, r)) = layer.get_disposition(cap) {
                         reasons.push(format!("repo: {r}"));
+                        effective_disp = effective_disp.intersect(d);
+                    }
+                }
+
+                if let Some(layer) = workflow_layer {
+                    if let Some((d, r)) = layer.get_disposition(cap) {
+                        reasons.push(format!("workflow: {r}"));
                         effective_disp = effective_disp.intersect(d);
                     }
                 }
@@ -239,7 +247,8 @@ mod tests {
             "role wants auto-push",
         );
 
-        let decisions = PolicyCompiler::compile(None, None, Some(&repo_layer), Some(&role_layer));
+        let decisions =
+            PolicyCompiler::compile(None, None, Some(&repo_layer), None, Some(&role_layer));
         let push_decision = decisions
             .iter()
             .find(|d| d.capability == Capability::GitPush)
@@ -257,7 +266,7 @@ mod tests {
             "offline mode",
         );
 
-        let decisions = PolicyCompiler::compile(Some(&user_layer), None, None, None);
+        let decisions = PolicyCompiler::compile(Some(&user_layer), None, None, None, None);
         let net_decision = decisions
             .iter()
             .find(|d| d.capability == Capability::NetworkAccess)
@@ -275,12 +284,40 @@ mod tests {
             "no child processes",
         );
 
-        let decisions = PolicyCompiler::compile(None, None, Some(&repo_layer), None);
+        let decisions = PolicyCompiler::compile(None, None, Some(&repo_layer), None, None);
         let spawn_decision = decisions
             .iter()
             .find(|d| d.capability == Capability::ProcessSpawn)
             .unwrap();
 
         assert_eq!(spawn_decision.disposition, PolicyDisposition::Deny);
+    }
+
+    #[test]
+    fn workflow_layer_can_tighten_but_cannot_loosen() {
+        let wf_tighten = PolicyLayer::new("workflow").with_rule(
+            Capability::FilesystemWrite,
+            PolicyDisposition::Deny,
+            "workflow forbids direct write",
+        );
+        let decisions = PolicyCompiler::compile(None, None, None, Some(&wf_tighten), None);
+        let write_decision = decisions
+            .iter()
+            .find(|d| d.capability == Capability::FilesystemWrite)
+            .unwrap();
+        assert_eq!(write_decision.disposition, PolicyDisposition::Deny);
+
+        // Workflow attempting to loosen GitPush HardDeny fails
+        let wf_loosen = PolicyLayer::new("workflow").with_rule(
+            Capability::GitPush,
+            PolicyDisposition::Allow,
+            "workflow wants git push",
+        );
+        let decisions2 = PolicyCompiler::compile(None, None, None, Some(&wf_loosen), None);
+        let push_decision = decisions2
+            .iter()
+            .find(|d| d.capability == Capability::GitPush)
+            .unwrap();
+        assert_eq!(push_decision.disposition, PolicyDisposition::HardDeny);
     }
 }

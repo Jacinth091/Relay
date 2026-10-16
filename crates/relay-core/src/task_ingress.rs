@@ -17,6 +17,10 @@ pub const MAX_LOCAL_TASK_INPUT_BYTES: u64 = 512 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TaskId(Uuid);
 
+/// Namespace used to derive a stable [`TaskId`] from a daemon command id.
+/// Fixed and arbitrary; only required to be stable across process restarts.
+const TASK_ID_COMMAND_NAMESPACE: Uuid = Uuid::from_bytes(*b"RelayTaskIdNsV2!");
+
 impl TaskId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
@@ -28,6 +32,17 @@ impl TaskId {
 
     pub fn parse(input: impl AsRef<str>) -> Result<Self, uuid::Error> {
         Uuid::parse_str(input.as_ref()).map(Self)
+    }
+
+    /// Derives a deterministic task id from a daemon command id, so that
+    /// replaying the same `SubmitHandoff` command (same command id) after a
+    /// crash or duplicate request always resolves to the same task instead
+    /// of minting a fresh random id on every `apply_command` call.
+    pub fn deterministic_from_command_id(command_id: &str) -> Self {
+        Self(Uuid::new_v5(
+            &TASK_ID_COMMAND_NAMESPACE,
+            command_id.as_bytes(),
+        ))
     }
 }
 
@@ -57,6 +72,15 @@ impl SubmissionTransport {
             Self::LocalFile => "local-file",
             Self::LocalPaste => "local-paste",
             Self::RelayMcp => "relay-mcp",
+        }
+    }
+
+    pub fn parse(input: &str) -> Option<Self> {
+        match input {
+            "local-file" => Some(Self::LocalFile),
+            "local-paste" => Some(Self::LocalPaste),
+            "relay-mcp" => Some(Self::RelayMcp),
+            _ => None,
         }
     }
 }
@@ -89,8 +113,15 @@ impl TaskImportCandidate {
 
     /// Consumes a validated candidate and assigns Relay-owned task identity.
     pub fn into_imported_task(self) -> ImportedTask {
+        self.into_imported_task_with_id(TaskId::new())
+    }
+
+    /// Consumes a validated candidate and assigns a caller-supplied task
+    /// identity, used by the daemon command path so that replaying the same
+    /// command id is idempotent instead of minting a new random task id.
+    pub fn into_imported_task_with_id(self, id: TaskId) -> ImportedTask {
         ImportedTask {
-            id: TaskId::new(),
+            id,
             handoff: self.handoff,
             project_key: self.project_key,
             project_name: self.project_name,
@@ -199,8 +230,52 @@ impl Relay {
         self.task_import_candidate(handoff, SubmissionTransport::RelayMcp)
     }
 
+    /// Reconstructs a task import candidate from already-serialized handoff
+    /// JSON and its original submission transport.
+    ///
+    /// Used by the daemon command path: by the time a `SubmitHandoff`
+    /// command reaches `apply_command`, the client has already parsed and
+    /// validated the handoff (as a local file, paste, or MCP submission) and
+    /// serializes the resulting [`HandoffTask`] to canonical JSON. The daemon
+    /// never re-reads a client-supplied file path from disk; it only
+    /// re-resolves the project registry entry against its own state, exactly
+    /// as the original preview did.
+    pub(crate) fn resolve_task_import_candidate(
+        &self,
+        handoff_json: &str,
+        submission_transport: SubmissionTransport,
+    ) -> Result<TaskImportCandidate, TaskIngressError> {
+        ensure_input_within_size_limit(handoff_json.len(), MAX_LOCAL_TASK_INPUT_BYTES)?;
+
+        let handoff = match submission_transport {
+            SubmissionTransport::RelayMcp => {
+                let handoff = parse_handoff_task_json(handoff_json)?;
+                if !handoff.extensions.is_empty() {
+                    return Err(TaskIngressError::ExtensionsNotAllowed);
+                }
+                handoff
+            }
+            SubmissionTransport::LocalFile | SubmissionTransport::LocalPaste => {
+                parse_handoff_task_text(handoff_json)?
+            }
+        };
+
+        self.task_import_candidate(handoff, submission_transport)
+    }
+
     pub fn confirm_task_import(&mut self, candidate: TaskImportCandidate) -> &ImportedTask {
         self.accept_imported_task(candidate.into_imported_task())
+    }
+
+    /// Records a candidate as reviewed under a caller-supplied task id, for
+    /// callers (the daemon command path) that already know the durable task
+    /// id independently and must not mint a second, different one locally.
+    pub fn accept_imported_task_with_id(
+        &mut self,
+        candidate: TaskImportCandidate,
+        id: TaskId,
+    ) -> &ImportedTask {
+        self.accept_imported_task(candidate.into_imported_task_with_id(id))
     }
 
     pub(crate) fn accept_imported_task(&mut self, imported: ImportedTask) -> &ImportedTask {

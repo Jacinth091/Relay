@@ -5,11 +5,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use relay_core::{
-    CoreExecutionEvent, ExecutionLimits, ExecutionReport, ExecutionScheduler,
-    ExecutionSchedulerError, GitHubRepositoryMetadata, ProjectKey, RegisterProject, Relay,
-    RepositoryInspection, SchedulerSnapshot, SchedulerTaskStatus, SqliteStore, StoredTask, TaskId,
-    TaskImportCandidate, TaskState, TrustedProject, inspect_trusted_project_repository,
-    list_stored_tasks,
+    CommandStatus, CoreExecutionEvent, DaemonClient, DaemonClientHandle, DaemonCommand,
+    ExecutionLimits, ExecutionReport, ExecutionScheduler, ExecutionSchedulerError,
+    GitHubRepositoryMetadata, ProjectKey, RegisterProject, Relay, RepositoryInspection,
+    SchedulerSnapshot, SchedulerTaskStatus, SqliteStore, StoredTask, TaskId, TaskImportCandidate,
+    TaskState, TrustedProject, inspect_trusted_project_repository, list_stored_tasks,
+    new_command_id,
 };
 #[cfg(not(test))]
 use relay_runtime::RuntimeIntegration;
@@ -206,6 +207,10 @@ pub(crate) struct AppState {
     pub(crate) registry_writable: bool,
     pub(crate) database_path: PathBuf,
     pub(crate) store: Option<SqliteStore>,
+    /// Client handle to the canonical Relay Daemon, used for durable
+    /// mutations (task submission). `store` is kept alongside it only for
+    /// reads (snapshots, listings) and the still-v1 execution/scheduler path.
+    pub(crate) daemon: Option<DaemonClientHandle>,
     pub(crate) durable_tasks: Vec<StoredTask>,
     pub(crate) selected_task: Option<TaskId>,
     pub(crate) scheduler: Option<Arc<ExecutionScheduler<RuntimeRouter>>>,
@@ -958,6 +963,7 @@ impl AppState {
             registry_writable,
             database_path,
             store,
+            daemon: None,
             durable_tasks,
             selected_task: None,
             scheduler,
@@ -1031,6 +1037,12 @@ impl AppState {
             execution_limits: app_execution_limits(),
             settings_form: SettingsForm::default(),
         }
+    }
+
+    /// Attaches a canonical daemon client handle for durable mutations.
+    /// `None` degrades task import the same way a missing `store` does.
+    pub(crate) fn attach_daemon(&mut self, daemon: Option<DaemonClientHandle>) {
+        self.daemon = daemon;
     }
 
     pub(crate) fn handle_paste(&mut self, text: &str) {
@@ -2080,9 +2092,9 @@ impl AppState {
     }
 
     pub(crate) async fn confirm_task_import(&mut self) {
-        let Some(store) = &self.store else {
+        let Some(daemon) = &self.daemon else {
             self.feedback = format!(
-                "Task import is disabled until the database is fixed: {}",
+                "Task import is disabled until the daemon is reachable: {}",
                 self.database_path.display()
             );
             return;
@@ -2093,18 +2105,42 @@ impl AppState {
             return;
         };
 
-        match self
-            .relay
-            .confirm_task_import_with_store(store, candidate.clone())
-            .await
-        {
-            Ok(stored) => {
-                let task_id = stored.id.to_string();
-                self.selected_task = Some(stored.id);
-                self.durable_tasks.push(stored);
+        let handoff_json = match serde_json::to_string(candidate.handoff()) {
+            Ok(json) => json,
+            Err(error) => {
+                self.task_candidate = Some(candidate);
+                self.feedback = format!("Failed to serialize validated task: {error}");
+                return;
+            }
+        };
+        let command_id = new_command_id();
+        let submission_transport = candidate.submission_transport().as_str().to_owned();
+
+        let submit_result = daemon
+            .submit_command(
+                &command_id,
+                DaemonCommand::SubmitHandoff {
+                    project_key: candidate.project_key().as_str().to_owned(),
+                    handoff_json,
+                    submission_transport,
+                },
+            )
+            .await;
+
+        match submit_result {
+            Ok(CommandStatus::Applied | CommandStatus::Duplicate) => {
+                let task_id = TaskId::deterministic_from_command_id(&command_id);
+                self.relay.accept_imported_task_with_id(candidate, task_id);
+                self.selected_task = Some(task_id);
+                self.refresh_durable_tasks().await;
                 self.feedback =
                     format!("Imported Relay task {task_id}. Execution has not started.");
                 self.screen = Screen::TaskReview;
+            }
+            Ok(CommandStatus::Failed) => {
+                self.task_candidate = Some(candidate);
+                self.feedback =
+                    "Failed to persist Relay task: the daemon rejected the command.".to_owned();
             }
             Err(error) => {
                 self.task_candidate = Some(candidate);

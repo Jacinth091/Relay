@@ -152,7 +152,9 @@ impl PortableRepositoryConfig {
     /// Fail-closed security rules:
     /// 1. Declared `project_id` must match `registration.project_id` (hijack prevention).
     /// 2. Checkout must be in a trusted state.
-    /// 3. Repository restrictions may clamp, but cannot broaden local policy ceilings.
+    /// 3. If an expected remote is configured on trusted local registration, the checkout's
+    ///    actual `remote.origin.url` must match it (mismatch, missing, or malformed fails closed).
+    /// 4. Repository restrictions may clamp, but cannot broaden local policy ceilings.
     pub fn validate_and_classify(
         &self,
         registration: &TrustedProjectRegistration,
@@ -162,6 +164,46 @@ impl PortableRepositoryConfig {
 
         if let Some(declared) = &self.declared_identity {
             declared.verify_matches(registration)?;
+        }
+
+        if let Some(expected) = registration.expected_remote_for(checkout) {
+            let actual_remote_opt =
+                crate::repository_safety::read_repository_remote_origin(&checkout.canonical_root)
+                    .map_err(|_| ProjectIdentityError::MissingRemote {
+                    checkout_id: checkout.id.to_string(),
+                    expected: expected.to_string(),
+                })?;
+
+            let actual_remote =
+                actual_remote_opt.ok_or_else(|| ProjectIdentityError::MissingRemote {
+                    checkout_id: checkout.id.to_string(),
+                    expected: expected.to_string(),
+                })?;
+
+            let exp_norm =
+                crate::RemoteFingerprint::normalize(expected.as_str()).map_err(|reason| {
+                    ProjectIdentityError::MalformedRemote {
+                        remote: expected.to_string(),
+                        reason,
+                    }
+                })?;
+
+            let act_norm =
+                crate::RemoteFingerprint::normalize(&actual_remote).map_err(|reason| {
+                    ProjectIdentityError::MalformedRemote {
+                        remote: actual_remote.clone(),
+                        reason,
+                    }
+                })?;
+
+            if exp_norm != act_norm {
+                return Err(PortableConfigError::Identity(
+                    ProjectIdentityError::RemoteMismatch {
+                        expected: expected.to_string(),
+                        actual: actual_remote,
+                    },
+                ));
+            }
         }
 
         Ok(TrustClassification::TrustedAgainstRegistration {

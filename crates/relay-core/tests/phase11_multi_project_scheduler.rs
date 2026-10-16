@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use relay_core::{
     CheckoutId, ProjectId, QueuedWorkItem, RoleAttemptId, RoleInstanceId, SchedulePriority,
-    SchedulerV2, SchedulerV2Config, TaskId, WorkflowRunId,
+    SchedulerV2, SchedulerV2Config, SqliteStore, TaskId, WorkflowRunId,
 };
 
 fn sample_work_item(
@@ -45,8 +45,9 @@ fn sample_work_item(
     }
 }
 
-#[test]
-fn test_multi_project_fairness_and_starvation_prevention() {
+#[tokio::test]
+async fn test_multi_project_fairness_and_starvation_prevention() {
+    let store = SqliteStore::in_memory().await.unwrap();
     let config = SchedulerV2Config {
         global_max_parallel: 2,
         per_project_max_parallel: 1,
@@ -87,7 +88,7 @@ fn test_multi_project_fairness_and_starvation_prevention() {
 
     // Tick 1: Schedule next. Global max = 2, per-project max = 1.
     // Must allocate 1 to Project A and 1 to Project B (Project A cannot monopolize both slots!)
-    let slots = scheduler.schedule_next();
+    let slots = scheduler.schedule_next(&store).await;
     assert_eq!(slots.len(), 2);
 
     let proj_a_slots = slots
@@ -106,8 +107,9 @@ fn test_multi_project_fairness_and_starvation_prevention() {
     );
 }
 
-#[test]
-fn test_exclusive_checkout_conflict_serialization() {
+#[tokio::test]
+async fn test_exclusive_checkout_conflict_serialization() {
+    let store = SqliteStore::in_memory().await.unwrap();
     let config = SchedulerV2Config {
         global_max_parallel: 4,
         per_project_max_parallel: 4,
@@ -133,7 +135,7 @@ fn test_exclusive_checkout_conflict_serialization() {
     ));
 
     // Tick 1: Only ONE item can be scheduled because the checkout is locked exclusively
-    let slots_tick1 = scheduler.schedule_next();
+    let slots_tick1 = scheduler.schedule_next(&store).await;
     assert_eq!(
         slots_tick1.len(),
         1,
@@ -141,15 +143,17 @@ fn test_exclusive_checkout_conflict_serialization() {
     );
 
     // Tick 2: Second attempt to schedule still yields 0 new slots because checkout is busy
-    let slots_tick2 = scheduler.schedule_next();
+    let slots_tick2 = scheduler.schedule_next(&store).await;
     assert_eq!(slots_tick2.len(), 0);
 
     // Release the active slot
-    let released = scheduler.release_slot(&slots_tick1[0].slot_id);
+    let released = scheduler
+        .release_slot(&slots_tick1[0].slot_id, &store)
+        .await;
     assert!(released.is_some());
 
     // Tick 3: Now the second item can be scheduled
-    let slots_tick3 = scheduler.schedule_next();
+    let slots_tick3 = scheduler.schedule_next(&store).await;
     assert_eq!(
         slots_tick3.len(),
         1,
@@ -157,8 +161,9 @@ fn test_exclusive_checkout_conflict_serialization() {
     );
 }
 
-#[test]
-fn test_provider_capacity_limiting_and_release() {
+#[tokio::test]
+async fn test_provider_capacity_limiting_and_release() {
+    let store = SqliteStore::in_memory().await.unwrap();
     let mut prov_caps = HashMap::new();
     prov_caps.insert("claude".to_string(), 2); // Claude capped at 2 slots
 
@@ -183,7 +188,7 @@ fn test_provider_capacity_limiting_and_release() {
     }
 
     // Tick 1: Schedules exactly 2 tasks because of Claude provider capacity
-    let slots = scheduler.schedule_next();
+    let slots = scheduler.schedule_next(&store).await;
     assert_eq!(
         slots.len(),
         2,
@@ -192,17 +197,18 @@ fn test_provider_capacity_limiting_and_release() {
     assert_eq!(scheduler.get_provider_active_count("claude"), 2);
 
     // Release 1 slot
-    scheduler.release_slot(&slots[0].slot_id);
+    scheduler.release_slot(&slots[0].slot_id, &store).await;
     assert_eq!(scheduler.get_provider_active_count("claude"), 1);
 
     // Tick 2: Now 1 more can be scheduled
-    let slots_tick2 = scheduler.schedule_next();
+    let slots_tick2 = scheduler.schedule_next(&store).await;
     assert_eq!(slots_tick2.len(), 1);
     assert_eq!(scheduler.get_provider_active_count("claude"), 2);
 }
 
-#[test]
-fn test_cancellation_isolation_across_projects() {
+#[tokio::test]
+async fn test_cancellation_isolation_across_projects() {
+    let store = SqliteStore::in_memory().await.unwrap();
     let config = SchedulerV2Config {
         global_max_parallel: 2,
         per_project_max_parallel: 1,
@@ -237,11 +243,11 @@ fn test_cancellation_isolation_across_projects() {
     ));
 
     // Schedule 1 from each
-    let active_slots = scheduler.schedule_next();
+    let active_slots = scheduler.schedule_next(&store).await;
     assert_eq!(active_slots.len(), 2);
 
     // Cancel Project A completely
-    let (drained_count, cancelled_active) = scheduler.cancel_project(&proj_a);
+    let (drained_count, cancelled_active) = scheduler.cancel_project(&proj_a, &store).await;
     assert_eq!(drained_count, 1, "1 queued item in Project A drained");
     assert_eq!(
         cancelled_active.len(),

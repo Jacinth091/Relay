@@ -30,6 +30,13 @@ fn pipe_suffix_for(database_path: &std::path::Path) -> String {
     format!("relay-test-{:x}", hasher.finish())
 }
 
+/// The full pipe path a daemon spawned by [`spawn_daemon`] listens on. The
+/// spawned process prefixes `RELAY_DAEMON_PIPE_SUFFIX` itself, so a test that
+/// connects as a client must build the complete name from the same suffix.
+fn pipe_name_for(database_path: &std::path::Path) -> String {
+    format!(r"\\.\pipe\{}", pipe_suffix_for(database_path))
+}
+
 fn spawn_daemon(prefix: &std::path::Path, lease_id: &str, lease_ttl: u64) -> Child {
     let database_path = prefix.join("state.sqlite3");
     let mut command = Command::new(env!("CARGO_BIN_EXE_relay"));
@@ -54,12 +61,14 @@ fn spawn_daemon(prefix: &std::path::Path, lease_id: &str, lease_ttl: u64) -> Chi
 fn daemon_starts_and_second_instance_conflicts_on_lease() {
     let prefix = unique_temp_prefix("conflict");
     let lease_id = "test-daemon-lease";
+    let database_path = prefix.join("state.sqlite3");
 
-    // Spawn first daemon
+    // Spawn the first daemon and wait until it actually answers on its pipe.
+    // The lease is taken during startup, after the store has been opened and
+    // migrated, so a fixed sleep here would race both the first migration of a
+    // fresh database and the lease insert itself on a slow machine.
     let mut d1 = spawn_daemon(&prefix, lease_id, 30);
-
-    // Give it a brief moment to acquire the lease
-    std::thread::sleep(Duration::from_millis(500));
+    let _first_client = wait_for_daemon_ready(&pipe_name_for(&database_path), &mut d1);
 
     // Spawn second daemon competing for the exact same lease
     let d2 = spawn_daemon(&prefix, lease_id, 30);
@@ -116,9 +125,9 @@ fn daemon_serves_requests_over_the_real_pipe_and_recovers_after_a_hard_kill() {
     let lease_id = "test-daemon-pipe";
     let database_path = prefix.join("state.sqlite3");
     // The client connects in-process (no environment variable hand-off), so
-    // it builds the full pipe path directly rather than going through
-    // `pipe_suffix_for` + the spawned process's own prefixing.
-    let pipe_name = format!(r"\\.\pipe\{}", pipe_suffix_for(&database_path));
+    // it builds the full pipe path directly rather than going through the
+    // spawned process's own prefixing.
+    let pipe_name = pipe_name_for(&database_path);
 
     // Short TTL so the test does not have to wait out a long default lease
     // window before a fresh daemon can take over after the hard kill below.

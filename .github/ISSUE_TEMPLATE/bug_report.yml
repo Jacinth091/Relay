@@ -1,0 +1,39 @@
+name: Bug report
+description: Report a reproducible problem in Relay.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: "Relay is an experimental hobby project with no support guarantee. Do not include secrets, private logs, user data, or exploit details. Report vulnerabilities privately as described in SECURITY.md."
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the actual behavior and what you expected.
+      placeholder: "When I ..., Relay ...; I expected ..."
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: Use a disposable test project; redact private details.
+      placeholder: "1. ...\n2. ...\n3. ..."
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Relay branch or commit
+      placeholder: "main @ commit SHA"
+  - type: input
+    id: environment
+    attributes:
+      label: Operating system and Rust version
+      placeholder: "Windows 11 / rustc ..."
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized logs or details (optional)
+      description: Double-check that all output is safe to publish.

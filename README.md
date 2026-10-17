@@ -223,20 +223,26 @@ choose **More info** → **Run anyway**.
 ### Put `relay` on your PATH (optional)
 
 To run `relay` from any folder, add the unzipped folder to your **user** `PATH`.
-Use System Properties → Environment Variables → *User variables* → `Path`, or the
-same change as one copy-paste command (run it inside the unzipped folder):
+The easiest route is the [one-line installer](#install-windows-one-line) above,
+which does this for you. Otherwise use System Properties → Environment Variables →
+*User variables* → `Path`, or this copy-paste command (run it inside the unzipped
+folder). It reads and writes the registry value directly, so `%VAR%` entries in your
+`Path` keep expanding:
 
 ```powershell
 $dir = (Resolve-Path .).Path
-[Environment]::SetEnvironmentVariable(
-  "Path",
-  [Environment]::GetEnvironmentVariable("Path", "User").TrimEnd(";") + ";$dir",
-  "User"
-)
+$key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment", $true)
+try {
+  $entries = @($key.GetValue("Path", "", "DoNotExpandEnvironmentNames") -split ";" | Where-Object { $_ })
+  if ($entries -notcontains $dir) {
+    $key.SetValue("Path", (@($entries + $dir) -join ";"), [Microsoft.Win32.RegistryValueKind]::ExpandString)
+  }
+} finally { $key.Close() }
 ```
 
-New terminals pick this up; already-open ones do not. For the current terminal
-only, use `$env:Path += ";$dir"`.
+Open a **new** terminal to pick this up (this command does not notify running
+programs). If a new terminal still does not see `relay`, sign out and back in. For
+the current terminal only, use `$env:Path += ";$dir"`.
 
 ### What the package does not include
 

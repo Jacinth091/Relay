@@ -208,6 +208,86 @@ work mixed in). Both findings were reproduced in source before any change.
   exclusion (unchanged); the PR #16 description was resynced to the corrected head
   after this branch landed.
 
+### PR #16 third re-review corrections (R19)
+
+The governed re-review of the R18 head (`d980cfe`) confirmed the R18 corrections
+(R18-01 and R18-02 **CLOSED**) but returned **BLOCK / RETURN TO DEV**: three
+further authority/lifecycle paths contradicted the single-writer and
+truthful-startup contract. R19 lands on `fix/v2-pr16-r19-authority` off
+`staging` (fix commit `ddafeb7`), with no R12-02 / Wave B work mixed in. All
+three were reproduced in source before any change.
+
+- **FLOW-19-01 (effect-worker writes — an adjacent, reachable ledger)** — the
+  daemon's effect worker mutated the same canonical `pending_effects` /
+  `effect_results` ledger the daemon owns, but through unfenced, unconditional
+  writes (`update_effect_state`, `record_effect_result`). A worker suspended
+  across a successor takeover could therefore flip a `completed` effect back to
+  `failed` and leave a contradictory second result row beside the successor's.
+  The worker now carries the daemon's `DaemonFence` and writes through
+  `update_effect_state_fenced(.., expected_state, fence)` (claim or requeue only
+  from the state it observed; `Ok(false)` when the claim moved on, typed
+  `PendingEffectNotFound` when the row is absent) and
+  `settle_effect_from_worker_fenced(..)` (result plus settle in one transaction
+  guarded by the fence and `state = 'in_flight'`), so a late result can neither
+  regress a settled effect nor add a second outcome. Losing the lease stops the
+  worker instead of letting it keep polling without authority. Regression
+  coverage: `effect_worker_writes_are_fenced_and_cannot_regress_a_settled_effect`
+  (asserts the raw `effect_results` rows) and
+  `a_stale_effect_worker_result_is_refused_after_a_successor_takes_the_lease` (a gated
+  handler holds the worker inside dispatch while the successor settles the
+  effect, which makes that interleaving deterministic rather than timing-based).
+- **DB-19-02 (lease identity was process-scoped)** — daemon leases were owned by
+  `(holder_pid, holder_host)`. Two daemon instances inside one process share both,
+  so the second instance renewed the first's fencing token instead of being
+  refused, ran its own `reconcile_on_startup` over the live instance's ledger, and
+  its failed-startup cleanup deleted the lease row the live first instance was
+  using. Migration **0009** adds `daemon_leases.holder_instance`. Renewal matches
+  pid + host + instance; a different instance is refused (`DaemonLeaseHeld`) while
+  the row is fresh and is a normal stale takeover (token + 1) once the TTL has
+  elapsed; `release_daemon_lease` is scoped to the owning instance, which
+  supersedes the pid-only scoping described for R18 above; and `DaemonFence` /
+  `assert_daemon_fence` compare the instance too, because a released row can be
+  re-acquired at the same pid with the token restarting at 1, so pid plus token
+  cannot name a generation. `DaemonServer::fence()` becomes `pub` so the effect
+  worker and the external integration tests can present the same authority; a
+  fence stays a read-only value whose every use is still checked against the live
+  lease row. Regression coverage:
+  `daemon_lease_ownership_is_per_instance_not_per_process`,
+  `a_reacquired_lease_does_not_accept_the_previous_instances_fence`, and
+  `a_second_daemon_in_one_process_cannot_share_or_delete_the_first_lease` (a
+  second `run_full_daemon` in one process is refused, the live instance's command
+  claim is not reset, its lease and token survive, and it still serves commands).
+- **FLOW-19-03 (readiness after a cancelled startup)** — the listener published
+  readiness as soon as the pipe was created, with no shutdown check, so a
+  cancellation after `create` succeeded was reported as a running daemon whose
+  listener exited on its next select. The listener now checks the shared shutdown
+  immediately before publishing readiness (no await between the check and the
+  send) and reports the cancellation instead; `run_full_daemon` re-checks the same
+  state before returning a successful handle, through the new
+  `readiness_failure`. Regression coverage:
+  `a_shutdown_set_before_readiness_is_not_reported_as_a_bound_listener` and
+  `a_readiness_signal_under_a_cancelled_startup_is_not_readiness`. The remaining
+  interleaving (a shutdown landing after the listener's check but before the host
+  returns) is closed **by construction** rather than by a test hook: no
+  `run_full_daemon`-level barrier test was added, because that would put a
+  test-only parameter on a production listener. This arm is disclosed to the
+  reviewer to grade rather than claimed as covered by a failing-before test.
+- **Bounded extras, each disclosed** — migration 0009 (required by DB-19-02); one
+  added pattern in `is_migration_race` for SQLite's "duplicate column name"
+  message, required so a concurrent first migrator of 0009 is classified like the
+  already-accepted WARN-01 class (the pattern also covers 0002 and 0008, which
+  `ALTER` the same way); and a documentation note on
+  `RecoveryCoordinator::reconcile_startup`, which writes effects unfenced but has
+  no daemon caller (its only caller is the phase-15 test), so any future
+  daemon-side caller must fence it exactly as the worker now does.
+- **Carried forward, deliberately deferred** — the optional P2 from this review (a
+  dedicated "handshake against a daemon whose authority was lost" test; the
+  behaviour itself landed in R18 WARN-02) is **not** in R19 scope and stays an
+  open P2 for the next round. WARN-01 (multi-process first-migration race) remains
+  the owner-accepted exclusion; 0009 joins that class.
+- **Migration numbering** — 0009 is now taken by this round, so Wave B's parked
+  migrations must start at **0010**.
+
 ## Wave C — Harden runtime/provider semantics
 
 Status: **NOT STARTED**

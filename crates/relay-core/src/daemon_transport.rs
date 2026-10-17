@@ -91,7 +91,10 @@ async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> std::io::Result<
 /// and `ready` is dropped unsent, which the host treats as a failed startup.
 /// If startup is cancelled (shared shutdown) while the pipe is still held, the
 /// listener reports that cancellation through `ready` rather than a successful
-/// bind, so a cancelled startup can never be mistaken for a bound listener.
+/// bind, so a cancelled startup can never be mistaken for a bound listener. The
+/// same holds for a cancellation that lands after the pipe was created but before
+/// readiness is published: the check and the publication happen without an await
+/// between them, so a shutdown already signalled is reported instead of a bind.
 pub async fn run_named_pipe_listener(
     server: Arc<DaemonServer>,
     pipe_name: &str,
@@ -149,6 +152,19 @@ pub async fn run_named_pipe_listener(
         first_instance = false;
 
         if let Some(ready) = ready.take() {
+            // Readiness is only truthful if startup has not already been
+            // cancelled: the pipe is created before the shutdown can be observed
+            // by the accept loop's select, so a cancellation in this window would
+            // otherwise be published as a successful bind and the host would
+            // return a "running" daemon whose listener exits immediately. There is
+            // no await between this check and the send, so a shutdown signalled by
+            // another task is observed here or not at all before publication.
+            if *shutdown.borrow() {
+                let _ = ready.send(Err(
+                    "daemon startup was cancelled before readiness was published".to_owned(),
+                ));
+                return Ok(());
+            }
             let _ = ready.send(Ok(()));
         }
 
@@ -713,5 +729,51 @@ mod tests {
 
         let _ = listener.await;
         drop(blocker);
+    }
+
+    /// FLOW-19-03: a startup cancelled *after* the pipe was created but before
+    /// readiness was published must not be reported as a bound listener. The
+    /// previous code signalled success as soon as `create` returned, so a shutdown
+    /// already set at that point produced a "running" daemon whose listener exited
+    /// on its very next select - and `watch::changed()` cannot be relied on to
+    /// notice, because a value set before the receiver existed is not a change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_set_before_readiness_is_not_reported_as_a_bound_listener() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let state_identity = store.store_identity().await.unwrap();
+        let server = Arc::new(
+            DaemonServer::start(
+                store,
+                test_relay(),
+                "test-lease-ready",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let pipe_name = default_pipe_name(&state_identity);
+        // Nothing holds the pipe, so `create` succeeds - that is exactly the
+        // window the readiness signal must not report as a bound transport.
+        let (shutdown_tx, shutdown_rx) = watch::channel(true);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let listener = tokio::spawn({
+            let server = Arc::clone(&server);
+            let pipe_name = pipe_name.clone();
+            async move {
+                let _ = run_named_pipe_listener(server, &pipe_name, shutdown_rx, ready_tx).await;
+            }
+        });
+
+        let outcome = ready_rx
+            .await
+            .expect("the listener must report a startup outcome");
+        assert!(
+            outcome.is_err(),
+            "a startup cancelled after the pipe was created must not report a bound listener"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = listener.await;
     }
 }

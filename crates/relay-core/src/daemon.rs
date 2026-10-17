@@ -268,9 +268,14 @@ impl DaemonServer {
     ) -> Result<Self, DaemonError> {
         let pid = std::process::id() as i64;
         let host = hostname();
+        // The lease is owned by this daemon *instance*, not merely by this
+        // process: two daemons started in one process share a pid and hostname,
+        // and a process-scoped identity would let the second renew - or a failed
+        // second startup release - the first instance's lease.
+        let instance = format!("{pid}-{}", uuid::Uuid::new_v4());
 
         let lease_record = store
-            .acquire_or_renew_daemon_lease(lease_id, pid, &host, ttl)
+            .acquire_or_renew_daemon_lease(lease_id, pid, &host, &instance, ttl)
             .await
             .map_err(|err| match err {
                 StoreError::DaemonLeaseHeld {
@@ -288,9 +293,10 @@ impl DaemonServer {
             Err(err) => {
                 // The lease was acquired, but this process cannot serve the
                 // database it just claimed. Release the lease rather than pinning
-                // it until the TTL elapses; the release is scoped to our own holder
-                // pid, so it can never delete a successor's row.
-                if let Err(release_err) = store.release_daemon_lease(lease_id, pid).await {
+                // it until the TTL elapses; the release is scoped to this exact
+                // instance, so it can never delete a successor's row.
+                if let Err(release_err) = store.release_daemon_lease(lease_id, pid, &instance).await
+                {
                     tracing::warn!(
                         error = %release_err,
                         "failed to release the daemon lease after a failed startup"
@@ -363,7 +369,11 @@ impl DaemonServer {
     }
 
     /// The durable fence this daemon must still hold for its writes to commit.
-    fn fence(&self) -> DaemonFence {
+    ///
+    /// Exposed so a daemon-owned background writer (the effect worker) can
+    /// present the same authority as the request path: every fenced store write
+    /// refuses a fence that no longer matches the live lease row.
+    pub fn fence(&self) -> DaemonFence {
         let record = self
             .lease_record
             .lock()
@@ -371,6 +381,7 @@ impl DaemonServer {
         DaemonFence {
             lease_id: record.lease_id.clone(),
             holder_pid: record.holder_pid,
+            holder_instance: record.holder_instance.clone(),
             fencing_token: record.fencing_token,
         }
     }
@@ -418,8 +429,14 @@ impl DaemonServer {
     /// this deletes it).
     pub async fn release_lease(&self) -> Result<(), DaemonError> {
         let lease_id = self.lease_id();
+        let instance = self
+            .lease_record
+            .lock()
+            .expect("lease record lock poisoned")
+            .holder_instance
+            .clone();
         self.store
-            .release_daemon_lease(&lease_id, std::process::id() as i64)
+            .release_daemon_lease(&lease_id, std::process::id() as i64, &instance)
             .await?;
         Ok(())
     }
@@ -427,11 +444,17 @@ impl DaemonServer {
     /// Renews the active lease heartbeat.
     pub async fn heartbeat(&self, ttl: Duration) -> Result<(), DaemonError> {
         let lease_id = self.lease_id();
+        let instance = self
+            .lease_record
+            .lock()
+            .expect("lease record lock poisoned")
+            .holder_instance
+            .clone();
         let pid = std::process::id() as i64;
         let host = hostname();
         let renewed = self
             .store
-            .acquire_or_renew_daemon_lease(&lease_id, pid, &host, ttl)
+            .acquire_or_renew_daemon_lease(&lease_id, pid, &host, &instance, ttl)
             .await?;
         *self
             .lease_record
@@ -1628,6 +1651,7 @@ mod tests {
                 "test-lease-ledger",
                 std::process::id() as i64 + 1,
                 "successor-host",
+                "successor-instance",
                 Duration::ZERO,
             )
             .await
@@ -1658,6 +1682,7 @@ mod tests {
         let successor_fence = DaemonFence {
             lease_id: "test-lease-ledger".to_owned(),
             holder_pid: successor.holder_pid,
+            holder_instance: successor.holder_instance.clone(),
             fencing_token: successor.fencing_token,
         };
         assert!(

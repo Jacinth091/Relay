@@ -228,6 +228,7 @@ async fn losing_the_lease_stops_the_daemon_serving_and_releases_its_pipe() {
             "lease-loss",
             std::process::id() as i64 + 1,
             "forged-successor",
+            "forged-successor-instance",
             Duration::ZERO,
         )
         .await
@@ -323,6 +324,7 @@ async fn a_daemon_that_cannot_bind_its_pipe_reports_startup_failure() {
             "lease-bind-failure",
             std::process::id() as i64 + 1,
             "other-host",
+            "other-instance",
             Duration::from_secs(60),
         )
         .await
@@ -367,6 +369,7 @@ async fn a_startup_cancelled_while_binding_fails_and_keeps_the_successor_lease()
             "lease-cancelled-bind",
             std::process::id() as i64 + 1,
             "forged-successor",
+            "forged-successor-instance",
             Duration::ZERO,
         )
         .await
@@ -397,6 +400,7 @@ async fn a_startup_cancelled_while_binding_fails_and_keeps_the_successor_lease()
             "lease-cancelled-bind",
             std::process::id() as i64 + 2,
             "third-party",
+            "third-party-instance",
             Duration::from_secs(60),
         )
         .await
@@ -447,6 +451,95 @@ async fn a_daemon_waits_for_a_held_pipe_and_then_serves() {
         .submit_command("cmd-after-retry", queue_effect("eff-retry", "idem-retry"))
         .await
         .expect("the retried listener must serve commands");
+    assert_eq!(status, CommandStatus::Applied);
+
+    embedded.shutdown().await;
+}
+
+/// DB-19-02: two daemon instances in one process share a pid and hostname. A
+/// process-scoped lease let the second instance renew the first's row (rather
+/// than being refused), and the failed-startup cleanup then deleted the lease the
+/// live first instance was using. Ownership is per instance, so the second start
+/// is refused before it touches anything, and the first keeps serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_daemon_in_one_process_cannot_share_or_delete_the_first_lease() {
+    let dir = temp_prefix("duplicate-start");
+    let store = SqliteStore::open(dir.join("state.sqlite3")).await.unwrap();
+
+    let (server, embedded) = run_full_daemon(
+        store.clone(),
+        Relay::new(),
+        "lease-duplicate",
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("the first daemon must start");
+    let client = client_for(&server);
+    wait_until_serving(&client).await;
+    let held_token = server.fencing_token();
+
+    // A command row that the live daemon has claimed: a second startup must not
+    // run its reconciliation pass over the live instance's ledger.
+    store
+        .record_command("cmd-live-claim", "queue_pending_effect", "{}")
+        .await
+        .unwrap();
+    assert!(
+        store.claim_command("cmd-live-claim").await.unwrap(),
+        "the live daemon's command must be claimable before the duplicate start"
+    );
+
+    // A second daemon start for the same database and lease id, in this process.
+    let second = run_full_daemon(
+        store.clone(),
+        Relay::new(),
+        "lease-duplicate",
+        Duration::from_secs(30),
+    )
+    .await;
+    match second {
+        Err(DaemonError::LeaseHeld(_)) => {}
+        Ok((_, other)) => {
+            other.shutdown().await;
+            panic!("a second daemon in the same process must not acquire the same lease");
+        }
+        Err(other) => panic!("expected a lease conflict for the second daemon, got {other:?}"),
+    }
+
+    // The refused start must not have cleared the live instance's claim.
+    assert!(
+        !store.claim_command("cmd-live-claim").await.unwrap(),
+        "a refused duplicate start must not reset the live instance's command claims"
+    );
+
+    // The live instance still owns the lease: a third party with a long TTL is
+    // refused rather than taking over, which it could not be if the row had been
+    // deleted by the failed start.
+    match store
+        .acquire_or_renew_daemon_lease(
+            "lease-duplicate",
+            std::process::id() as i64 + 1,
+            "other-host",
+            "other-instance",
+            Duration::from_secs(60),
+        )
+        .await
+    {
+        Err(StoreError::DaemonLeaseHeld { .. }) => {}
+        Ok(_) => panic!("the live daemon's lease must survive a refused duplicate start"),
+        Err(other) => panic!("unexpected lease error: {other:?}"),
+    }
+
+    // ...and it is still authoritative: the same token and a working command path.
+    assert_eq!(
+        server.fencing_token(),
+        held_token,
+        "a refused duplicate start must not advance the live instance's fencing token"
+    );
+    let status = client
+        .submit_command("cmd-after-duplicate", queue_effect("eff-dup", "idem-dup"))
+        .await
+        .expect("the live daemon must keep serving after a refused duplicate start");
     assert_eq!(status, CommandStatus::Applied);
 
     embedded.shutdown().await;

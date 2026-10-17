@@ -25,6 +25,38 @@ use crate::{
 /// listener rather than masked by this timeout.
 const LISTENER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The listener's readiness report: `Ok(Ok(()))` when the transport bound,
+/// `Ok(Err(reason))` when startup was cancelled instead, a dropped sender when
+/// the listener could not bind at all, and the outer `Err` when binding took
+/// longer than [`LISTENER_READY_TIMEOUT`].
+type ListenerReadiness = Result<
+    Result<Result<(), String>, tokio::sync::oneshot::error::RecvError>,
+    tokio::time::error::Elapsed,
+>;
+
+/// Interprets the listener's readiness outcome as a startup failure reason, or
+/// `None` when the daemon is genuinely bound and serving.
+///
+/// A published readiness signal is not readiness if the shared shutdown was
+/// already signalled. The listener checks that before it publishes, and this
+/// re-checks it before a successful handle is returned; neither check awaits
+/// between observing the shutdown and acting, so a cancellation can only land
+/// before the listener's check (reported by the listener) or after this one (a
+/// normal post-startup shutdown), never inside the report itself.
+fn readiness_failure(readiness: ListenerReadiness, shutdown_signalled: bool) -> Option<String> {
+    match readiness {
+        Ok(Ok(Ok(()))) if !shutdown_signalled => None,
+        Ok(Ok(Ok(()))) => {
+            Some("daemon startup was cancelled before it reported readiness".to_owned())
+        }
+        Ok(Ok(Err(reason))) => Some(reason),
+        Ok(Err(_dropped)) => {
+            Some("daemon pipe listener stopped before it bound its transport".to_owned())
+        }
+        Err(_elapsed) => Some("daemon pipe listener did not bind its transport in time".to_owned()),
+    }
+}
+
 /// A client handle to the canonical Relay Daemon, whether reached in-process
 /// (test harnesses, or this process embedding the daemon itself) or over the
 /// real local transport. `DaemonClient`'s methods use native `async fn`
@@ -184,21 +216,15 @@ pub async fn run_full_daemon(
     // listener. A dropped `ready` means the listener could not bind at all, and
     // an `Err` payload means startup was cancelled before it bound - neither is
     // reported as readiness.
-    let startup_failure = match tokio::time::timeout(LISTENER_READY_TIMEOUT, ready_rx).await {
-        Ok(Ok(Ok(()))) => None,
-        Ok(Ok(Err(reason))) => Some(reason),
-        Ok(Err(_dropped)) => {
-            Some("daemon pipe listener stopped before it bound its transport".to_owned())
-        }
-        Err(_elapsed) => Some("daemon pipe listener did not bind its transport in time".to_owned()),
-    };
+    let readiness = tokio::time::timeout(LISTENER_READY_TIMEOUT, ready_rx).await;
+    let startup_failure = readiness_failure(readiness, *shutdown_rx.borrow());
 
     if let Some(reason) = startup_failure {
         // Startup failed after the lease was acquired. Tear the whole startup
         // down - stop and join the heartbeat as well as the listener - and
         // release the lease this process still owns, so a successor does not
         // have to wait out the TTL to take over. `release_daemon_lease` is
-        // scoped to our own holder pid, so it can never delete a successor's row.
+        // scoped to this daemon instance, so it can never delete a successor's row.
         let _ = shutdown_tx.send(true);
         let _ = tokio::join!(heartbeat, listener);
         if let Err(err) = server.release_lease().await {
@@ -213,6 +239,7 @@ pub async fn run_full_daemon(
     let worker_store = server.store().clone();
     let effect_worker = tokio::spawn(run_effect_worker(
         worker_store,
+        server.fence(),
         EffectWorkerRegistry::new(),
         Duration::from_secs(5),
         5,
@@ -317,5 +344,36 @@ pub async fn connect_or_embed(
             ))
         }
         Err(other) => Err(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FLOW-19-03: a readiness signal published after the shared shutdown was
+    /// already signalled is not readiness. The host re-checks that state before it
+    /// returns a successful handle, so a startup cancelled after the pipe was
+    /// created cannot surface as a daemon whose listener is about to exit.
+    #[test]
+    fn a_readiness_signal_under_a_cancelled_startup_is_not_readiness() {
+        assert_eq!(
+            readiness_failure(Ok(Ok(Ok(()))), false),
+            None,
+            "a bound transport under a live startup is readiness"
+        );
+
+        let cancelled = readiness_failure(Ok(Ok(Ok(()))), true).expect(
+            "readiness published after a cancellation must not be reported as a running daemon",
+        );
+        assert!(
+            cancelled.contains("cancelled"),
+            "unexpected startup failure reason: {cancelled}"
+        );
+
+        // The listener's own cancellation reason is preserved rather than replaced.
+        let reason = readiness_failure(Ok(Ok(Err("listener cancelled".to_owned()))), false)
+            .expect("a cancelled listener must not be reported as readiness");
+        assert_eq!(reason, "listener cancelled");
     }
 }

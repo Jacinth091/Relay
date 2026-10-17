@@ -17,6 +17,7 @@ use relay_core::{
     EffectWorkerRegistry, InProcessDaemonClient, PendingEffectRecord, ProjectRegistry,
     RegisterProject, Relay, SqliteStore, list_stored_tasks, run_effect_worker,
 };
+use relay_store::DaemonFence;
 
 /// Always succeeds; used to prove a reconciled effect completes its
 /// lifecycle end to end, not just that it is unstuck from `in_flight`.
@@ -25,6 +26,21 @@ struct AlwaysSucceedHandler;
 impl EffectHandler for AlwaysSucceedHandler {
     async fn handle(&self, _effect: &PendingEffectRecord) -> EffectOutcome {
         EffectOutcome::Success("{}".to_owned())
+    }
+}
+
+/// Signals when it has been entered, then blocks until released, so a test can
+/// act *while* the worker holds an effect's claim.
+struct GatedHandler {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl EffectHandler for GatedHandler {
+    async fn handle(&self, _effect: &PendingEffectRecord) -> EffectOutcome {
+        self.started.notify_one();
+        self.release.notified().await;
+        EffectOutcome::Failure("late worker result".to_owned())
     }
 }
 
@@ -276,6 +292,7 @@ async fn effect_worker_reconciles_stale_in_flight_effects_after_a_crash() {
     let worker_store = store.clone();
     let worker = tokio::spawn(run_effect_worker(
         worker_store,
+        server.fence(),
         registry,
         POLL_INTERVAL,
         5,
@@ -298,4 +315,128 @@ async fn effect_worker_reconciles_stale_in_flight_effects_after_a_crash() {
         effect.state, "completed",
         "a stale in-flight effect must be reconciled and re-dispatched, not left stuck"
     );
+}
+
+/// FLOW-19-01: the effect worker mutates the same canonical `pending_effects` /
+/// `effect_results` ledger the daemon owns, so its writes are fenced on the lease
+/// and guarded on the state it claimed. A worker whose claim is overtaken while
+/// its handler runs must not settle the effect or record a contradictory result.
+///
+/// The handler gate makes the interleaving deterministic: the successor settles
+/// the effect *while* the stale worker is provably still inside its handler,
+/// which is exactly the window the unfenced worker wrote through.
+#[tokio::test]
+async fn a_stale_effect_worker_result_is_refused_after_a_successor_takes_the_lease() {
+    const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+    let store = SqliteStore::in_memory().await.unwrap();
+    let server = Arc::new(
+        DaemonServer::start(
+            store.clone(),
+            test_relay(),
+            "lease-worker-authority",
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap(),
+    );
+    let client = InProcessDaemonClient::new(server.clone());
+
+    // The effect is queued through the daemon's own command path, so it is the
+    // daemon's ledger the worker will write to.
+    client
+        .submit_command(
+            "cmd-queue-gated",
+            DaemonCommand::QueuePendingEffect {
+                effect_id: "eff-gated".to_owned(),
+                effect_type: "gated_effect".to_owned(),
+                idempotency_key: "idem-gated".to_owned(),
+                payload_json: "{}".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut registry = EffectWorkerRegistry::new();
+    registry.register(
+        "gated_effect",
+        GatedHandler {
+            started: started.clone(),
+            release: release.clone(),
+        },
+    );
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(run_effect_worker(
+        store.clone(),
+        server.fence(),
+        registry,
+        POLL_INTERVAL,
+        5,
+        shutdown_rx,
+    ));
+
+    // The worker claimed the effect and is now inside the handler.
+    tokio::time::timeout(Duration::from_secs(10), started.notified())
+        .await
+        .expect("the worker must dispatch the queued effect");
+    let claimed = store
+        .get_pending_effect("eff-gated")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        claimed.state, "in_flight",
+        "the worker must claim the effect before dispatching it"
+    );
+
+    // A successor takes the lease and settles the effect successfully while the
+    // stale worker is still blocked in its handler.
+    let successor = store
+        .acquire_or_renew_daemon_lease(
+            "lease-worker-authority",
+            std::process::id() as i64 + 1,
+            "successor-host",
+            "successor-instance",
+            Duration::ZERO,
+        )
+        .await
+        .expect("forging a successor lease must succeed");
+    let successor_fence = DaemonFence {
+        lease_id: "lease-worker-authority".to_owned(),
+        holder_pid: successor.holder_pid,
+        holder_instance: successor.holder_instance.clone(),
+        fencing_token: successor.fencing_token,
+    };
+    store
+        .record_effect_result_fenced(
+            "success-result",
+            "eff-gated",
+            "success",
+            r#"{"ok":true}"#,
+            &successor_fence,
+        )
+        .await
+        .expect("the successor must be able to settle the effect it owns");
+
+    // Release the handler. Its late failure must be refused, and the worker must
+    // stop rather than keep polling without authority.
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), worker)
+        .await
+        .expect("the worker must stop once its lease is gone")
+        .expect("the worker task must not panic");
+
+    let settled = store
+        .get_pending_effect("eff-gated")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        settled.state, "completed",
+        "a stale worker result must not regress the successor's completed effect"
+    );
+    let _ = shutdown_tx.send(true);
 }

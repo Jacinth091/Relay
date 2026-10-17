@@ -81,12 +81,29 @@ impl DaemonClient for DaemonClientHandle {
 pub struct EmbeddedDaemon {
     server: Arc<DaemonServer>,
     shutdown_tx: watch::Sender<bool>,
+    /// Receives `true` when this daemon stops: an explicit
+    /// [`EmbeddedDaemon::shutdown`], or loss of the daemon lease.
+    shutdown: watch::Receiver<bool>,
     heartbeat: tokio::task::JoinHandle<()>,
     listener: tokio::task::JoinHandle<()>,
     effect_worker: tokio::task::JoinHandle<()>,
 }
 
 impl EmbeddedDaemon {
+    /// Resolves once this daemon stops, whether because the host shut it down or
+    /// because it lost authoritative ownership of the daemon lease.
+    ///
+    /// Long-running hosts should await this alongside their own shutdown signal so
+    /// a daemon that has lost its lease exits instead of idling with no authority
+    /// while a successor owns the database.
+    pub async fn wait_for_shutdown(&mut self) {
+        while !*self.shutdown.borrow_and_update() {
+            if self.shutdown.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
         let _ = tokio::join!(self.heartbeat, self.listener, self.effect_worker);
@@ -103,12 +120,15 @@ impl EmbeddedDaemon {
 /// Starts a full daemon: acquires the exclusive lease, runs startup command
 /// reconciliation once, then spawns the heartbeat loop, the named pipe
 /// request listener, and the effect worker under one shutdown signal.
+///
+/// The transport address is derived from the durable identity of the database
+/// this daemon serves, so a client configured for a different database looks
+/// somewhere else entirely.
 pub async fn run_full_daemon(
     store: SqliteStore,
     relay: Relay,
     lease_id: &str,
     lease_ttl: Duration,
-    pipe_name: &str,
 ) -> Result<(Arc<DaemonServer>, EmbeddedDaemon), DaemonError> {
     let daemon = DaemonServer::start(store, relay, lease_id, lease_ttl).await?;
 
@@ -120,11 +140,12 @@ pub async fn run_full_daemon(
     let heartbeat = tokio::spawn(run_heartbeat_loop(
         Arc::clone(&server),
         lease_ttl,
+        shutdown_tx.clone(),
         shutdown_rx.clone(),
     ));
 
     let listener_server = Arc::clone(&server);
-    let listener_pipe_name = pipe_name.to_owned();
+    let listener_pipe_name = daemon_transport::default_pipe_name(server.state_identity());
     let listener_shutdown = shutdown_rx.clone();
     let listener = tokio::spawn(async move {
         if let Err(err) = daemon_transport::run_named_pipe_listener(
@@ -144,7 +165,7 @@ pub async fn run_full_daemon(
         EffectWorkerRegistry::new(),
         Duration::from_secs(5),
         5,
-        shutdown_rx,
+        shutdown_rx.clone(),
     ));
 
     Ok((
@@ -152,6 +173,7 @@ pub async fn run_full_daemon(
         EmbeddedDaemon {
             server,
             shutdown_tx,
+            shutdown: shutdown_rx,
             heartbeat,
             listener,
             effect_worker,
@@ -162,6 +184,7 @@ pub async fn run_full_daemon(
 async fn run_heartbeat_loop(
     server: Arc<DaemonServer>,
     ttl: Duration,
+    shutdown_tx: watch::Sender<bool>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let heartbeat_interval = (ttl / 3).max(Duration::from_secs(1));
@@ -171,7 +194,16 @@ async fn run_heartbeat_loop(
         tokio::select! {
             _ = interval.tick() => {
                 if let Err(err) = server.heartbeat(ttl).await {
-                    tracing::error!(error = %err, "failed to renew daemon lease heartbeat");
+                    // Losing the lease means a successor may already own this
+                    // database. Stop claiming authority right away: every request
+                    // fails closed, and the listener and effect worker shut down so
+                    // the successor can bind the transport.
+                    tracing::error!(
+                        error = %err,
+                        "lost the daemon lease; stopping the daemon instead of serving stale state"
+                    );
+                    server.mark_authority_lost(format!("daemon lease renewal failed: {err}"));
+                    let _ = shutdown_tx.send(true);
                     return;
                 }
             }
@@ -199,16 +231,19 @@ pub async fn connect_or_embed(
     relay: Relay,
     lease_id: &str,
     lease_ttl: Duration,
-    pipe_name: &str,
 ) -> Result<(DaemonClientHandle, Option<EmbeddedDaemon>), DaemonError> {
-    let pipe_client = NamedPipeDaemonClient::new(pipe_name);
+    let state_identity = store.store_identity().await?;
+    let pipe_client = NamedPipeDaemonClient::new(
+        daemon_transport::default_pipe_name(&state_identity),
+        state_identity,
+    );
     match pipe_client.ping().await {
         Ok(()) => return Ok((DaemonClientHandle::Pipe(pipe_client), None)),
         Err(DaemonError::NotRunning) => {}
         Err(other) => return Err(other),
     }
 
-    match run_full_daemon(store, relay, lease_id, lease_ttl, pipe_name).await {
+    match run_full_daemon(store, relay, lease_id, lease_ttl).await {
         Ok((server, embedded)) => Ok((
             DaemonClientHandle::InProcess(InProcessDaemonClient::new(server)),
             Some(embedded),

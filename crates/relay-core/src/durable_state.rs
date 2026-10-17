@@ -344,6 +344,10 @@ pub async fn acquire_durable_lease(
         LeaseKind::Verification => "verification".to_string(),
     };
 
+    // Canonical durable-lease expiry representation: Unix epoch seconds as text.
+    // The store evaluates expiry in epoch seconds (tolerating date-text rows), and
+    // `Lease::assert_valid` parses this field as epoch seconds. If this changes,
+    // both of those must change with it.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -379,7 +383,7 @@ pub async fn release_durable_lease(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ProjectRegistry, RegisterProject};
+    use crate::{CandidateError, ProjectRegistry, RegisterProject};
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -402,6 +406,110 @@ mod tests {
         },
         "ambiguity_policy": "needs_clarification"
     }"#;
+
+    #[tokio::test]
+    async fn durable_lease_expiry_is_reclaimed_once_ttl_elapses() {
+        // Regression for PR #16 review finding R16-01: this wrapper writes
+        // `expires_at` as Unix epoch seconds, but the store evaluated expiry as
+        // SQLite date text, so an elapsed durable lease was never detected and a
+        // crashed holder permanently pinned the resource.
+        let store = SqliteStore::in_memory().await.unwrap();
+        let resource = LeaseResource::WorkflowRun(WorkflowRunId("wfr-r16-01".to_owned()));
+        let kind = LeaseKind::ExclusiveWrite;
+        let holder_one = LeaseHolder {
+            holder_id: "holder-one".to_string(),
+            pid: std::process::id(),
+            host: "localhost".to_string(),
+        };
+        let holder_two = LeaseHolder {
+            holder_id: "holder-two".to_string(),
+            pid: std::process::id(),
+            host: "localhost".to_string(),
+        };
+
+        // ttl_seconds = 0 => already expired when the next holder asks for it.
+        let first = acquire_durable_lease(
+            &store,
+            &LeaseId::new("lease-r16-01-a"),
+            &resource,
+            &kind,
+            &holder_one,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.fencing_token, 1);
+        assert_eq!(first.state, LeaseState::Active);
+        assert!(
+            first.expires_at.parse::<u64>().is_ok(),
+            "durable lease expiry must be canonical Unix epoch seconds, got {}",
+            first.expires_at
+        );
+
+        // A competing holder reclaims the elapsed lease with a monotonic token.
+        let second = acquire_durable_lease(
+            &store,
+            &LeaseId::new("lease-r16-01-b"),
+            &resource,
+            &kind,
+            &holder_two,
+            3600,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.fencing_token, 2, "fencing token must stay monotonic");
+        assert_eq!(second.state, LeaseState::Active);
+
+        // The elapsed lease no longer validates; the reclaimed one does.
+        assert!(matches!(
+            first.assert_valid(first.fencing_token),
+            Err(CandidateError::LeaseExpired { .. })
+        ));
+        assert!(second.assert_valid(second.fencing_token).is_ok());
+    }
+
+    #[tokio::test]
+    async fn durable_lease_with_live_ttl_still_blocks_competing_holder() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let resource = LeaseResource::WorkflowRun(WorkflowRunId("wfr-r16-02".to_owned()));
+        let kind = LeaseKind::ExclusiveWrite;
+        let holder_one = LeaseHolder {
+            holder_id: "holder-one".to_string(),
+            pid: std::process::id(),
+            host: "localhost".to_string(),
+        };
+        let holder_two = LeaseHolder {
+            holder_id: "holder-two".to_string(),
+            pid: std::process::id(),
+            host: "localhost".to_string(),
+        };
+
+        acquire_durable_lease(
+            &store,
+            &LeaseId::new("lease-r16-02-a"),
+            &resource,
+            &kind,
+            &holder_one,
+            3600,
+        )
+        .await
+        .unwrap();
+
+        let err = acquire_durable_lease(
+            &store,
+            &LeaseId::new("lease-r16-02-b"),
+            &resource,
+            &kind,
+            &holder_two,
+            3600,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            TaskPersistenceError::Store(StoreError::ResourceLeaseHeld { .. })
+        ));
+    }
 
     #[tokio::test]
     async fn stores_imported_task_as_canonical_ready_state() {

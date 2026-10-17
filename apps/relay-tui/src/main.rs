@@ -35,7 +35,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use relay_core::{
     DEFAULT_LEASE_ID, DEFAULT_LEASE_TTL, Relay, connect_or_embed, default_config_path,
-    default_database_path, default_pipe_name,
+    default_database_path,
 };
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -76,7 +76,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             relay.clone(),
             DEFAULT_LEASE_ID,
             DEFAULT_LEASE_TTL,
-            &default_pipe_name(),
         )
         .await
         {
@@ -156,7 +155,6 @@ async fn serve_mcp() -> Result<(), Box<dyn Error>> {
         relay.clone(),
         DEFAULT_LEASE_ID,
         DEFAULT_LEASE_TTL,
-        &default_pipe_name(),
     )
     .await
     .map_err(|error| {
@@ -199,13 +197,12 @@ async fn run_daemon(lease_id: String, lease_ttl_secs: u64) -> Result<(), Box<dyn
     })?;
 
     let ttl = std::time::Duration::from_secs(lease_ttl_secs);
-    let (daemon, embedded) =
-        relay_core::run_full_daemon(store, relay, &lease_id, ttl, &default_pipe_name())
-            .await
-            .map_err(|error| {
-                eprintln!("relay: failed to start daemon: {error}");
-                error
-            })?;
+    let (daemon, mut embedded) = relay_core::run_full_daemon(store, relay, &lease_id, ttl)
+        .await
+        .map_err(|error| {
+            eprintln!("relay: failed to start daemon: {error}");
+            error
+        })?;
 
     tracing::info!(
         lease_id = %lease_id,
@@ -213,8 +210,21 @@ async fn run_daemon(lease_id: String, lease_ttl_secs: u64) -> Result<(), Box<dyn
         "Relay daemon running and serving requests"
     );
 
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("Relay daemon received shutdown signal");
+    // Exit on either an explicit shutdown signal or loss of authoritative
+    // ownership of the daemon lease: a daemon that no longer owns the lease must
+    // not keep running (and must release its transport) while a successor serves
+    // the same database.
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            tracing::info!("Relay daemon received shutdown signal");
+        }
+        () = embedded.wait_for_shutdown() => {
+            tracing::warn!(
+                "Relay daemon lost authoritative ownership of its lease; shutting down"
+            );
+        }
+    }
     embedded.shutdown().await;
 
     Ok(())

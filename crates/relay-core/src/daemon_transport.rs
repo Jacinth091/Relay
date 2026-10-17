@@ -28,16 +28,28 @@ const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 const ERROR_PIPE_BUSY: i32 = 231;
 const ERROR_FILE_NOT_FOUND: i32 = 2;
 
-/// The default local pipe name. The variable part is a bare suffix rather
-/// than a full pipe path deliberately: some shells/process-launchers mangle
-/// a leading `\\` when it round-trips through an environment variable value,
-/// so the `\\.\pipe\` prefix is always constructed in-process instead of
-/// being transmitted. Mirrors the `RELAY_DATABASE_PATH` override convention
-/// used elsewhere for test isolation.
-pub fn default_pipe_name() -> String {
-    let suffix =
-        std::env::var("RELAY_DAEMON_PIPE_SUFFIX").unwrap_or_else(|_| "relay-daemon".to_owned());
-    format!(r"\\.\pipe\{suffix}")
+/// The local pipe name for the daemon serving a given durable state identity.
+///
+/// The suffix is derived from the database's own identity (migration 0007) rather
+/// than being a fixed string, so two differently configured processes cannot alias
+/// onto each other's daemon by default: different databases produce different pipe
+/// names. The variable part stays a bare suffix rather than a full pipe path
+/// deliberately - some shells/process-launchers mangle a leading `\\` when it
+/// round-trips through an environment variable value, so the `\\.\pipe\` prefix is
+/// always constructed in-process instead of being transmitted.
+///
+/// `RELAY_DAEMON_PIPE_SUFFIX` overrides the derived suffix for test isolation and
+/// manual experiments. It only changes *where* a client looks: the handshake
+/// identity check in [`NamedPipeDaemonClient`] still refuses a daemon that is
+/// serving different durable state, so a shared suffix cannot silently cross-write.
+pub fn default_pipe_name(state_identity: &str) -> String {
+    match std::env::var("RELAY_DAEMON_PIPE_SUFFIX") {
+        Ok(suffix) if !suffix.is_empty() => format!(r"\\.\pipe\{suffix}"),
+        _ => {
+            let digest = crate::digest::sha256_digest(state_identity.as_bytes());
+            format!(r"\\.\pipe\relay-daemon-{}", &digest[..16])
+        }
+    }
 }
 
 async fn write_frame<W: AsyncWriteExt + Unpin>(
@@ -137,12 +149,20 @@ async fn serve_connection(server: &DaemonServer, mut pipe: NamedPipeServer) -> s
 /// connection would add concurrency complexity for no measurable benefit.
 pub struct NamedPipeDaemonClient {
     pipe_name: String,
+    expected_state_identity: String,
 }
 
+/// Client name used for the implicit per-call identity handshake.
+const IMPLICIT_HANDSHAKE_CLIENT: &str = "relay-client";
+
 impl NamedPipeDaemonClient {
-    pub fn new(pipe_name: impl Into<String>) -> Self {
+    /// Creates a client for `pipe_name` that will only ever mutate durable state
+    /// whose identity matches `expected_state_identity` (the database identity of
+    /// the store this client was opened against).
+    pub fn new(pipe_name: impl Into<String>, expected_state_identity: impl Into<String>) -> Self {
         Self {
             pipe_name: pipe_name.into(),
+            expected_state_identity: expected_state_identity.into(),
         }
     }
 
@@ -171,7 +191,9 @@ impl NamedPipeDaemonClient {
     }
 
     async fn call(&self, request: DaemonRequest) -> Result<DaemonResponse, DaemonError> {
-        let mut client = self.connect().await?;
+        let (mut client, _ack) = self
+            .connect_and_handshake(IMPLICIT_HANDSHAKE_CLIENT)
+            .await?;
         let bytes = serde_json::to_vec(&request)?;
         write_frame(&mut client, &bytes)
             .await
@@ -182,26 +204,70 @@ impl NamedPipeDaemonClient {
         let response: DaemonResponse = serde_json::from_slice(&response_bytes)?;
         Ok(response)
     }
+
+    /// Opens a connection and verifies the daemon's durable state identity on it
+    /// before the caller's request is sent.
+    ///
+    /// Every [`NamedPipeDaemonClient`] request goes through this, and every request
+    /// opens its own connection, so a client cannot reach a daemon serving
+    /// different durable state even once - a reachable pipe is never accepted as
+    /// proof of matching identity.
+    async fn connect_and_handshake(
+        &self,
+        client_name: &str,
+    ) -> Result<(NamedPipeClient, DaemonResponse), DaemonError> {
+        let mut client = self.connect().await?;
+
+        let request = DaemonRequest::Handshake {
+            client_name: client_name.to_owned(),
+            protocol_version: crate::daemon::DAEMON_PROTOCOL_VERSION,
+            state_identity: self.expected_state_identity.clone(),
+        };
+        let bytes = serde_json::to_vec(&request)?;
+        write_frame(&mut client, &bytes)
+            .await
+            .map_err(|err| DaemonError::Transport(err.to_string()))?;
+        let response_bytes = read_frame(&mut client)
+            .await
+            .map_err(|err| DaemonError::Transport(err.to_string()))?;
+        let ack: DaemonResponse = serde_json::from_slice(&response_bytes)?;
+
+        match &ack {
+            DaemonResponse::HandshakeAck { state_identity, .. } => {
+                if state_identity != &self.expected_state_identity {
+                    return Err(DaemonError::StateIdentityMismatch {
+                        expected: self.expected_state_identity.clone(),
+                        actual: state_identity.clone(),
+                    });
+                }
+                Ok((client, ack))
+            }
+            DaemonResponse::StateIdentityMismatch {
+                daemon_identity, ..
+            } => Err(DaemonError::StateIdentityMismatch {
+                expected: self.expected_state_identity.clone(),
+                actual: daemon_identity.clone(),
+            }),
+            DaemonResponse::Error(err) => Err(DaemonError::Command(err.clone())),
+            other => Err(DaemonError::Command(format!(
+                "unexpected handshake response: {other:?}"
+            ))),
+        }
+    }
 }
 
 impl DaemonClient for NamedPipeDaemonClient {
     async fn handshake(&self, client_name: &str) -> Result<(String, i64), DaemonError> {
-        match self
-            .call(DaemonRequest::Handshake {
-                client_name: client_name.to_owned(),
-                protocol_version: crate::daemon::DAEMON_PROTOCOL_VERSION,
-            })
-            .await?
-        {
+        let (_client, ack) = self.connect_and_handshake(client_name).await?;
+        match ack {
             DaemonResponse::HandshakeAck {
                 daemon_version,
                 fencing_token,
                 ..
             } => Ok((daemon_version, fencing_token)),
-            DaemonResponse::Error(err) => Err(DaemonError::Command(err)),
-            _ => Err(DaemonError::Command(
-                "unexpected handshake response".to_owned(),
-            )),
+            other => Err(DaemonError::Command(format!(
+                "unexpected handshake response: {other:?}"
+            ))),
         }
     }
 

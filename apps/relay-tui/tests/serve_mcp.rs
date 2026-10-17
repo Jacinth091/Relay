@@ -53,6 +53,63 @@ fn spawn_relay_isolated(name: &str) -> Child {
     command.spawn().expect("failed to spawn relay binary")
 }
 
+/// Spawns `relay daemon` for one database on its **identity-derived** pipe
+/// (no `RELAY_DAEMON_PIPE_SUFFIX`), i.e. the production default transport.
+fn spawn_default_pipe_daemon(
+    config_path: &std::path::Path,
+    database_path: &std::path::Path,
+) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_relay"));
+    command
+        .args(["daemon"])
+        .env("RELAY_CONFIG_PATH", config_path)
+        // Clear any inherited override so the pipe really is derived.
+        .env_remove("RELAY_DAEMON_PIPE_SUFFIX")
+        .env("RELAY_DATABASE_PATH", database_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.spawn().expect("failed to spawn relay daemon")
+}
+
+/// Creates and migrates the database at `database_path` and returns its durable
+/// state identity, so the test process never migrates a fresh file
+/// concurrently with a daemon process.
+fn prepare_database(database_path: &std::path::Path) -> String {
+    block_on_store(async {
+        relay_core::SqliteStore::open(database_path)
+            .await
+            .expect("prepare the database")
+            .store_identity()
+            .await
+            .expect("read durable state identity")
+    })
+}
+
+/// Waits until the daemon serving `state_identity` answers on its
+/// identity-derived pipe.
+fn wait_for_identity_pipe_daemon(state_identity: &str, daemon: &mut Child) {
+    use relay_core::DaemonClient;
+
+    let client = relay_core::NamedPipeDaemonClient::new(
+        relay_core::default_pipe_name(state_identity),
+        state_identity.to_owned(),
+    );
+    for _ in 0..100 {
+        if block_on_store(client.ping()).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = daemon.kill();
+    let mut stderr_buf = String::new();
+    if let Some(mut stderr) = daemon.stderr.take() {
+        let _ = stderr.read_to_string(&mut stderr_buf);
+    }
+    let _ = daemon.wait();
+    panic!("daemon never answered on its identity-derived pipe; stderr:\n{stderr_buf}");
+}
+
 #[test]
 fn stdin_closed_immediately_exits_zero_with_empty_stdout() {
     let mut child = spawn_relay_isolated("eof");
@@ -168,15 +225,36 @@ fn spawn_interactive(
     config_path: &std::path::Path,
     database_path: &std::path::Path,
 ) -> InteractiveServer {
+    spawn_interactive_with_pipe(
+        config_path,
+        database_path,
+        Some(&pipe_suffix_for(database_path)),
+    )
+}
+
+/// Spawns `relay serve-mcp` with an explicit transport suffix override.
+///
+/// `None` leaves `RELAY_DAEMON_PIPE_SUFFIX` unset so the process uses the
+/// production default: a pipe name derived from the durable identity of the
+/// database it was given.
+fn spawn_interactive_with_pipe(
+    config_path: &std::path::Path,
+    database_path: &std::path::Path,
+    pipe_suffix: Option<&str>,
+) -> InteractiveServer {
     let mut command = Command::new(env!("CARGO_BIN_EXE_relay"));
     command
         .args(["serve-mcp"])
         .env("RELAY_CONFIG_PATH", config_path)
-        .env("RELAY_DAEMON_PIPE_SUFFIX", pipe_suffix_for(database_path))
+        // Clear any inherited override first, so `None` means "derived identity".
+        .env_remove("RELAY_DAEMON_PIPE_SUFFIX")
         .env("RELAY_DATABASE_PATH", database_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(suffix) = pipe_suffix {
+        command.env("RELAY_DAEMON_PIPE_SUFFIX", suffix);
+    }
     let mut child = command.spawn().expect("failed to spawn relay binary");
 
     let stdin = child
@@ -593,4 +671,55 @@ fn lifecycle_two_sequential_sessions_share_one_database() {
     let persisted_ids: Vec<String> = tasks.iter().map(|task| task.id.to_string()).collect();
     assert!(persisted_ids.contains(&first_task_id));
     assert!(persisted_ids.contains(&second_task_id));
+}
+
+/// R16-02 at the MCP surface: with a *separately started* daemon already
+/// serving another database on that database's identity-derived pipe, a
+/// `serve-mcp` process given database A must still write to A - the task the
+/// caller is told is `Ready` must be the task that exists in A.
+///
+/// Before transports were bound to durable state identity, both processes
+/// shared one global pipe name, so B's daemon accepted A's submission and the
+/// caller received a successful task id for a task that lived in B.
+#[test]
+fn serve_mcp_writes_only_to_its_own_database_when_another_daemon_is_running() {
+    // Database B, served by its own daemon on B's derived pipe.
+    let (config_b, database_b) = make_isolated_paths("identity-b");
+    let identity_b = prepare_database(&database_b);
+    let mut daemon_b = spawn_default_pipe_daemon(&config_b, &database_b);
+    wait_for_identity_pipe_daemon(&identity_b, &mut daemon_b);
+
+    // Database A, this `serve-mcp` process's own database, also on the
+    // production default transport (no suffix override).
+    let (config_a, database_a) = make_isolated_paths("identity-a");
+    let mut server = spawn_interactive_with_pipe(&config_a, &database_a, None);
+
+    initialize_handshake(&mut server, "2025-06-18", 1);
+    let (task_id_text, state) = submit_valid_task_over_the_wire(&mut server, 2);
+    assert_eq!(state, "Ready");
+    server.shutdown_expect_exit_zero("identity isolation");
+
+    let store_a = block_on_store(relay_core::SqliteStore::open(&database_a)).expect("reopen A");
+    let identity_a = block_on_store(store_a.store_identity()).expect("read A identity");
+    assert_ne!(
+        relay_core::default_pipe_name(&identity_a),
+        relay_core::default_pipe_name(&identity_b),
+        "distinct databases must not share a transport address"
+    );
+
+    let tasks_a = block_on_store(relay_core::list_stored_tasks(&store_a)).expect("list A tasks");
+    assert_eq!(tasks_a.len(), 1);
+    assert_eq!(tasks_a[0].id.to_string(), task_id_text);
+    assert_eq!(tasks_a[0].state, relay_core::TaskState::Ready);
+
+    // The other database received nothing.
+    let store_b = block_on_store(relay_core::SqliteStore::open(&database_b)).expect("reopen B");
+    let tasks_b = block_on_store(relay_core::list_stored_tasks(&store_b)).expect("list B tasks");
+    assert!(
+        tasks_b.is_empty(),
+        "a submission must never land in another database: {tasks_b:?}"
+    );
+
+    let _ = daemon_b.kill();
+    let _ = daemon_b.wait();
 }

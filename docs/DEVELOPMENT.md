@@ -61,10 +61,20 @@ Relay persists SQLite state and can launch coding-agent processes.
 | `RELAY_DATABASE_PATH` | Override the SQLite database location |
 | `RELAY_CODEX_TRANSPORT` | Set to `exec` to opt out of the default Codex `app-server` transport |
 | `RELAY_TUI_INPUT_TRACE` | Enable TUI input diagnostics |
+| `RELAY_DAEMON_PIPE_SUFFIX` | Test-only override for the daemon's named-pipe suffix |
 
 Both `RELAY_CONFIG_PATH` and `RELAY_DATABASE_PATH` are useful for hermetic
 manual testing: point them at a temporary directory so a run cannot touch your
 normal local state.
+
+You do **not** need to isolate the daemon transport by hand. The daemon's named
+pipe is derived from the durable identity of the database it serves (a value
+generated inside that database by migration 0007), so two databases never share
+one transport address and a client cannot reach a daemon serving different state
+— every request opens a connection, performs a state-identity handshake, and is
+refused if the identities disagree. `RELAY_DAEMON_PIPE_SUFFIX` exists only for
+tests that deliberately need to influence the pipe name; leaving it unset is the
+production behavior.
 
 Relay reads repository-local `.relay/project.toml` and `.relay/policies.toml`
 as **untrusted portable declarations**. Such declarations may *restrict* what a

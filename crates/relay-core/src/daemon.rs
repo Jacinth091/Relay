@@ -44,6 +44,10 @@ pub enum DaemonError {
     NotRunning,
     #[error("daemon transport error: {0}")]
     Transport(String),
+    #[error(
+        "daemon state identity mismatch: the client is bound to durable state '{expected}', but the responding daemon serves '{actual}'"
+    )]
+    StateIdentityMismatch { expected: String, actual: String },
 }
 
 /// A client request sent to the Relay Daemon.
@@ -53,6 +57,9 @@ pub enum DaemonRequest {
     Handshake {
         client_name: String,
         protocol_version: u32,
+        /// Durable state identity the client is bound to. The daemon refuses a
+        /// mismatch, so a client can never mutate a database it did not open.
+        state_identity: String,
     },
     SubmitCommand {
         command_id: String,
@@ -74,6 +81,9 @@ pub enum DaemonResponse {
         daemon_version: String,
         protocol_version: u32,
         fencing_token: i64,
+        /// Durable state identity this daemon is serving, so the client can verify
+        /// it reached the daemon for its own database.
+        state_identity: String,
     },
     CommandResult {
         command_id: String,
@@ -83,6 +93,16 @@ pub enum DaemonResponse {
     Snapshot(DaemonSnapshot),
     Events(Vec<DaemonEvent>),
     Pong,
+    /// The daemon refused the handshake because the client is bound to a
+    /// different durable state identity. Carries both identities so the client
+    /// can report the mismatch as a typed transport error rather than an opaque
+    /// command failure.
+    StateIdentityMismatch {
+        /// Durable state identity the client asked for.
+        client_identity: String,
+        /// Durable state identity this daemon actually serves.
+        daemon_identity: String,
+    },
     Error(String),
 }
 
@@ -221,6 +241,14 @@ pub struct DaemonServer {
     // server be shared behind an `Arc` (request handling and the lease
     // heartbeat run concurrently) while `heartbeat` still only needs `&self`.
     lease_record: std::sync::Mutex<DaemonLeaseRecord>,
+    /// This database's durable state identity (migration 0007). Requests bound to
+    /// any other identity are refused: a reachable pipe is never accepted as proof
+    /// that the responding daemon serves the database the client opened.
+    state_identity: String,
+    /// `None` while this process is the authoritative lease holder; `Some(reason)`
+    /// once it has lost the lease. While it is `Some`, every request fails closed
+    /// so a stale daemon cannot keep mutating state it no longer owns.
+    authority_lost: std::sync::Mutex<Option<String>>,
 }
 
 impl DaemonServer {
@@ -248,15 +276,46 @@ impl DaemonServer {
                 other => DaemonError::Store(other),
             })?;
 
+        let state_identity = store.store_identity().await?;
+
         Ok(Self {
             store,
             relay: Arc::new(relay),
             lease_record: std::sync::Mutex::new(lease_record),
+            state_identity,
+            authority_lost: std::sync::Mutex::new(None),
         })
     }
 
     pub fn store(&self) -> &SqliteStore {
         &self.store
+    }
+
+    /// The durable state identity this daemon serves (see
+    /// [`relay_store::SqliteStore::store_identity`]).
+    pub fn state_identity(&self) -> &str {
+        &self.state_identity
+    }
+
+    /// Records that this process has lost authoritative ownership of the daemon
+    /// lease. Idempotent: the first reason recorded is the one reported, so the
+    /// original cause is what clients and logs see.
+    ///
+    /// After this, [`DaemonServer::handle_request`] fails closed for every request
+    /// and callers are expected to stop the request listener and effect worker, so
+    /// a successor can bind the transport and take over.
+    pub fn mark_authority_lost(&self, reason: impl Into<String>) {
+        let mut authority_lost = self.authority_lost.lock().expect("authority lock poisoned");
+        if authority_lost.is_none() {
+            *authority_lost = Some(reason.into());
+        }
+    }
+
+    fn authority_lost_reason(&self) -> Option<String> {
+        self.authority_lost
+            .lock()
+            .expect("authority lock poisoned")
+            .clone()
     }
 
     pub fn lease_id(&self) -> String {
@@ -305,20 +364,37 @@ impl DaemonServer {
 
     /// Handles a typed client request.
     pub async fn handle_request(&self, request: DaemonRequest) -> DaemonResponse {
+        if let Some(reason) = self.authority_lost_reason() {
+            // Fail closed: this process can no longer prove it owns the daemon
+            // lease, so it must not execute semantic commands (or claim liveness)
+            // on state a successor may already own.
+            return DaemonResponse::Error(format!(
+                "daemon is no longer authoritative over this database: {reason}"
+            ));
+        }
+
         match request {
             DaemonRequest::Handshake {
                 client_name: _,
                 protocol_version,
+                state_identity,
             } => {
                 if protocol_version != DAEMON_PROTOCOL_VERSION {
                     return DaemonResponse::Error(format!(
                         "protocol version mismatch: client requested {protocol_version}, daemon supports {DAEMON_PROTOCOL_VERSION}"
                     ));
                 }
+                if state_identity != self.state_identity {
+                    return DaemonResponse::StateIdentityMismatch {
+                        client_identity: state_identity,
+                        daemon_identity: self.state_identity.clone(),
+                    };
+                }
                 DaemonResponse::HandshakeAck {
                     daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
                     protocol_version: DAEMON_PROTOCOL_VERSION,
                     fencing_token: self.fencing_token(),
+                    state_identity: self.state_identity.clone(),
                 }
             }
             DaemonRequest::Ping => DaemonResponse::Pong,
@@ -420,12 +496,12 @@ impl DaemonServer {
     }
 
     /// Resolves a recorded command to a terminal outcome. Terminal commands
-    /// (`applied`/`failed`) return their cached result. Non-terminal commands
-    /// (`received`, or `needs_reconciliation` during startup reconciliation)
-    /// are (re-)applied now: this is safe because every mutation
-    /// `apply_command` performs is idempotent on the command id / deterministic
-    /// derived ids, so re-running it after a crash never duplicates the
-    /// underlying effect.
+    /// (`applied`/`failed`) return their cached result. A non-terminal command is
+    /// claimed by exactly one caller, which applies it and records the terminal
+    /// result; a concurrent replay of the same command id loses the claim and waits
+    /// for that result instead of applying the command a second time. Re-applying
+    /// after a crash is safe because every mutation `apply_command` performs is
+    /// idempotent on the command id / deterministic derived ids.
     async fn resolve_command(&self, command_id: &str, command: &DaemonCommand) -> DaemonResponse {
         let existing = match self.store.get_command(command_id).await {
             Ok(Some(row)) => row,
@@ -446,6 +522,12 @@ impl DaemonServer {
                 };
             }
             _ => {}
+        }
+
+        match self.store.claim_command(command_id).await {
+            Ok(true) => {}
+            Ok(false) => return self.await_concurrent_resolution(command_id).await,
+            Err(err) => return DaemonResponse::Error(err.to_string()),
         }
 
         match self.apply_command(command_id, command).await {
@@ -475,12 +557,46 @@ impl DaemonServer {
         }
     }
 
+    /// Waits for the caller that holds a command's claim to record the terminal
+    /// result, then reports that same result. A duplicate replay therefore observes
+    /// the winner's committed outcome - including its `failed` outcome - instead of
+    /// racing it, so reported and durable terminal status cannot disagree.
+    async fn await_concurrent_resolution(&self, command_id: &str) -> DaemonResponse {
+        const MAX_ATTEMPTS: u32 = 200;
+        const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+        for _ in 0..MAX_ATTEMPTS {
+            tokio::time::sleep(POLL_INTERVAL).await;
+
+            match self.store.get_command(command_id).await {
+                Ok(Some(row)) if matches!(row.status.as_str(), "applied" | "failed") => {
+                    return DaemonResponse::CommandResult {
+                        command_id: command_id.to_owned(),
+                        status: CommandStatus::Duplicate,
+                        result_json: row.response_json,
+                    };
+                }
+                Ok(_) => {}
+                Err(err) => return DaemonResponse::Error(err.to_string()),
+            }
+        }
+
+        DaemonResponse::Error(format!(
+            "command {command_id} is already being applied but has not reached a terminal result"
+        ))
+    }
+
     /// Scans for commands stuck in a non-terminal status (e.g. the daemon
     /// crashed between `apply_command` succeeding and `complete_command`
     /// being recorded) and resolves each one. A command whose payload cannot
     /// be deserialized is parked as `needs_reconciliation` with a logged
     /// reason instead of being silently left stuck or guessed at.
     pub async fn reconcile_on_startup(&self) -> Result<(), DaemonError> {
+        // Claims held by the previous process died with it. This runs before the
+        // request listener accepts connections, so clearing them cannot steal a
+        // live claim.
+        self.store.reset_command_claims().await?;
+
         let incomplete = self.store.list_incomplete_commands().await?;
         for row in incomplete {
             self.reconcile_one_command(&row).await;
@@ -521,6 +637,25 @@ impl DaemonServer {
         }
     }
 
+    /// Returns the trusted registry to resolve a submission against.
+    ///
+    /// When this daemon was built from a config path, the persisted registry is
+    /// re-read so registrations made after daemon start take effect immediately.
+    /// A registry with no persisted source (test harnesses, explicitly injected
+    /// registries) is used as-is.
+    fn trusted_registry_for_submission(&self) -> Result<Relay, DaemonError> {
+        let Some(config_path) = self.relay.config_path() else {
+            return Ok((*self.relay).clone());
+        };
+
+        Relay::load_from_config_path(config_path).map_err(|error| {
+            DaemonError::Command(format!(
+                "cannot refresh the trusted project registry from {}: {error}",
+                config_path.display()
+            ))
+        })
+    }
+
     async fn apply_command(
         &self,
         command_id: &str,
@@ -538,8 +673,12 @@ impl DaemonServer {
                             "unknown submission transport '{submission_transport}'"
                         ))
                     })?;
-                let candidate = self
-                    .relay
+                // Resolve against the authoritative persisted registry rather than the
+                // snapshot captured at daemon start: a project may have been
+                // registered since then, and a stale in-memory copy would reject a
+                // handoff the trusted config already allows.
+                let relay = self.trusted_registry_for_submission()?;
+                let candidate = relay
                     .resolve_task_import_candidate(handoff_json, transport)
                     .map_err(|e| DaemonError::Command(e.to_string()))?;
 
@@ -663,6 +802,7 @@ impl DaemonClient for InProcessDaemonClient {
             .handle_request(DaemonRequest::Handshake {
                 client_name: client_name.to_owned(),
                 protocol_version: DAEMON_PROTOCOL_VERSION,
+                state_identity: self.server.state_identity().to_owned(),
             })
             .await;
 
@@ -794,6 +934,7 @@ mod tests {
             .handle_request(DaemonRequest::Handshake {
                 client_name: "relay-tui".to_owned(),
                 protocol_version: DAEMON_PROTOCOL_VERSION,
+                state_identity: daemon.state_identity().to_owned(),
             })
             .await;
 
@@ -814,6 +955,7 @@ mod tests {
             .handle_request(DaemonRequest::Handshake {
                 client_name: "old-client".to_owned(),
                 protocol_version: 999,
+                state_identity: daemon.state_identity().to_owned(),
             })
             .await;
 
@@ -962,6 +1104,289 @@ mod tests {
             assert_eq!(snapshot.pending_effects[0].state, "completed");
         } else {
             panic!("expected snapshot");
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_refuses_a_client_bound_to_a_different_database() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let other_store = SqliteStore::in_memory().await.unwrap();
+        let identity = store.store_identity().await.unwrap();
+        let other_identity = other_store.store_identity().await.unwrap();
+        assert_ne!(
+            identity, other_identity,
+            "two databases must never share a durable state identity"
+        );
+
+        let daemon = DaemonServer::start(
+            store,
+            Relay::new(),
+            "test-lease-identity",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(daemon.state_identity(), identity);
+
+        // A client bound to this daemon's own durable state is accepted.
+        let accepted = daemon
+            .handle_request(DaemonRequest::Handshake {
+                client_name: "relay-tui".to_owned(),
+                protocol_version: DAEMON_PROTOCOL_VERSION,
+                state_identity: identity.clone(),
+            })
+            .await;
+        match accepted {
+            DaemonResponse::HandshakeAck {
+                state_identity: acknowledged,
+                ..
+            } => assert_eq!(acknowledged, identity),
+            other => panic!("expected a handshake ack, got {other:?}"),
+        }
+
+        // A client bound to a different database is refused, and the refusal names
+        // both identities so a host can report it precisely.
+        let refused = daemon
+            .handle_request(DaemonRequest::Handshake {
+                client_name: "relay-tui".to_owned(),
+                protocol_version: DAEMON_PROTOCOL_VERSION,
+                state_identity: other_identity.clone(),
+            })
+            .await;
+        match refused {
+            DaemonResponse::StateIdentityMismatch {
+                client_identity,
+                daemon_identity,
+            } => {
+                assert_eq!(client_identity, other_identity);
+                assert_eq!(daemon_identity, identity);
+            }
+            other => panic!("expected a state identity mismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn submission_uses_a_project_registered_after_daemon_start() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let config_dir = std::env::temp_dir().join(format!("relay-registry-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        let repo_path = config_dir.join("repo");
+        std::fs::create_dir_all(&repo_path).unwrap();
+
+        // The daemon starts against the persisted trusted registry, which does not
+        // know the project yet.
+        let relay = Relay::load_from_config_path(&config_path).unwrap();
+        let daemon =
+            DaemonServer::start(store, relay, "test-lease-registry", Duration::from_secs(60))
+                .await
+                .unwrap();
+
+        let handoff = |command_id: &str| DaemonRequest::SubmitCommand {
+            command_id: command_id.to_owned(),
+            command: DaemonCommand::SubmitHandoff {
+                project_key: "test-proj".to_owned(),
+                handoff_json: TEST_HANDOFF.to_owned(),
+                submission_transport: "local-paste".to_owned(),
+            },
+        };
+
+        let before = daemon
+            .handle_request(handoff("cmd-before-registration"))
+            .await;
+        match before {
+            DaemonResponse::CommandResult { status, .. } => {
+                assert_eq!(status, CommandStatus::Failed)
+            }
+            other => panic!("expected an unregistered project to be rejected, got {other:?}"),
+        }
+
+        // The approved Add Project action persists the registration to the trusted
+        // config the daemon reads.
+        let mut registry = crate::ProjectRegistry::load(&config_path).unwrap();
+        registry
+            .register(crate::RegisterProject {
+                key: "test-proj".to_owned(),
+                name: None,
+                local_path: repo_path,
+                expected_remote: None,
+                default_stack: None,
+                github: None,
+            })
+            .unwrap();
+        registry.save(&config_path).unwrap();
+
+        // The same daemon instance, without a restart, now accepts the handoff.
+        let after = daemon
+            .handle_request(handoff("cmd-after-registration"))
+            .await;
+        match after {
+            DaemonResponse::CommandResult { status, .. } => {
+                assert_eq!(status, CommandStatus::Applied);
+            }
+            other => panic!("expected the registered project's handoff to apply, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_lost_its_lease_refuses_every_request() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let daemon = DaemonServer::start(
+            store,
+            test_relay(),
+            "test-lease-lost",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+        // While it holds the lease the daemon serves normally.
+        assert!(matches!(
+            daemon.handle_request(DaemonRequest::Ping).await,
+            DaemonResponse::Pong
+        ));
+
+        daemon.mark_authority_lost("simulated successor took the lease");
+
+        // Every request - liveness probes and mutations alike - fails closed, so a
+        // stale daemon cannot keep mutating state a successor may already own.
+        let responses = [
+            daemon.handle_request(DaemonRequest::Ping).await,
+            daemon.handle_request(DaemonRequest::GetSnapshot).await,
+            daemon
+                .handle_request(DaemonRequest::SubmitCommand {
+                    command_id: "cmd-after-lease-loss".to_owned(),
+                    command: DaemonCommand::SubmitHandoff {
+                        project_key: "test-proj".to_owned(),
+                        handoff_json: TEST_HANDOFF.to_owned(),
+                        submission_transport: "local-paste".to_owned(),
+                    },
+                })
+                .await,
+        ];
+        for response in responses {
+            match response {
+                DaemonResponse::Error(message) => {
+                    assert!(message.contains("no longer authoritative"), "{message}");
+                }
+                other => panic!("expected a fail-closed error, got {other:?}"),
+            }
+        }
+
+        // The rejected command was refused before it was even recorded.
+        assert!(
+            daemon
+                .store()
+                .get_command("cmd-after-lease-loss")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_replays_of_one_command_id_converge_on_one_result() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let daemon = DaemonServer::start(
+            store,
+            test_relay(),
+            "test-lease-replay",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+        // Seed a task in state `ready` by importing a handoff.
+        let seeded = daemon
+            .handle_request(DaemonRequest::SubmitCommand {
+                command_id: "cmd-seed".to_owned(),
+                command: DaemonCommand::SubmitHandoff {
+                    project_key: "test-proj".to_owned(),
+                    handoff_json: TEST_HANDOFF.to_owned(),
+                    submission_transport: "local-paste".to_owned(),
+                },
+            })
+            .await;
+        assert!(matches!(
+            seeded,
+            DaemonResponse::CommandResult {
+                status: CommandStatus::Applied,
+                ..
+            }
+        ));
+
+        let task_id = match daemon.handle_request(DaemonRequest::GetSnapshot).await {
+            DaemonResponse::Snapshot(snapshot) => {
+                assert_eq!(snapshot.tasks.len(), 1);
+                assert_eq!(snapshot.tasks[0].state, "ready");
+                snapshot.tasks[0].id.clone()
+            }
+            other => panic!("expected a snapshot, got {other:?}"),
+        };
+
+        let command = DaemonCommand::UpdateTaskState {
+            task_id,
+            expected_state: "ready".to_owned(),
+            new_state: "running".to_owned(),
+        };
+        let replay = || DaemonRequest::SubmitCommand {
+            command_id: "cmd-concurrent".to_owned(),
+            command: command.clone(),
+        };
+
+        // Two concurrent submissions of the *same* command id.
+        let (first, second) = tokio::join!(
+            daemon.handle_request(replay()),
+            daemon.handle_request(replay())
+        );
+
+        let mut applied = 0;
+        let mut duplicate = 0;
+        let mut reported = Vec::new();
+        for response in [first, second] {
+            match response {
+                DaemonResponse::CommandResult {
+                    status,
+                    result_json,
+                    ..
+                } => {
+                    match status {
+                        CommandStatus::Applied => applied += 1,
+                        CommandStatus::Duplicate => duplicate += 1,
+                        other => panic!("unexpected terminal status {other:?}"),
+                    }
+                    reported.push(result_json);
+                }
+                other => panic!("expected a command result, got {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            (applied, duplicate),
+            (1, 1),
+            "exactly one caller applies the command and the other observes its cached result"
+        );
+        assert_eq!(
+            reported[0], reported[1],
+            "a duplicate replay must report the committed result, not a raced one"
+        );
+
+        // One durable terminal outcome: the command applied once, and the task
+        // transitioned exactly once.
+        let row = daemon
+            .store()
+            .get_command("cmd-concurrent")
+            .await
+            .unwrap()
+            .expect("the command must be durably recorded");
+        assert_eq!(row.status, "applied");
+
+        match daemon.handle_request(DaemonRequest::GetSnapshot).await {
+            DaemonResponse::Snapshot(snapshot) => {
+                assert_eq!(snapshot.tasks.len(), 1);
+                assert_eq!(snapshot.tasks[0].state, "running");
+            }
+            other => panic!("expected a snapshot, got {other:?}"),
         }
     }
 }

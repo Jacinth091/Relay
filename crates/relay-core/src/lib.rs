@@ -30,7 +30,7 @@ pub mod scheduler_v2;
 mod task_ingress;
 pub mod workflow;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use relay_protocol::{AmbiguityPolicy, HandoffTask};
 pub use relay_runtime::{
@@ -147,6 +147,12 @@ pub use workflow::{
 pub struct Relay {
     project_registry: ProjectRegistry,
     reviewed_task: Option<ImportedTask>,
+    /// Trusted config path this Relay was loaded from, when it came from disk.
+    ///
+    /// The daemon re-reads the authoritative persisted registry from here when a
+    /// submission arrives, so a project registered *after* the daemon started is
+    /// honoured immediately instead of being rejected against a stale snapshot.
+    config_path: Option<PathBuf>,
 }
 
 impl Relay {
@@ -160,12 +166,26 @@ impl Relay {
         Self {
             project_registry,
             reviewed_task: None,
+            config_path: None,
         }
     }
 
     /// Loads Relay's trusted local project registry from a TOML config path.
+    ///
+    /// The path is retained ([`Relay::config_path`]) so a daemon built from this
+    /// Relay can re-read the persisted registry when submissions arrive.
     pub fn load_from_config_path(path: impl AsRef<Path>) -> Result<Self, ProjectRegistryError> {
-        Ok(Self::with_project_registry(ProjectRegistry::load(path)?))
+        let path = path.as_ref();
+        Ok(Self {
+            project_registry: ProjectRegistry::load(path)?,
+            reviewed_task: None,
+            config_path: Some(path.to_path_buf()),
+        })
+    }
+
+    /// The trusted config path this Relay was loaded from, if it came from disk.
+    pub fn config_path(&self) -> Option<&Path> {
+        self.config_path.as_deref()
     }
 
     /// Returns the number of configured projects currently visible to Relay.

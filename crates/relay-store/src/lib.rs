@@ -328,14 +328,28 @@ impl SqliteStore {
         &self,
         task: &NewTaskRecord,
     ) -> Result<TaskRecord, StoreError> {
-        retry_on_transient_lock(|| self.insert_task_if_absent_once(task)).await
+        retry_on_transient_lock(|| self.insert_task_if_absent_once(task, None)).await
+    }
+
+    /// Fenced variant used by the daemon's handoff submission path.
+    pub async fn insert_task_if_absent_fenced(
+        &self,
+        task: &NewTaskRecord,
+        fence: &DaemonFence,
+    ) -> Result<TaskRecord, StoreError> {
+        retry_on_transient_lock(|| self.insert_task_if_absent_once(task, Some(fence))).await
     }
 
     async fn insert_task_if_absent_once(
         &self,
         task: &NewTaskRecord,
+        fence: Option<&DaemonFence>,
     ) -> Result<TaskRecord, StoreError> {
         let mut transaction = self.pool.begin().await?;
+
+        if let Some(fence) = fence {
+            assert_daemon_fence(&mut *transaction, fence).await?;
+        }
 
         let result = sqlx::query(
             r#"
@@ -434,7 +448,25 @@ impl SqliteStore {
         expected_state: &str,
         new_state: &str,
     ) -> Result<TaskRecord, StoreError> {
-        retry_on_transient_lock(|| self.update_task_state_once(id, expected_state, new_state)).await
+        retry_on_transient_lock(|| self.update_task_state_once(id, expected_state, new_state, None))
+            .await
+    }
+
+    /// Fenced variant used by the daemon command path: the transition is
+    /// refused unless this process still holds `fence` at the moment the write
+    /// commits, so a command admitted before authority was lost cannot land a
+    /// stale state change after a successor took the lease.
+    pub async fn update_task_state_fenced(
+        &self,
+        id: &str,
+        expected_state: &str,
+        new_state: &str,
+        fence: &DaemonFence,
+    ) -> Result<TaskRecord, StoreError> {
+        retry_on_transient_lock(|| {
+            self.update_task_state_once(id, expected_state, new_state, Some(fence))
+        })
+        .await
     }
 
     async fn update_task_state_once(
@@ -442,7 +474,14 @@ impl SqliteStore {
         id: &str,
         expected_state: &str,
         new_state: &str,
+        fence: Option<&DaemonFence>,
     ) -> Result<TaskRecord, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        if let Some(fence) = fence {
+            assert_daemon_fence(&mut *transaction, fence).await?;
+        }
+
         let result = sqlx::query(
             r#"
             UPDATE tasks
@@ -455,14 +494,14 @@ impl SqliteStore {
         .bind(new_state)
         .bind(id)
         .bind(expected_state)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
 
         if result.rows_affected() == 0 {
             let actual_state =
                 sqlx::query_scalar::<_, String>("SELECT state FROM tasks WHERE id = ?1")
                     .bind(id)
-                    .fetch_optional(&self.pool)
+                    .fetch_optional(&mut *transaction)
                     .await?;
 
             return match actual_state {
@@ -475,9 +514,11 @@ impl SqliteStore {
             };
         }
 
-        self.get_task(id)
+        let task = fetch_task(&mut *transaction, id)
             .await?
-            .ok_or_else(|| StoreError::TaskNotFound { id: id.to_owned() })
+            .ok_or_else(|| StoreError::TaskNotFound { id: id.to_owned() })?;
+        transaction.commit().await?;
+        Ok(task)
     }
 
     pub async fn claim_ready_task_for_execution(
@@ -1228,13 +1269,29 @@ impl SqliteStore {
         &self,
         effect: &NewPendingEffectRecord,
     ) -> Result<PendingEffectRecord, StoreError> {
-        retry_on_transient_lock(|| self.insert_pending_effect_once(effect)).await
+        retry_on_transient_lock(|| self.insert_pending_effect_once(effect, None)).await
+    }
+
+    /// Fenced variant used by the daemon's `QueuePendingEffect` command path.
+    pub async fn insert_pending_effect_fenced(
+        &self,
+        effect: &NewPendingEffectRecord,
+        fence: &DaemonFence,
+    ) -> Result<PendingEffectRecord, StoreError> {
+        retry_on_transient_lock(|| self.insert_pending_effect_once(effect, Some(fence))).await
     }
 
     async fn insert_pending_effect_once(
         &self,
         effect: &NewPendingEffectRecord,
+        fence: Option<&DaemonFence>,
     ) -> Result<PendingEffectRecord, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        if let Some(fence) = fence {
+            assert_daemon_fence(&mut *transaction, fence).await?;
+        }
+
         // OR IGNORE makes replaying the same QueuePendingEffect command (same
         // effect id) after a crash idempotent instead of erroring.
         sqlx::query(
@@ -1247,14 +1304,28 @@ impl SqliteStore {
         .bind(&effect.effect_type)
         .bind(&effect.idempotency_key)
         .bind(&effect.payload_json)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
 
-        self.get_pending_effect(&effect.id).await?.ok_or_else(|| {
-            StoreError::PendingEffectNotFound {
+        let row = sqlx::query(
+            r#"
+            SELECT id, effect_type, idempotency_key, payload_json, state, attempts, last_error, created_at, updated_at
+            FROM pending_effects
+            WHERE id = ?1
+            "#,
+        )
+        .bind(&effect.id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+
+        let record = row
+            .map(row_to_pending_effect_record)
+            .transpose()?
+            .ok_or_else(|| StoreError::PendingEffectNotFound {
                 id: effect.id.clone(),
-            }
-        })
+            })?;
+        transaction.commit().await?;
+        Ok(record)
     }
 
     pub async fn get_pending_effect(
@@ -1394,7 +1465,22 @@ impl SqliteStore {
         result_json: &str,
     ) -> Result<EffectResultRecord, StoreError> {
         retry_on_transient_lock(|| {
-            self.record_effect_result_once(id, effect_id, outcome, result_json)
+            self.record_effect_result_once(id, effect_id, outcome, result_json, None)
+        })
+        .await
+    }
+
+    /// Fenced variant used by the daemon's `CompleteEffect` command path.
+    pub async fn record_effect_result_fenced(
+        &self,
+        id: &str,
+        effect_id: &str,
+        outcome: &str,
+        result_json: &str,
+        fence: &DaemonFence,
+    ) -> Result<EffectResultRecord, StoreError> {
+        retry_on_transient_lock(|| {
+            self.record_effect_result_once(id, effect_id, outcome, result_json, Some(fence))
         })
         .await
     }
@@ -1405,8 +1491,13 @@ impl SqliteStore {
         effect_id: &str,
         outcome: &str,
         result_json: &str,
+        fence: Option<&DaemonFence>,
     ) -> Result<EffectResultRecord, StoreError> {
         let mut transaction = self.pool.begin().await?;
+
+        if let Some(fence) = fence {
+            assert_daemon_fence(&mut *transaction, fence).await?;
+        }
 
         // OR IGNORE makes replaying the same CompleteEffect command (same
         // result id) after a crash idempotent: the subsequent SELECT below
@@ -2045,6 +2136,43 @@ async fn insert_event(
     Ok(())
 }
 
+/// Asserts that the daemon lease row still belongs to this process at the
+/// expected fencing token. Evaluated as the first statement of the same
+/// transaction as the mutation it guards, so it cannot be satisfied by a
+/// lease that was valid when the command was admitted but lost before the
+/// write committed.
+async fn assert_daemon_fence<'a>(
+    executor: impl sqlx::Executor<'a, Database = sqlx::Sqlite>,
+    fence: &DaemonFence,
+) -> Result<(), StoreError> {
+    let row = sqlx::query(
+        r#"
+        SELECT holder_pid, fencing_token
+        FROM daemon_leases
+        WHERE lease_id = ?1
+        "#,
+    )
+    .bind(&fence.lease_id)
+    .fetch_optional(executor)
+    .await?;
+
+    let still_holds = match row {
+        Some(row) => {
+            row.try_get::<i64, _>("holder_pid")? == fence.holder_pid
+                && row.try_get::<i64, _>("fencing_token")? == fence.fencing_token
+        }
+        None => false,
+    };
+
+    if still_holds {
+        Ok(())
+    } else {
+        Err(StoreError::DaemonAuthorityLost {
+            lease_id: fence.lease_id.clone(),
+        })
+    }
+}
+
 async fn fetch_task<'a>(
     executor: impl sqlx::Executor<'a, Database = sqlx::Sqlite>,
     id: &str,
@@ -2194,6 +2322,20 @@ fn row_to_resource_lease_record(
     })
 }
 
+/// Proof that a caller may still write on behalf of a daemon lease.
+///
+/// A daemon mutates durable state inside a transaction that first asserts the
+/// `daemon_leases` row still belongs to this process at this exact fencing
+/// token. If a successor has taken the lease (which increments the token), the
+/// assertion fails and the mutation is refused, so a command admitted before
+/// authority was lost cannot commit after a successor took over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonFence {
+    pub lease_id: String,
+    pub holder_pid: i64,
+    pub fencing_token: i64,
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("failed to create Relay database directory '{path}': {source}")]
@@ -2221,6 +2363,10 @@ pub enum StoreError {
         holder_pid: i64,
         holder_host: String,
     },
+    #[error(
+        "daemon lease '{lease_id}' is no longer held by this process at the expected fencing token; refusing a stale write"
+    )]
+    DaemonAuthorityLost { lease_id: String },
     #[error(
         "resource lease on {resource_type}:{resource_id} is active and held by {holder_id} (expires {expires_at})"
     )]
@@ -2901,6 +3047,57 @@ mod tests {
             .unwrap();
         assert_eq!(fresh.holder_pid, 1001);
         assert_eq!(fresh.fencing_token, 1);
+    }
+
+    #[tokio::test]
+    async fn fenced_writes_are_refused_after_a_successor_takes_the_daemon_lease() {
+        let store = SqliteStore::in_memory().await.unwrap();
+
+        let lease = store
+            .acquire_or_renew_daemon_lease("daemon-main", 1001, "host-a", Duration::from_secs(60))
+            .await
+            .unwrap();
+        let fence = DaemonFence {
+            lease_id: "daemon-main".to_owned(),
+            holder_pid: lease.holder_pid,
+            fencing_token: lease.fencing_token,
+        };
+
+        store
+            .insert_task(&task_record("task-fenced", "fenced"))
+            .await
+            .unwrap();
+
+        // While this process holds the lease, its fenced write commits.
+        let updated = store
+            .update_task_state_fenced("task-fenced", "ready", "running", &fence)
+            .await
+            .unwrap();
+        assert_eq!(updated.state, "running");
+
+        // A successor takes the lease (stale takeover), which increments the
+        // fencing token and changes the holder.
+        let successor = store
+            .acquire_or_renew_daemon_lease("daemon-main", 1002, "host-b", Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(successor.fencing_token, lease.fencing_token + 1);
+
+        // The stale fence can no longer commit: the write is refused instead of
+        // landing after the successor took ownership.
+        let refused = store
+            .update_task_state_fenced("task-fenced", "running", "done", &fence)
+            .await;
+        assert!(matches!(
+            refused,
+            Err(StoreError::DaemonAuthorityLost { .. })
+        ));
+
+        let task = store.get_task("task-fenced").await.unwrap().unwrap();
+        assert_eq!(
+            task.state, "running",
+            "a stale fenced write must not change durable state"
+        );
     }
 
     #[tokio::test]

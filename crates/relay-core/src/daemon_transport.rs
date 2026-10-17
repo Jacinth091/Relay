@@ -81,21 +81,65 @@ async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> std::io::Result<
 
 /// Runs the named pipe accept loop, dispatching each connection's requests to
 /// `server.handle_request`. Returns once `shutdown` is signalled.
+///
+/// Binds the first pipe instance before returning to the caller's control: the
+/// `ready` signal fires exactly once when the listener owns its transport, so
+/// the daemon host does not report a running daemon that has no listener. If a
+/// stale predecessor still holds the pipe (for example during a lease takeover),
+/// binding is retried within a bounded window instead of failing immediately; if
+/// it still cannot bind, the listener returns an error and `ready` is dropped
+/// unsent, which the host treats as a failed startup.
 pub async fn run_named_pipe_listener(
     server: Arc<DaemonServer>,
     pipe_name: &str,
     mut shutdown: watch::Receiver<bool>,
+    ready: tokio::sync::oneshot::Sender<()>,
 ) -> Result<(), DaemonError> {
+    const BIND_RETRY_ATTEMPTS: u32 = 200;
+    const BIND_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
+    let mut ready = Some(ready);
     let mut first_instance = true;
     loop {
         let pipe_server = {
-            let mut options = ServerOptions::new();
-            options.first_pipe_instance(first_instance);
-            options.create(pipe_name).map_err(|err| {
-                DaemonError::Transport(format!("failed to create pipe instance: {err}"))
-            })?
+            let mut attempt = 0u32;
+            loop {
+                let mut options = ServerOptions::new();
+                options.first_pipe_instance(first_instance);
+                match options.create(pipe_name) {
+                    Ok(pipe_server) => break pipe_server,
+                    Err(err) => {
+                        attempt += 1;
+                        if attempt >= BIND_RETRY_ATTEMPTS {
+                            return Err(DaemonError::Transport(format!(
+                                "failed to create pipe instance '{pipe_name}' after {attempt} attempts: {err}"
+                            )));
+                        }
+                        tracing::warn!(
+                            attempt,
+                            error = %err,
+                            "daemon pipe is held by another instance; retrying to take over"
+                        );
+                        tokio::select! {
+                            _ = tokio::time::sleep(BIND_RETRY_INTERVAL) => {}
+                            _ = shutdown.changed() => {
+                                if *shutdown.borrow() {
+                                    if let Some(ready) = ready.take() {
+                                        let _ = ready.send(());
+                                    }
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         };
         first_instance = false;
+
+        if let Some(ready) = ready.take() {
+            let _ = ready.send(());
+        }
 
         tokio::select! {
             connect_result = pipe_server.connect() => {
@@ -118,7 +162,15 @@ pub async fn run_named_pipe_listener(
     }
 }
 
+/// Serves one accepted pipe connection.
+///
+/// A connection is *not* trusted until it completes a matching-identity
+/// handshake. Until then only a `Handshake` is accepted; every other request is
+/// refused without being dispatched, so a raw peer that skips the handshake (or
+/// fails it against the wrong database) cannot mutate state, and a handshake
+/// against one identity cannot be replayed into commands for another.
 async fn serve_connection(server: &DaemonServer, mut pipe: NamedPipeServer) -> std::io::Result<()> {
+    let mut admitted = false;
     loop {
         let frame = match read_frame(&mut pipe).await {
             Ok(frame) => frame,
@@ -136,7 +188,26 @@ async fn serve_connection(server: &DaemonServer, mut pipe: NamedPipeServer) -> s
             }
         };
 
-        let response = server.handle_request(request).await;
+        let response = match &request {
+            DaemonRequest::Handshake {
+                protocol_version,
+                state_identity,
+                ..
+            } => {
+                let response = server.handshake_response(*protocol_version, state_identity);
+                // Only a successful ack admits this connection; a refusal
+                // (wrong version or wrong database) leaves it unadmitted, and a
+                // later handshake can still be attempted on the same connection.
+                admitted = matches!(response, DaemonResponse::HandshakeAck { .. });
+                response
+            }
+            _ if !admitted => DaemonResponse::Error(
+                "request rejected: the connection has not completed a matching identity handshake"
+                    .to_owned(),
+            ),
+            _ => server.handle_request(request).await,
+        };
+
         let bytes = serde_json::to_vec(&response).unwrap_or_else(|err| {
             serde_json::to_vec(&DaemonResponse::Error(err.to_string())).unwrap()
         });
@@ -310,6 +381,7 @@ impl DaemonClient for NamedPipeDaemonClient {
             .call(DaemonRequest::SubmitCommand {
                 command_id: command_id.to_owned(),
                 command,
+                state_identity: self.expected_state_identity.clone(),
             })
             .await?
         {
@@ -327,5 +399,253 @@ impl DaemonClient for NamedPipeDaemonClient {
             DaemonResponse::Error(err) => Err(DaemonError::Command(err)),
             _ => Err(DaemonError::Command("unexpected ping response".to_owned())),
         }
+    }
+}
+
+/// Real named-pipe coverage for the R17-01 server-side admission gate.
+///
+/// These deliberately speak the raw framing protocol instead of going through
+/// [`NamedPipeDaemonClient`]: the point is to prove what a peer that *skips* the
+/// handshake (or fails it) can and cannot do, which the typed client - by
+/// construction - never does.
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use relay_store::SqliteStore;
+    use tokio::sync::watch;
+
+    use super::*;
+    use crate::{
+        Relay,
+        daemon::{DAEMON_PROTOCOL_VERSION, DaemonCommand, DaemonServer},
+    };
+
+    const TEST_HANDOFF: &str = r#"{
+        "protocol_version": 1,
+        "project": "test-proj",
+        "title": "Transport Admission Test",
+        "task": { "goal": "Prove a raw peer cannot mutate without a handshake" },
+        "ambiguity_policy": "needs_clarification"
+    }"#;
+
+    fn test_relay() -> Relay {
+        let mut registry = crate::ProjectRegistry::empty();
+        let path = std::env::temp_dir().join("relay-daemon-transport-test-project");
+        std::fs::create_dir_all(&path).unwrap();
+        registry
+            .register(crate::RegisterProject {
+                key: "test-proj".to_owned(),
+                name: None,
+                local_path: path,
+                expected_remote: None,
+                default_stack: None,
+                github: None,
+            })
+            .unwrap();
+        Relay::with_project_registry(registry)
+    }
+
+    struct Harness {
+        pipe_name: String,
+        state_identity: String,
+        server: Arc<DaemonServer>,
+        shutdown: watch::Sender<bool>,
+        listener: tokio::task::JoinHandle<()>,
+    }
+
+    impl Harness {
+        async fn start() -> Self {
+            let store = SqliteStore::in_memory().await.unwrap();
+            let state_identity = store.store_identity().await.unwrap();
+            let server = Arc::new(
+                DaemonServer::start(
+                    store,
+                    test_relay(),
+                    "test-lease-admission",
+                    Duration::from_secs(60),
+                )
+                .await
+                .unwrap(),
+            );
+
+            let pipe_name = default_pipe_name(&state_identity);
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let listener = {
+                let server = Arc::clone(&server);
+                let pipe_name = pipe_name.clone();
+                tokio::spawn(async move {
+                    let _ =
+                        run_named_pipe_listener(server, &pipe_name, shutdown_rx, ready_tx).await;
+                })
+            };
+            ready_rx
+                .await
+                .expect("the test listener must bind its pipe");
+
+            Self {
+                pipe_name,
+                state_identity,
+                server,
+                shutdown,
+                listener,
+            }
+        }
+
+        async fn connect(&self) -> NamedPipeClient {
+            for _ in 0..100 {
+                match ClientOptions::new().open(&self.pipe_name) {
+                    Ok(client) => return client,
+                    Err(err)
+                        if matches!(
+                            err.raw_os_error(),
+                            Some(ERROR_PIPE_BUSY) | Some(ERROR_FILE_NOT_FOUND)
+                        ) =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(err) => panic!("failed to connect to the test pipe: {err}"),
+                }
+            }
+            panic!("test pipe never became reachable");
+        }
+
+        async fn request(
+            &self,
+            client: &mut NamedPipeClient,
+            request: &DaemonRequest,
+        ) -> DaemonResponse {
+            let bytes = serde_json::to_vec(request).unwrap();
+            write_frame(client, &bytes).await.unwrap();
+            let response_bytes = read_frame(client).await.unwrap();
+            serde_json::from_slice(&response_bytes).unwrap()
+        }
+
+        async fn submit_handoff(&self, command_id: &str) -> DaemonRequest {
+            DaemonRequest::SubmitCommand {
+                command_id: command_id.to_owned(),
+                command: DaemonCommand::SubmitHandoff {
+                    project_key: "test-proj".to_owned(),
+                    handoff_json: TEST_HANDOFF.to_owned(),
+                    submission_transport: "local-paste".to_owned(),
+                },
+                state_identity: self.state_identity.clone(),
+            }
+        }
+
+        async fn stop(self) {
+            let _ = self.shutdown.send(true);
+            let _ = self.listener.await;
+        }
+    }
+
+    /// Counts durable command rows, so a refused request can be proven to have
+    /// had no effect rather than merely having produced an error response.
+    async fn recorded_command_count(server: &DaemonServer, command_id: &str) -> bool {
+        server
+            .store()
+            .get_command(command_id)
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn raw_peer_without_a_handshake_cannot_submit_a_command() {
+        let harness = Harness::start().await;
+        let mut client = harness.connect().await;
+
+        // No handshake: the very first frame is a mutating command.
+        let request = harness.submit_handoff("cmd-no-handshake").await;
+        match harness.request(&mut client, &request).await {
+            DaemonResponse::Error(err) => {
+                assert!(
+                    err.contains("has not completed a matching identity handshake"),
+                    "unexpected refusal message: {err}"
+                );
+            }
+            other => panic!("expected an unadmitted connection to be refused, got {other:?}"),
+        }
+
+        assert!(
+            !recorded_command_count(&harness.server, "cmd-no-handshake").await,
+            "a refused command must not be recorded"
+        );
+        match harness
+            .server
+            .handle_request(DaemonRequest::GetSnapshot)
+            .await
+        {
+            DaemonResponse::Snapshot(snapshot) => assert!(
+                snapshot.tasks.is_empty(),
+                "a refused command must not import a task"
+            ),
+            other => panic!("expected a snapshot, got {other:?}"),
+        }
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn mismatched_handshake_does_not_admit_the_connection() {
+        let harness = Harness::start().await;
+        let mut client = harness.connect().await;
+
+        // Handshake against a *different* database's identity.
+        let mismatch = DaemonRequest::Handshake {
+            client_name: "raw-test".to_owned(),
+            protocol_version: DAEMON_PROTOCOL_VERSION,
+            state_identity: "some-other-database".to_owned(),
+        };
+        match harness.request(&mut client, &mismatch).await {
+            DaemonResponse::StateIdentityMismatch { .. } => {}
+            other => panic!("expected an identity mismatch, got {other:?}"),
+        }
+
+        // The connection must still be unadmitted.
+        let request = harness.submit_handoff("cmd-wrong-handshake").await;
+        match harness.request(&mut client, &request).await {
+            DaemonResponse::Error(err) => {
+                assert!(
+                    err.contains("has not completed a matching identity handshake"),
+                    "unexpected refusal message: {err}"
+                );
+            }
+            other => panic!("expected an unadmitted connection to be refused, got {other:?}"),
+        }
+
+        assert!(
+            !recorded_command_count(&harness.server, "cmd-wrong-handshake").await,
+            "a refused command must not be recorded"
+        );
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn matching_handshake_admits_subsequent_commands() {
+        let harness = Harness::start().await;
+        let mut client = harness.connect().await;
+
+        let handshake = DaemonRequest::Handshake {
+            client_name: "raw-test".to_owned(),
+            protocol_version: DAEMON_PROTOCOL_VERSION,
+            state_identity: harness.state_identity.clone(),
+        };
+        match harness.request(&mut client, &handshake).await {
+            DaemonResponse::HandshakeAck { .. } => {}
+            other => panic!("expected a handshake ack, got {other:?}"),
+        }
+
+        let request = harness.submit_handoff("cmd-admitted").await;
+        match harness.request(&mut client, &request).await {
+            DaemonResponse::CommandResult { status, .. } => {
+                assert_eq!(status, CommandStatus::Applied)
+            }
+            other => panic!("expected the admitted command to apply, got {other:?}"),
+        }
+
+        harness.stop().await;
     }
 }

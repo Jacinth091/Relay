@@ -93,11 +93,20 @@ pub(crate) async fn persist_imported_task(
 /// Persists an imported task idempotently: replaying the same task id (e.g.
 /// a daemon command retried after a crash) returns the existing row instead
 /// of erroring or duplicating the `task_ready` event.
+///
+/// Fenced on the daemon lease, because the only caller is the daemon's handoff
+/// submission path: a submission admitted before authority was lost must not
+/// land after a successor took the lease.
 pub(crate) async fn persist_imported_task_if_absent(
     store: &SqliteStore,
     task: &ImportedTask,
+    fence: &relay_store::DaemonFence,
 ) -> Result<StoredTask, TaskPersistenceError> {
-    record_to_stored_task(store.insert_task_if_absent(&new_task_record(task)?).await?)
+    record_to_stored_task(
+        store
+            .insert_task_if_absent_fenced(&new_task_record(task)?, fence)
+            .await?,
+    )
 }
 
 fn new_task_record(task: &ImportedTask) -> Result<NewTaskRecord, TaskPersistenceError> {
@@ -345,9 +354,12 @@ pub async fn acquire_durable_lease(
     };
 
     // Canonical durable-lease expiry representation: Unix epoch seconds as text.
-    // The store evaluates expiry in epoch seconds (tolerating date-text rows), and
-    // `Lease::assert_valid` parses this field as epoch seconds. If this changes,
-    // both of those must change with it.
+    // The store compares expiry as an integer against the current epoch second
+    // (`CAST(expires_at AS INTEGER)`), and `Lease::assert_valid` parses this field
+    // as epoch seconds. Only this wrapper writes the column; any other
+    // representation (for example an ISO date string) is read as that string's
+    // leading integer and would appear already expired, not "tolerated". If this
+    // changes, both the store comparison and `assert_valid` must change with it.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

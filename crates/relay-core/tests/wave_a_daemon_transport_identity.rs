@@ -11,6 +11,10 @@
 //!   submissions are resolved against the persisted trusted registry.
 //! - R16-04: losing the daemon lease stops the daemon serving and releases its
 //!   transport, so a successor can bind it.
+//! - R17-02 (re-review of R16-04): `run_full_daemon` does not report a running
+//!   daemon until its listener has actually bound the transport, retries binding
+//!   while a stale instance still holds the pipe, and fails startup truthfully if
+//!   it cannot bind at all.
 
 #![cfg(windows)]
 
@@ -24,6 +28,7 @@ use relay_core::{
     NamedPipeDaemonClient, ProjectRegistry, RegisterProject, Relay, SqliteStore, default_pipe_name,
     list_stored_tasks, run_full_daemon,
 };
+use tokio::net::windows::named_pipe::ServerOptions;
 
 const HANDOFF: &str = r#"{
     "protocol_version": 1,
@@ -273,4 +278,74 @@ async fn losing_the_lease_stops_the_daemon_serving_and_releases_its_pipe() {
     let successor_client = client_for(&successor);
     wait_until_serving(&successor_client).await;
     successor_embedded.shutdown().await;
+}
+
+/// R17-02: a successor that cannot bind the transport must not be reported as a
+/// running daemon. Previously `run_full_daemon` returned as soon as it spawned
+/// the listener, so a bind failure left a "running" daemon whose pipe belonged
+/// to no one and whose error had only been logged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_that_cannot_bind_its_pipe_reports_startup_failure() {
+    let dir = temp_prefix("bind-failure");
+    let store = SqliteStore::open(dir.join("state.sqlite3")).await.unwrap();
+    let identity = store.store_identity().await.unwrap();
+    let pipe_name = default_pipe_name(&identity);
+
+    // Hold the first pipe instance for the whole test, so the daemon can never
+    // bind its transport.
+    let _blocker = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&pipe_name)
+        .expect("the test must be able to hold the pipe first");
+
+    let started = run_full_daemon(
+        store,
+        Relay::new(),
+        "lease-bind-failure",
+        Duration::from_secs(30),
+    )
+    .await;
+    assert!(
+        started.is_err(),
+        "a daemon that cannot bind its transport must not report itself running"
+    );
+}
+
+/// R17-02: binding is retried while a stale instance still holds the pipe, so a
+/// takeover that overlaps a live predecessor converges on a serving daemon
+/// instead of a silently dead one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_waits_for_a_held_pipe_and_then_serves() {
+    let dir = temp_prefix("bind-retry");
+    let store = SqliteStore::open(dir.join("state.sqlite3")).await.unwrap();
+    let identity = store.store_identity().await.unwrap();
+    let pipe_name = default_pipe_name(&identity);
+
+    let blocker = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&pipe_name)
+        .expect("the test must be able to hold the pipe first");
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(blocker);
+    });
+
+    let (server, embedded) = run_full_daemon(
+        store,
+        Relay::new(),
+        "lease-bind-retry",
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("the daemon must bind once the held pipe is released");
+
+    let client = client_for(&server);
+    wait_until_serving(&client).await;
+    let status = client
+        .submit_command("cmd-after-retry", queue_effect("eff-retry", "idem-retry"))
+        .await
+        .expect("the retried listener must serve commands");
+    assert_eq!(status, CommandStatus::Applied);
+
+    embedded.shutdown().await;
 }

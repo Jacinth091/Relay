@@ -19,6 +19,12 @@ use crate::{
     effect_worker::{EffectWorkerRegistry, run_effect_worker},
 };
 
+/// Upper bound on how long `run_full_daemon` waits for its listener to bind the
+/// transport before reporting startup failure. It exceeds the listener's own
+/// bounded takeover retry window, so a genuine bind failure is reported by the
+/// listener rather than masked by this timeout.
+const LISTENER_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A client handle to the canonical Relay Daemon, whether reached in-process
 /// (test harnesses, or this process embedding the daemon itself) or over the
 /// real local transport. `DaemonClient`'s methods use native `async fn`
@@ -147,17 +153,41 @@ pub async fn run_full_daemon(
     let listener_server = Arc::clone(&server);
     let listener_pipe_name = daemon_transport::default_pipe_name(server.state_identity());
     let listener_shutdown = shutdown_rx.clone();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let listener = tokio::spawn(async move {
         if let Err(err) = daemon_transport::run_named_pipe_listener(
             listener_server,
             &listener_pipe_name,
             listener_shutdown,
+            ready_tx,
         )
         .await
         {
             tracing::error!(error = %err, "daemon pipe listener stopped with an error");
         }
     });
+
+    // Do not report a running daemon until its transport is actually bound: a
+    // successor that claimed the lease while a stale daemon still held the pipe
+    // must wait out the takeover (bounded) rather than return a daemon with no
+    // listener. A dropped `ready` means the listener could not bind at all.
+    match tokio::time::timeout(LISTENER_READY_TIMEOUT, ready_rx).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_dropped)) => {
+            let _ = shutdown_tx.send(true);
+            let _ = listener.await;
+            return Err(DaemonError::Transport(
+                "daemon pipe listener failed to bind its transport".to_owned(),
+            ));
+        }
+        Err(_elapsed) => {
+            let _ = shutdown_tx.send(true);
+            let _ = listener.await;
+            return Err(DaemonError::Transport(
+                "daemon pipe listener did not bind its transport in time".to_owned(),
+            ));
+        }
+    }
 
     let worker_store = server.store().clone();
     let effect_worker = tokio::spawn(run_effect_worker(

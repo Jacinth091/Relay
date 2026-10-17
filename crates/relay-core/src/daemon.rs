@@ -14,11 +14,11 @@ use crate::{
     Relay, SqliteStore, StoredTask, SubmissionTransport, TaskId, durable_state::list_stored_tasks,
 };
 use relay_store::{
-    CommandRecord, DaemonLeaseRecord, EventRecord, NewPendingEffectRecord, PendingEffectRecord,
-    StoreError,
+    CommandRecord, DaemonFence, DaemonLeaseRecord, EventRecord, NewPendingEffectRecord,
+    PendingEffectRecord, StoreError,
 };
 
-pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
+pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
 pub const DAEMON_PROTOCOL_NAME: &str = "relay.v2";
 pub const DEFAULT_LEASE_ID: &str = "relay-daemon-primary";
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(15);
@@ -36,6 +36,8 @@ pub enum DaemonError {
     LeaseHeld(String),
     #[error("store error: {0}")]
     Store(#[from] StoreError),
+    #[error("daemon lost authority over the database before the command could commit: {0}")]
+    AuthorityLost(String),
     #[error("command error: {0}")]
     Command(String),
     #[error("serialization error: {0}")]
@@ -64,6 +66,11 @@ pub enum DaemonRequest {
     SubmitCommand {
         command_id: String,
         command: DaemonCommand,
+        /// Durable state identity the submitting client is bound to. The daemon
+        /// refuses a mismatch before applying anything, so a mutating request
+        /// cannot be dispatched without the caller naming the database it means
+        /// to write - even if it bypasses the connection wrapper.
+        state_identity: String,
     },
     GetSnapshot,
     GetEventsAfter {
@@ -297,6 +304,51 @@ impl DaemonServer {
         &self.state_identity
     }
 
+    /// Validates a handshake and builds its response.
+    ///
+    /// This is the single validation path for handshakes: the transport requires
+    /// a `HandshakeAck` from here before dispatching any other request on a
+    /// connection, and the direct request path uses it too, so both agree on the
+    /// protocol version and database identity.
+    pub fn handshake_response(
+        &self,
+        protocol_version: u32,
+        state_identity: &str,
+    ) -> DaemonResponse {
+        if protocol_version != DAEMON_PROTOCOL_VERSION {
+            return DaemonResponse::Error(format!(
+                "protocol version mismatch: client requested {protocol_version}, daemon supports {DAEMON_PROTOCOL_VERSION}"
+            ));
+        }
+
+        if state_identity != self.state_identity {
+            return DaemonResponse::StateIdentityMismatch {
+                client_identity: state_identity.to_owned(),
+                daemon_identity: self.state_identity.clone(),
+            };
+        }
+
+        DaemonResponse::HandshakeAck {
+            daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
+            protocol_version: DAEMON_PROTOCOL_VERSION,
+            fencing_token: self.fencing_token(),
+            state_identity: self.state_identity.clone(),
+        }
+    }
+
+    /// The durable fence this daemon must still hold for its writes to commit.
+    fn fence(&self) -> DaemonFence {
+        let record = self
+            .lease_record
+            .lock()
+            .expect("lease record lock poisoned");
+        DaemonFence {
+            lease_id: record.lease_id.clone(),
+            holder_pid: record.holder_pid,
+            fencing_token: record.fencing_token,
+        }
+    }
+
     /// Records that this process has lost authoritative ownership of the daemon
     /// lease. Idempotent: the first reason recorded is the one reported, so the
     /// original cause is what clients and logs see.
@@ -363,6 +415,12 @@ impl DaemonServer {
     }
 
     /// Handles a typed client request.
+    ///
+    /// A mutating [`DaemonRequest::SubmitCommand`] must name the durable state
+    /// identity it is bound to; a mismatch is refused before any mutation, so a
+    /// caller that bypasses the connection wrapper still cannot write to an
+    /// unintended database. The transport additionally refuses any request on a
+    /// connection that has not completed a matching handshake.
     pub async fn handle_request(&self, request: DaemonRequest) -> DaemonResponse {
         if let Some(reason) = self.authority_lost_reason() {
             // Fail closed: this process can no longer prove it owns the daemon
@@ -378,25 +436,7 @@ impl DaemonServer {
                 client_name: _,
                 protocol_version,
                 state_identity,
-            } => {
-                if protocol_version != DAEMON_PROTOCOL_VERSION {
-                    return DaemonResponse::Error(format!(
-                        "protocol version mismatch: client requested {protocol_version}, daemon supports {DAEMON_PROTOCOL_VERSION}"
-                    ));
-                }
-                if state_identity != self.state_identity {
-                    return DaemonResponse::StateIdentityMismatch {
-                        client_identity: state_identity,
-                        daemon_identity: self.state_identity.clone(),
-                    };
-                }
-                DaemonResponse::HandshakeAck {
-                    daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
-                    protocol_version: DAEMON_PROTOCOL_VERSION,
-                    fencing_token: self.fencing_token(),
-                    state_identity: self.state_identity.clone(),
-                }
-            }
+            } => self.handshake_response(protocol_version, &state_identity),
             DaemonRequest::Ping => DaemonResponse::Pong,
             DaemonRequest::GetSnapshot => match self.build_snapshot().await {
                 Ok(snapshot) => DaemonResponse::Snapshot(snapshot),
@@ -414,7 +454,18 @@ impl DaemonServer {
             DaemonRequest::SubmitCommand {
                 command_id,
                 command,
-            } => self.execute_command(command_id, command).await,
+                state_identity,
+            } => {
+                if state_identity != self.state_identity {
+                    // Fail closed before any mutation: the caller is not bound to
+                    // this daemon's durable state.
+                    return DaemonResponse::StateIdentityMismatch {
+                        client_identity: state_identity,
+                        daemon_identity: self.state_identity.clone(),
+                    };
+                }
+                self.execute_command(command_id, command).await
+            }
         }
     }
 
@@ -499,9 +550,16 @@ impl DaemonServer {
     /// (`applied`/`failed`) return their cached result. A non-terminal command is
     /// claimed by exactly one caller, which applies it and records the terminal
     /// result; a concurrent replay of the same command id loses the claim and waits
-    /// for that result instead of applying the command a second time. Re-applying
-    /// after a crash is safe because every mutation `apply_command` performs is
-    /// idempotent on the command id / deterministic derived ids.
+    /// for that result instead of applying the command a second time.
+    ///
+    /// The semantic effect and the command's terminal record are two separate
+    /// durable writes. If the effect commits but its terminal record does not
+    /// (crash, or a failed completion write), the terminal outcome is *not*
+    /// reported optimistically: the command is left non-terminal for startup
+    /// reconciliation, and the caller is told the resolution could not be
+    /// recorded. Replay of an already-committed transition converges on
+    /// `applied` (see `apply_command`), so a crash cannot turn a successful
+    /// transition into a durable `failed` command.
     async fn resolve_command(&self, command_id: &str, command: &DaemonCommand) -> DaemonResponse {
         let existing = match self.store.get_command(command_id).await {
             Ok(Some(row)) => row,
@@ -514,10 +572,20 @@ impl DaemonServer {
         };
 
         match existing.status.as_str() {
-            "applied" | "failed" => {
+            "applied" => {
                 return DaemonResponse::CommandResult {
                     command_id: command_id.to_owned(),
                     status: CommandStatus::Duplicate,
+                    result_json: existing.response_json,
+                };
+            }
+            "failed" => {
+                // A cached failure stays a failure. Reporting it as `Duplicate`
+                // would let a caller that replays a command id read a failed
+                // command as a successful one.
+                return DaemonResponse::CommandResult {
+                    command_id: command_id.to_owned(),
+                    status: CommandStatus::Failed,
                     result_json: existing.response_json,
                 };
             }
@@ -530,30 +598,43 @@ impl DaemonServer {
             Err(err) => return DaemonResponse::Error(err.to_string()),
         }
 
-        match self.apply_command(command_id, command).await {
-            Ok(result_json) => {
-                let _ = self
-                    .store
-                    .complete_command(command_id, "applied", result_json.as_deref())
-                    .await;
-                DaemonResponse::CommandResult {
-                    command_id: command_id.to_owned(),
-                    status: CommandStatus::Applied,
-                    result_json,
-                }
+        let (status, result_json) = match self.apply_command(command_id, command).await {
+            Ok(result_json) => (CommandStatus::Applied, result_json),
+            Err(DaemonError::Store(StoreError::DaemonAuthorityLost { .. }))
+            | Err(DaemonError::AuthorityLost(_)) => {
+                // Authority was lost while the command was in flight. Do not
+                // record a terminal result: a successor owns the database now
+                // and will reconcile this command. Recording `failed` here
+                // would durably mislabel a command that never got to run.
+                return DaemonResponse::Error(
+                    "daemon lost authority over the database while applying the command; it was not recorded as terminal"
+                        .to_owned(),
+                );
             }
-            Err(err) => {
-                let err_str = err.to_string();
-                let _ = self
-                    .store
-                    .complete_command(command_id, "failed", Some(&err_str))
-                    .await;
-                DaemonResponse::CommandResult {
-                    command_id: command_id.to_owned(),
-                    status: CommandStatus::Failed,
-                    result_json: Some(err_str),
-                }
-            }
+            Err(err) => (CommandStatus::Failed, Some(err.to_string())),
+        };
+
+        let terminal_status = match status {
+            CommandStatus::Applied => "applied",
+            _ => "failed",
+        };
+        if let Err(err) = self
+            .store
+            .complete_command(command_id, terminal_status, result_json.as_deref())
+            .await
+        {
+            // Fail closed: the caller must not be told the command succeeded
+            // when we could not durably record that outcome. The command stays
+            // non-terminal and startup reconciliation will resolve it.
+            return DaemonResponse::Error(format!(
+                "command {command_id} was applied but its terminal result could not be recorded: {err}"
+            ));
+        }
+
+        DaemonResponse::CommandResult {
+            command_id: command_id.to_owned(),
+            status,
+            result_json,
         }
     }
 
@@ -570,9 +651,14 @@ impl DaemonServer {
 
             match self.store.get_command(command_id).await {
                 Ok(Some(row)) if matches!(row.status.as_str(), "applied" | "failed") => {
+                    let status = if row.status == "applied" {
+                        CommandStatus::Duplicate
+                    } else {
+                        CommandStatus::Failed
+                    };
                     return DaemonResponse::CommandResult {
                         command_id: command_id.to_owned(),
-                        status: CommandStatus::Duplicate,
+                        status,
                         result_json: row.response_json,
                     };
                 }
@@ -661,6 +747,11 @@ impl DaemonServer {
         command_id: &str,
         command: &DaemonCommand,
     ) -> Result<Option<String>, DaemonError> {
+        // Every durable write a command performs is fenced on this daemon's
+        // lease: if a successor took over between admission and the write, the
+        // store refuses the mutation instead of letting a stale daemon commit.
+        let fence = self.fence();
+
         match command {
             DaemonCommand::SubmitHandoff {
                 project_key: _,
@@ -684,10 +775,13 @@ impl DaemonServer {
 
                 let imported = candidate
                     .into_imported_task_with_id(TaskId::deterministic_from_command_id(command_id));
-                let stored =
-                    crate::durable_state::persist_imported_task_if_absent(&self.store, &imported)
-                        .await
-                        .map_err(|e| DaemonError::Command(e.to_string()))?;
+                let stored = crate::durable_state::persist_imported_task_if_absent(
+                    &self.store,
+                    &imported,
+                    &fence,
+                )
+                .await
+                .map_err(map_persistence_error)?;
 
                 Ok(Some(
                     serde_json::json!({
@@ -703,10 +797,27 @@ impl DaemonServer {
                 expected_state,
                 new_state,
             } => {
-                let updated = self
+                let updated = match self
                     .store
-                    .update_task_state(task_id, expected_state, new_state)
-                    .await?;
+                    .update_task_state_fenced(task_id, expected_state, new_state, &fence)
+                    .await
+                {
+                    Ok(updated) => updated,
+                    Err(StoreError::StateConflict { actual_state, .. })
+                        if actual_state == *new_state =>
+                    {
+                        // The transition this command performs is already
+                        // durably present (for example, the compare-and-set
+                        // committed before a crash but the command's terminal
+                        // row was never written). The command is idempotent on
+                        // its desired end state, so replaying it converges on
+                        // `applied` instead of a false `failed`.
+                        return Ok(Some(
+                            serde_json::json!({"id": task_id, "state": new_state}).to_string(),
+                        ));
+                    }
+                    Err(err) => return Err(map_store_error(err)),
+                };
                 Ok(Some(
                     serde_json::json!({
                         "id": updated.id,
@@ -727,7 +838,11 @@ impl DaemonServer {
                     idempotency_key: idempotency_key.clone(),
                     payload_json: payload_json.clone(),
                 };
-                let queued = self.store.insert_pending_effect(&record).await?;
+                let queued = self
+                    .store
+                    .insert_pending_effect_fenced(&record, &fence)
+                    .await
+                    .map_err(map_store_error)?;
                 Ok(Some(serde_json::to_string(&DaemonPendingEffect::from(
                     queued,
                 ))?))
@@ -740,8 +855,9 @@ impl DaemonServer {
             } => {
                 let result = self
                     .store
-                    .record_effect_result(result_id, effect_id, outcome, result_json)
-                    .await?;
+                    .record_effect_result_fenced(result_id, effect_id, outcome, result_json, &fence)
+                    .await
+                    .map_err(map_store_error)?;
                 Ok(Some(
                     serde_json::json!({
                         "id": result.id,
@@ -862,6 +978,7 @@ impl DaemonClient for InProcessDaemonClient {
             .handle_request(DaemonRequest::SubmitCommand {
                 command_id: command_id.to_owned(),
                 command,
+                state_identity: self.server.state_identity().to_owned(),
             })
             .await;
 
@@ -881,6 +998,24 @@ impl DaemonClient for InProcessDaemonClient {
             DaemonResponse::Error(err) => Err(DaemonError::Command(err)),
             _ => Err(DaemonError::Command("unexpected ping response".to_owned())),
         }
+    }
+}
+
+/// Preserves the typed "this daemon no longer owns the database" signal so a
+/// command refused by the fence is never mistaken for an ordinary failure.
+fn map_store_error(error: StoreError) -> DaemonError {
+    match error {
+        StoreError::DaemonAuthorityLost { lease_id } => DaemonError::AuthorityLost(lease_id),
+        other => DaemonError::Store(other),
+    }
+}
+
+fn map_persistence_error(error: crate::durable_state::TaskPersistenceError) -> DaemonError {
+    match error {
+        crate::durable_state::TaskPersistenceError::Store(StoreError::DaemonAuthorityLost {
+            lease_id,
+        }) => DaemonError::AuthorityLost(lease_id),
+        other => DaemonError::Command(other.to_string()),
     }
 }
 
@@ -982,6 +1117,7 @@ mod tests {
             .handle_request(DaemonRequest::SubmitCommand {
                 command_id: cmd_id.clone(),
                 command: command.clone(),
+                state_identity: daemon.state_identity().to_owned(),
             })
             .await;
 
@@ -1000,6 +1136,7 @@ mod tests {
             .handle_request(DaemonRequest::SubmitCommand {
                 command_id: cmd_id.clone(),
                 command,
+                state_identity: daemon.state_identity().to_owned(),
             })
             .await;
 
@@ -1062,6 +1199,7 @@ mod tests {
             .handle_request(DaemonRequest::SubmitCommand {
                 command_id: eff_cmd_id,
                 command: queue_cmd,
+                state_identity: daemon.state_identity().to_owned(),
             })
             .await;
 
@@ -1086,6 +1224,7 @@ mod tests {
             .handle_request(DaemonRequest::SubmitCommand {
                 command_id: comp_cmd_id,
                 command: comp_cmd,
+                state_identity: daemon.state_identity().to_owned(),
             })
             .await;
 
@@ -1189,6 +1328,7 @@ mod tests {
                 handoff_json: TEST_HANDOFF.to_owned(),
                 submission_transport: "local-paste".to_owned(),
             },
+            state_identity: daemon.state_identity().to_owned(),
         };
 
         let before = daemon
@@ -1261,6 +1401,7 @@ mod tests {
                         handoff_json: TEST_HANDOFF.to_owned(),
                         submission_transport: "local-paste".to_owned(),
                     },
+                    state_identity: daemon.state_identity().to_owned(),
                 })
                 .await,
         ];
@@ -1305,6 +1446,7 @@ mod tests {
                     handoff_json: TEST_HANDOFF.to_owned(),
                     submission_transport: "local-paste".to_owned(),
                 },
+                state_identity: daemon.state_identity().to_owned(),
             })
             .await;
         assert!(matches!(
@@ -1332,6 +1474,7 @@ mod tests {
         let replay = || DaemonRequest::SubmitCommand {
             command_id: "cmd-concurrent".to_owned(),
             command: command.clone(),
+            state_identity: daemon.state_identity().to_owned(),
         };
 
         // Two concurrent submissions of the *same* command id.
@@ -1388,5 +1531,220 @@ mod tests {
             }
             other => panic!("expected a snapshot, got {other:?}"),
         }
+    }
+
+    /// R17-01: a mutating request must name the database it means to write; a
+    /// caller bound to another database's identity is refused before anything is
+    /// applied, even if it bypasses the connection wrapper entirely.
+    #[tokio::test]
+    async fn submit_command_requires_the_matching_database_identity() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let daemon = DaemonServer::start(
+            store,
+            test_relay(),
+            "test-lease-identity",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+        let response = daemon
+            .handle_request(DaemonRequest::SubmitCommand {
+                command_id: "cmd-foreign-identity".to_owned(),
+                command: DaemonCommand::SubmitHandoff {
+                    project_key: "test-proj".to_owned(),
+                    handoff_json: TEST_HANDOFF.to_owned(),
+                    submission_transport: "local-paste".to_owned(),
+                },
+                state_identity: "some-other-database".to_owned(),
+            })
+            .await;
+
+        match response {
+            DaemonResponse::StateIdentityMismatch {
+                client_identity,
+                daemon_identity,
+            } => {
+                assert_eq!(client_identity, "some-other-database");
+                assert_eq!(daemon_identity, daemon.state_identity());
+            }
+            other => panic!("expected an identity mismatch, got {other:?}"),
+        }
+
+        // Fail closed means *no* durable effect: nothing was recorded and nothing
+        // was imported.
+        assert!(
+            daemon
+                .store()
+                .get_command("cmd-foreign-identity")
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused command must not be recorded"
+        );
+        match daemon.handle_request(DaemonRequest::GetSnapshot).await {
+            DaemonResponse::Snapshot(snapshot) => assert!(snapshot.tasks.is_empty()),
+            other => panic!("expected a snapshot, got {other:?}"),
+        }
+    }
+
+    /// R17-04: the compare-and-set effect and the command's terminal record are
+    /// separate durable writes. When the effect commits but the terminal record
+    /// does not, replaying the command must converge on `applied` (the transition
+    /// is already present) rather than durably recording a false `failed`.
+    #[tokio::test]
+    async fn replaying_a_committed_state_transition_reports_applied_not_failed() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let daemon = DaemonServer::start(
+            store,
+            test_relay(),
+            "test-lease-replay",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+        let seeded = daemon
+            .handle_request(DaemonRequest::SubmitCommand {
+                command_id: "cmd-replay-seed".to_owned(),
+                command: DaemonCommand::SubmitHandoff {
+                    project_key: "test-proj".to_owned(),
+                    handoff_json: TEST_HANDOFF.to_owned(),
+                    submission_transport: "local-paste".to_owned(),
+                },
+                state_identity: daemon.state_identity().to_owned(),
+            })
+            .await;
+        assert!(matches!(
+            seeded,
+            DaemonResponse::CommandResult {
+                status: CommandStatus::Applied,
+                ..
+            }
+        ));
+
+        let task_id = match daemon.handle_request(DaemonRequest::GetSnapshot).await {
+            DaemonResponse::Snapshot(snapshot) => {
+                assert_eq!(snapshot.tasks.len(), 1);
+                snapshot.tasks[0].id.clone()
+            }
+            other => panic!("expected a snapshot, got {other:?}"),
+        };
+
+        let transition = DaemonRequest::SubmitCommand {
+            command_id: "cmd-replay-transition".to_owned(),
+            command: DaemonCommand::UpdateTaskState {
+                task_id: task_id.clone(),
+                expected_state: "ready".to_owned(),
+                new_state: "running".to_owned(),
+            },
+            state_identity: daemon.state_identity().to_owned(),
+        };
+
+        let first = match daemon.handle_request(transition.clone()).await {
+            DaemonResponse::CommandResult { status, .. } => status,
+            other => panic!("expected a command result, got {other:?}"),
+        };
+        assert_eq!(first, CommandStatus::Applied);
+
+        // Simulate the crash window: the transition is durably committed, but the
+        // command's terminal row was never written and its claim was reset by
+        // startup reconciliation.
+        daemon
+            .store()
+            .complete_command("cmd-replay-transition", "received", None)
+            .await
+            .unwrap();
+        daemon.store().reset_command_claims().await.unwrap();
+
+        let replay = match daemon.handle_request(transition).await {
+            DaemonResponse::CommandResult { status, .. } => status,
+            other => panic!("expected a command result, got {other:?}"),
+        };
+        assert_eq!(
+            replay,
+            CommandStatus::Applied,
+            "replaying a transition whose effect already committed must report applied, not a false failed"
+        );
+
+        match daemon.handle_request(DaemonRequest::GetSnapshot).await {
+            DaemonResponse::Snapshot(snapshot) => {
+                assert_eq!(snapshot.tasks.len(), 1);
+                assert_eq!(snapshot.tasks[0].state, "running");
+            }
+            other => panic!("expected a snapshot, got {other:?}"),
+        }
+    }
+
+    /// R17-04: a cached `failed` command must stay a failure on replay. Reporting
+    /// it as `Duplicate` would let a caller that reuses a command id read a failed
+    /// command as a successful one.
+    #[tokio::test]
+    async fn a_failed_command_replays_as_failed_not_duplicate() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let daemon = DaemonServer::start(
+            store,
+            test_relay(),
+            "test-lease-failed",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+        let seeded = daemon
+            .handle_request(DaemonRequest::SubmitCommand {
+                command_id: "cmd-failed-seed".to_owned(),
+                command: DaemonCommand::SubmitHandoff {
+                    project_key: "test-proj".to_owned(),
+                    handoff_json: TEST_HANDOFF.to_owned(),
+                    submission_transport: "local-paste".to_owned(),
+                },
+                state_identity: daemon.state_identity().to_owned(),
+            })
+            .await;
+        let task_id = match seeded {
+            DaemonResponse::CommandResult { .. } => {
+                match daemon.handle_request(DaemonRequest::GetSnapshot).await {
+                    DaemonResponse::Snapshot(snapshot) => snapshot.tasks[0].id.clone(),
+                    other => panic!("expected a snapshot, got {other:?}"),
+                }
+            }
+            other => panic!("expected a command result, got {other:?}"),
+        };
+
+        // The task is `ready`; asking for `running -> done` cannot apply.
+        let failing = DaemonRequest::SubmitCommand {
+            command_id: "cmd-failed-transition".to_owned(),
+            command: DaemonCommand::UpdateTaskState {
+                task_id,
+                expected_state: "running".to_owned(),
+                new_state: "done".to_owned(),
+            },
+            state_identity: daemon.state_identity().to_owned(),
+        };
+
+        let first = match daemon.handle_request(failing.clone()).await {
+            DaemonResponse::CommandResult { status, .. } => status,
+            other => panic!("expected a command result, got {other:?}"),
+        };
+        assert_eq!(first, CommandStatus::Failed);
+
+        let replay = match daemon.handle_request(failing).await {
+            DaemonResponse::CommandResult { status, .. } => status,
+            other => panic!("expected a command result, got {other:?}"),
+        };
+        assert_eq!(
+            replay,
+            CommandStatus::Failed,
+            "a failed command must not be reported as a successful duplicate"
+        );
+
+        let row = daemon
+            .store()
+            .get_command("cmd-failed-transition")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "failed");
     }
 }

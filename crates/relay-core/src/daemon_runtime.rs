@@ -170,23 +170,33 @@ pub async fn run_full_daemon(
     // Do not report a running daemon until its transport is actually bound: a
     // successor that claimed the lease while a stale daemon still held the pipe
     // must wait out the takeover (bounded) rather than return a daemon with no
-    // listener. A dropped `ready` means the listener could not bind at all.
-    match tokio::time::timeout(LISTENER_READY_TIMEOUT, ready_rx).await {
-        Ok(Ok(())) => {}
+    // listener. A dropped `ready` means the listener could not bind at all, and
+    // an `Err` payload means startup was cancelled before it bound - neither is
+    // reported as readiness.
+    let startup_failure = match tokio::time::timeout(LISTENER_READY_TIMEOUT, ready_rx).await {
+        Ok(Ok(Ok(()))) => None,
+        Ok(Ok(Err(reason))) => Some(reason),
         Ok(Err(_dropped)) => {
-            let _ = shutdown_tx.send(true);
-            let _ = listener.await;
-            return Err(DaemonError::Transport(
-                "daemon pipe listener failed to bind its transport".to_owned(),
-            ));
+            Some("daemon pipe listener stopped before it bound its transport".to_owned())
         }
-        Err(_elapsed) => {
-            let _ = shutdown_tx.send(true);
-            let _ = listener.await;
-            return Err(DaemonError::Transport(
-                "daemon pipe listener did not bind its transport in time".to_owned(),
-            ));
+        Err(_elapsed) => Some("daemon pipe listener did not bind its transport in time".to_owned()),
+    };
+
+    if let Some(reason) = startup_failure {
+        // Startup failed after the lease was acquired. Tear the whole startup
+        // down - stop and join the heartbeat as well as the listener - and
+        // release the lease this process still owns, so a successor does not
+        // have to wait out the TTL to take over. `release_daemon_lease` is
+        // scoped to our own holder pid, so it can never delete a successor's row.
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::join!(heartbeat, listener);
+        if let Err(err) = server.release_lease().await {
+            tracing::warn!(
+                error = %err,
+                "failed to release the daemon lease after a failed startup"
+            );
         }
+        return Err(DaemonError::Transport(reason));
     }
 
     let worker_store = server.store().clone();

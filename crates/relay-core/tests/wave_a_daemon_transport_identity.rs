@@ -15,6 +15,9 @@
 //!   daemon until its listener has actually bound the transport, retries binding
 //!   while a stale instance still holds the pipe, and fails startup truthfully if
 //!   it cannot bind at all.
+//! - R18-02 (re-review of R17-02): a startup cancelled while it is still retrying
+//!   the bind reports failure rather than readiness, stops its background tasks,
+//!   and releases only the lease it still owns - a successor's lease survives.
 
 #![cfg(windows)]
 
@@ -28,6 +31,7 @@ use relay_core::{
     NamedPipeDaemonClient, ProjectRegistry, RegisterProject, Relay, SqliteStore, default_pipe_name,
     list_stored_tasks, run_full_daemon,
 };
+use relay_store::StoreError;
 use tokio::net::windows::named_pipe::ServerOptions;
 
 const HANDOFF: &str = r#"{
@@ -309,6 +313,104 @@ async fn a_daemon_that_cannot_bind_its_pipe_reports_startup_failure() {
         started.is_err(),
         "a daemon that cannot bind its transport must not report itself running"
     );
+
+    // R18-02: a failed startup must not pin the lease it acquired. If the lease
+    // were still held, this different-holder acquisition would be refused with
+    // `DaemonLeaseHeld` instead of taking over immediately.
+    let reopened = SqliteStore::open(dir.join("state.sqlite3")).await.unwrap();
+    let taken = reopened
+        .acquire_or_renew_daemon_lease(
+            "lease-bind-failure",
+            std::process::id() as i64 + 1,
+            "other-host",
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("a failed startup must not leave the daemon lease pinned");
+    assert_eq!(taken.holder_pid, std::process::id() as i64 + 1);
+}
+
+/// R18-02: cancelling a startup while the listener is still retrying a pipe held
+/// by a predecessor must report failure rather than a running daemon, and must
+/// stop the background tasks while releasing only the lease this instance still
+/// owns - a successor's lease row must survive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_startup_cancelled_while_binding_fails_and_keeps_the_successor_lease() {
+    let dir = temp_prefix("cancelled-bind");
+    let store = SqliteStore::open(dir.join("state.sqlite3")).await.unwrap();
+    let identity = store.store_identity().await.unwrap();
+
+    // Hold the pipe so the listener cannot bind and stays in its retry loop.
+    let blocker = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(default_pipe_name(&identity))
+        .expect("the test must be able to hold the pipe first");
+
+    // A two-second TTL keeps the heartbeat tick at one second while making the
+    // forged successor's freshly-written row too young for the stale heartbeat to
+    // reclaim: staleness is `elapsed_secs >= ttl_secs`, so a 2s TTL always reads a
+    // just-written row as held (renewal fails) rather than reclaimable.
+    let startup = tokio::spawn(run_full_daemon(
+        store.clone(),
+        Relay::new(),
+        "lease-cancelled-bind",
+        Duration::from_secs(2),
+    ));
+
+    // Let the starter take the lease, then hand it to a successor while the
+    // starter is still trying to bind. The next heartbeat observes the loss and
+    // cancels the startup through the shared shutdown signal. The listener retries
+    // the bind for ten seconds, so this window is wide.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let successor = store
+        .acquire_or_renew_daemon_lease(
+            "lease-cancelled-bind",
+            std::process::id() as i64 + 1,
+            "forged-successor",
+            Duration::ZERO,
+        )
+        .await
+        .expect("forging a successor lease must succeed");
+    assert_eq!(
+        successor.fencing_token, 2,
+        "the starter must have taken the lease before the successor forged its own"
+    );
+
+    let outcome = tokio::time::timeout(Duration::from_secs(20), startup)
+        .await
+        .expect("a cancelled startup must finish")
+        .expect("the startup task must not panic");
+    match outcome {
+        Err(DaemonError::Transport(message)) => assert!(
+            message.contains("cancelled"),
+            "a cancelled startup must report the cancellation, got: {message}"
+        ),
+        Ok(_) => panic!("a cancelled startup must not report a running daemon"),
+        Err(other) => panic!("expected a transport startup failure, got {other:?}"),
+    }
+
+    // The failed startup must not release a lease it no longer owns: the forged
+    // successor still holds it, so a third party requesting a long TTL is refused
+    // rather than quietly taking it.
+    match store
+        .acquire_or_renew_daemon_lease(
+            "lease-cancelled-bind",
+            std::process::id() as i64 + 2,
+            "third-party",
+            Duration::from_secs(60),
+        )
+        .await
+    {
+        Err(StoreError::DaemonLeaseHeld { holder_host, .. }) => {
+            assert_eq!(
+                holder_host, "forged-successor",
+                "the successor's lease must survive the failed startup untouched"
+            );
+        }
+        other => panic!("the successor's lease must survive the failed startup, got {other:?}"),
+    }
+
+    drop(blocker);
 }
 
 /// R17-02: binding is retried while a stale instance still holds the pipe, so a

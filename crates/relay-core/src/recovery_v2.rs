@@ -112,6 +112,12 @@ impl RecoveryCoordinator {
 
     /// Performs recovery reconciliation across the daemon store, exchange capabilities,
     /// and active leases.
+    ///
+    /// Not on the daemon's startup path: the daemon runs
+    /// [`crate::daemon::DaemonServer::reconcile_on_startup`], whose writes are fenced on
+    /// the daemon lease. This module is exercised by its phase tests only, and its effect
+    /// writes here are unfenced; any future caller that runs inside a daemon process must
+    /// fence them on that process's lease exactly like the effect worker does.
     pub async fn reconcile_startup(
         store: &SqliteStore,
         exchange: Option<&RelayExchange>,

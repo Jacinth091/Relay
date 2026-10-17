@@ -1,0 +1,21 @@
+-- Migration 0009: Relay Architecture v2 - per-instance daemon lease ownership (PR #16 review DB-19-02)
+--
+-- A daemon lease was identified by the owning process: (holder_pid, holder_host).
+-- Two daemon instances inside one process share both, so the second instance
+-- looked like the owner of the first: it could renew the same fencing token
+-- instead of being refused, reset the live instance's command claims during its
+-- own startup reconciliation, and - through the failed-startup cleanup - delete
+-- the row the first, still-running instance was using.
+--
+-- `holder_instance` names the individual daemon instance (a fresh identifier per
+-- acquire, carried for the lifetime of that instance). Renewal matches on it as
+-- well, so a second instance is refused while the first is live, and release
+-- (which matches it too) can only ever delete the row of the instance that
+-- actually wrote it. A stale row is still reclaimable by a successor once its
+-- TTL has elapsed, which increments the fencing token as before.
+--
+-- Existing rows carry the empty string, which no new instance ever uses: a
+-- pre-existing row is therefore only reclaimable by the elapsed-TTL takeover
+-- path, never treated as a live renewal of a different instance.
+
+ALTER TABLE daemon_leases ADD COLUMN holder_instance TEXT NOT NULL DEFAULT '';

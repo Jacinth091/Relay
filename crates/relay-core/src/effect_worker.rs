@@ -16,7 +16,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use tokio::sync::watch;
 
-use relay_store::{PendingEffectRecord, SqliteStore};
+use relay_store::{DaemonFence, PendingEffectRecord, SqliteStore, StoreError};
 
 pub enum EffectOutcome {
     Success(String),
@@ -84,8 +84,16 @@ impl<H: EffectHandler + Send + Sync> BoxedEffectHandler for HandlerAdapter<H> {
 /// Polls for effect work: reconciles effects stuck `in_flight` past a
 /// staleness threshold (crash recovery), then dispatches a batch of `pending`
 /// effects to their registered handler.
+///
+/// Every write this worker makes is fenced on the daemon lease it was started
+/// with and conditional on the effect state it observed, because the worker
+/// mutates the same canonical effect ledger as the rest of the daemon: a
+/// successor that settles an effect must not be overwritten, and must not have a
+/// second, contradictory result row added beside its own. Losing the lease stops
+/// the worker outright rather than letting it keep polling without authority.
 pub async fn run_effect_worker(
     store: SqliteStore,
+    fence: DaemonFence,
     registry: EffectWorkerRegistry,
     poll_interval: Duration,
     max_attempts: i64,
@@ -100,8 +108,12 @@ pub async fn run_effect_worker(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                reconcile_stale_in_flight(&store, stale_after, max_attempts).await;
-                process_pending_batch(&store, &registry).await;
+                if !reconcile_stale_in_flight(&store, &fence, stale_after, max_attempts).await {
+                    return;
+                }
+                if !process_pending_batch(&store, &fence, &registry).await {
+                    return;
+                }
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
@@ -112,7 +124,18 @@ pub async fn run_effect_worker(
     }
 }
 
-async fn reconcile_stale_in_flight(store: &SqliteStore, stale_after: Duration, max_attempts: i64) {
+/// Reports whether the worker may keep running: `false` once the lease has been
+/// taken over, in which case nothing it writes can commit anyway.
+fn may_continue(err: &StoreError) -> bool {
+    !matches!(err, StoreError::DaemonAuthorityLost { .. })
+}
+
+async fn reconcile_stale_in_flight(
+    store: &SqliteStore,
+    fence: &DaemonFence,
+    stale_after: Duration,
+    max_attempts: i64,
+) -> bool {
     let stale = match store
         .list_stale_in_flight_effects(stale_after.as_secs() as i64)
         .await
@@ -120,47 +143,80 @@ async fn reconcile_stale_in_flight(store: &SqliteStore, stale_after: Duration, m
         Ok(effects) => effects,
         Err(err) => {
             tracing::error!(error = %err, "effect worker: failed to list stale in-flight effects");
-            return;
+            return true;
         }
     };
 
     for effect in stale {
-        let outcome = if effect.attempts >= max_attempts {
-            store
-                .update_effect_state(
-                    &effect.id,
-                    "failed",
-                    Some("exceeded max retry attempts after crash recovery"),
-                )
-                .await
+        let (state, last_error) = if effect.attempts >= max_attempts {
+            (
+                "failed",
+                Some("exceeded max retry attempts after crash recovery"),
+            )
         } else {
-            store.update_effect_state(&effect.id, "pending", None).await
+            ("pending", None)
         };
 
-        if let Err(err) = outcome {
-            tracing::error!(effect_id = %effect.id, error = %err, "effect worker: failed to reconcile stale in-flight effect");
+        // Conditional on the effect still being in flight: an effect that a
+        // successor already settled must not be re-opened by this instance.
+        match store
+            .update_effect_state_fenced(&effect.id, state, last_error, "in_flight", fence)
+            .await
+        {
+            Ok(_) => {}
+            Err(err) if !may_continue(&err) => {
+                tracing::error!(
+                    effect_id = %effect.id,
+                    error = %err,
+                    "effect worker: lost the daemon lease; stopping instead of writing stale effect state"
+                );
+                return false;
+            }
+            Err(err) => {
+                tracing::error!(effect_id = %effect.id, error = %err, "effect worker: failed to reconcile stale in-flight effect");
+            }
         }
     }
+
+    true
 }
 
-async fn process_pending_batch(store: &SqliteStore, registry: &EffectWorkerRegistry) {
+async fn process_pending_batch(
+    store: &SqliteStore,
+    fence: &DaemonFence,
+    registry: &EffectWorkerRegistry,
+) -> bool {
     const BATCH_LIMIT: usize = 20;
 
     let pending = match store.list_pending_effects(Some("pending")).await {
         Ok(effects) => effects,
         Err(err) => {
             tracing::error!(error = %err, "effect worker: failed to list pending effects");
-            return;
+            return true;
         }
     };
 
     for effect in pending.into_iter().take(BATCH_LIMIT) {
-        if let Err(err) = store
-            .update_effect_state(&effect.id, "in_flight", None)
+        // Claim the effect. A successor that already claimed or settled it
+        // makes this write match nothing, and the worker leaves it alone.
+        match store
+            .update_effect_state_fenced(&effect.id, "in_flight", None, "pending", fence)
             .await
         {
-            tracing::error!(effect_id = %effect.id, error = %err, "effect worker: failed to mark effect in-flight");
-            continue;
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(err) if !may_continue(&err) => {
+                tracing::error!(
+                    effect_id = %effect.id,
+                    error = %err,
+                    "effect worker: lost the daemon lease; stopping instead of claiming effect work"
+                );
+                return false;
+            }
+            Err(err) => {
+                tracing::error!(effect_id = %effect.id, error = %err, "effect worker: failed to mark effect in-flight");
+                continue;
+            }
         }
 
         let outcome = registry.dispatch(&effect).await;
@@ -171,11 +227,33 @@ async fn process_pending_batch(store: &SqliteStore, registry: &EffectWorkerRegis
         };
 
         let result_id = format!("{}-worker-result", effect.id);
-        if let Err(err) = store
-            .record_effect_result(&result_id, &effect.id, result_outcome, &result_json)
+        // Records the result and settles the effect in one fenced, claim-guarded
+        // transaction: if the claim was overtaken while the handler ran, neither
+        // the state move nor the result row lands.
+        match store
+            .settle_effect_from_worker_fenced(
+                &result_id,
+                &effect.id,
+                result_outcome,
+                &result_json,
+                fence,
+            )
             .await
         {
-            tracing::error!(effect_id = %effect.id, error = %err, "effect worker: failed to record effect result");
+            Ok(_) => {}
+            Err(err) if !may_continue(&err) => {
+                tracing::error!(
+                    effect_id = %effect.id,
+                    error = %err,
+                    "effect worker: lost the daemon lease; discarding a result it no longer owns"
+                );
+                return false;
+            }
+            Err(err) => {
+                tracing::error!(effect_id = %effect.id, error = %err, "effect worker: failed to record effect result");
+            }
         }
     }
+
+    true
 }

@@ -144,6 +144,10 @@ pub struct DaemonLeaseRecord {
     pub lease_id: String,
     pub holder_pid: i64,
     pub holder_host: String,
+    /// The individual daemon instance that owns this lease. Two daemons in one
+    /// process share a pid and hostname; renewal and release match this too, so
+    /// neither can act as the other.
+    pub holder_instance: String,
     pub acquired_at: String,
     pub heartbeat_at: String,
     pub fencing_token: i64,
@@ -1584,7 +1588,32 @@ impl SqliteStore {
         state: &str,
         last_error: Option<&str>,
     ) -> Result<(), StoreError> {
-        retry_on_transient_lock(|| self.update_effect_state_once(id, state, last_error)).await
+        retry_on_transient_lock(|| self.update_effect_state_once(id, state, last_error, None, None))
+            .await
+            .map(|_| ())
+    }
+
+    /// Fenced variant used by the daemon's own effect worker.
+    ///
+    /// The write is refused (`DaemonAuthorityLost`) once a successor holds the
+    /// lease, and it only applies while the effect is still in
+    /// `expected_state`. A worker that read a `pending` effect and scanned its
+    /// bag only after a successor settled it must not regress the newer result,
+    /// so the guard is on the same transaction as the mutation. Returns `false`
+    /// when the effect has moved on (the worker no longer owns the transition);
+    /// an effect that does not exist is still a typed error.
+    pub async fn update_effect_state_fenced(
+        &self,
+        id: &str,
+        state: &str,
+        last_error: Option<&str>,
+        expected_state: &str,
+        fence: &DaemonFence,
+    ) -> Result<bool, StoreError> {
+        retry_on_transient_lock(|| {
+            self.update_effect_state_once(id, state, last_error, Some(expected_state), Some(fence))
+        })
+        .await
     }
 
     async fn update_effect_state_once(
@@ -1592,7 +1621,15 @@ impl SqliteStore {
         id: &str,
         state: &str,
         last_error: Option<&str>,
-    ) -> Result<(), StoreError> {
+        expected_state: Option<&str>,
+        fence: Option<&DaemonFence>,
+    ) -> Result<bool, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        if let Some(fence) = fence {
+            assert_daemon_fence(&mut *transaction, fence).await?;
+        }
+
         let res = sqlx::query(
             r#"
             UPDATE pending_effects
@@ -1601,18 +1638,37 @@ impl SqliteStore {
                 last_error = ?2,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE id = ?3
+              AND (?4 IS NULL OR state = ?4)
             "#,
         )
         .bind(state)
         .bind(last_error)
         .bind(id)
-        .execute(&self.pool)
+        .bind(expected_state)
+        .execute(&mut *transaction)
         .await?;
 
         if res.rows_affected() == 0 {
-            return Err(StoreError::PendingEffectNotFound { id: id.to_owned() });
+            if expected_state.is_none() {
+                return Err(StoreError::PendingEffectNotFound { id: id.to_owned() });
+            }
+            // The guarded write matched nothing: either the effect moved on
+            // under us (a successor settled or re-claimed it), or it never
+            // existed. Only the second case is an error.
+            let exists = sqlx::query("SELECT 1 FROM pending_effects WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .is_some();
+            if !exists {
+                return Err(StoreError::PendingEffectNotFound { id: id.to_owned() });
+            }
+            transaction.commit().await?;
+            return Ok(false);
         }
-        Ok(())
+
+        transaction.commit().await?;
+        Ok(true)
     }
 
     pub async fn record_effect_result(
@@ -1641,6 +1697,82 @@ impl SqliteStore {
             self.record_effect_result_once(id, effect_id, outcome, result_json, Some(fence))
         })
         .await
+    }
+
+    /// Fenced variant used by the daemon's own effect worker: records the
+    /// handler's result and settles the effect, but only while this instance
+    /// still owns the claim (`in_flight`).
+    ///
+    /// Both writes are one transaction, guarded by the lease fence and by the
+    /// effect still being in-flight, so a worker result that lands after a
+    /// successor already settled the effect is refused as a whole: it cannot
+    /// flip a `completed` effect back to `failed`, and it cannot add a second,
+    /// contradictory result row. Returns `false` when the claim was lost; a
+    /// missing effect row is the same case, not an error, because the
+    /// transition this worker wanted to own no longer exists to own.
+    pub async fn settle_effect_from_worker_fenced(
+        &self,
+        id: &str,
+        effect_id: &str,
+        outcome: &str,
+        result_json: &str,
+        fence: &DaemonFence,
+    ) -> Result<bool, StoreError> {
+        retry_on_transient_lock(|| {
+            self.settle_effect_from_worker_once(id, effect_id, outcome, result_json, fence)
+        })
+        .await
+    }
+
+    async fn settle_effect_from_worker_once(
+        &self,
+        id: &str,
+        effect_id: &str,
+        outcome: &str,
+        result_json: &str,
+        fence: &DaemonFence,
+    ) -> Result<bool, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        assert_daemon_fence(&mut *transaction, fence).await?;
+
+        let res = sqlx::query(
+            r#"
+            UPDATE pending_effects
+            SET state = CASE WHEN ?1 = 'success' THEN 'completed' ELSE 'failed' END,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?2
+              AND state = 'in_flight'
+            "#,
+        )
+        .bind(outcome)
+        .bind(effect_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        if res.rows_affected() == 0 {
+            // This instance no longer owns the effect's transition: someone else
+            // settled or re-claimed it after this worker read it. Record no
+            // result, so no contradictory outcome is left behind.
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO effect_results (id, effect_id, outcome, result_json)
+            VALUES (?1, ?2, ?3, ?4)
+            "#,
+        )
+        .bind(id)
+        .bind(effect_id)
+        .bind(outcome)
+        .bind(result_json)
+        .execute(&mut *transaction)
+        .await?;
+
+        transaction.commit().await?;
+        Ok(true)
     }
 
     async fn record_effect_result_once(
@@ -1750,15 +1882,30 @@ impl SqliteStore {
         Ok(max_id.unwrap_or(0))
     }
 
+    /// Acquires or renews the daemon lease for one daemon *instance*.
+    ///
+    /// `holder_instance` identifies the individual instance, not the process:
+    /// renewal requires the row to belong to this exact instance, so a second
+    /// daemon started inside the same process is refused (`DaemonLeaseHeld`)
+    /// while the first is live instead of silently sharing its fencing token.
+    /// A row whose owner is stale (elapsed TTL) is still reclaimable by any
+    /// successor, which increments the fencing token.
     pub async fn acquire_or_renew_daemon_lease(
         &self,
         lease_id: &str,
         holder_pid: i64,
         holder_host: &str,
+        holder_instance: &str,
         ttl: Duration,
     ) -> Result<DaemonLeaseRecord, StoreError> {
         retry_on_transient_lock(|| {
-            self.acquire_or_renew_daemon_lease_once(lease_id, holder_pid, holder_host, ttl)
+            self.acquire_or_renew_daemon_lease_once(
+                lease_id,
+                holder_pid,
+                holder_host,
+                holder_instance,
+                ttl,
+            )
         })
         .await
     }
@@ -1768,13 +1915,14 @@ impl SqliteStore {
         lease_id: &str,
         holder_pid: i64,
         holder_host: &str,
+        holder_instance: &str,
         ttl: Duration,
     ) -> Result<DaemonLeaseRecord, StoreError> {
         let mut transaction = self.pool.begin().await?;
 
         let existing = sqlx::query(
             r#"
-            SELECT lease_id, holder_pid, holder_host, acquired_at, heartbeat_at, fencing_token,
+            SELECT lease_id, holder_pid, holder_host, holder_instance, acquired_at, heartbeat_at, fencing_token,
                    CAST((strftime('%s', 'now') - strftime('%s', heartbeat_at)) AS INTEGER) as elapsed_secs
             FROM daemon_leases
             WHERE lease_id = ?1
@@ -1787,10 +1935,14 @@ impl SqliteStore {
         if let Some(row) = existing {
             let current_pid: i64 = row.try_get("holder_pid")?;
             let current_host: String = row.try_get("holder_host")?;
+            let current_instance: String = row.try_get("holder_instance")?;
             let elapsed_secs: Option<i64> = row.try_get("elapsed_secs")?;
 
-            if current_pid == holder_pid && current_host == holder_host {
-                // Heartbeat renewal
+            if current_pid == holder_pid
+                && current_host == holder_host
+                && current_instance == holder_instance
+            {
+                // Heartbeat renewal: this is the instance that already owns the row.
                 sqlx::query(
                     r#"
                     UPDATE daemon_leases
@@ -1806,19 +1958,25 @@ impl SqliteStore {
                 let is_stale = elapsed_secs.is_none_or(|s| s >= ttl_secs);
 
                 if is_stale {
+                    // A successor takes over the row - a different holder, or a
+                    // second instance in the same process whose predecessor is
+                    // gone. The fencing token advances so every write admitted
+                    // under the previous owner is refused.
                     sqlx::query(
                         r#"
                         UPDATE daemon_leases
                         SET holder_pid = ?1,
                             holder_host = ?2,
+                            holder_instance = ?3,
                             acquired_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                             heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                             fencing_token = fencing_token + 1
-                        WHERE lease_id = ?3
+                        WHERE lease_id = ?4
                         "#,
                     )
                     .bind(holder_pid)
                     .bind(holder_host)
+                    .bind(holder_instance)
                     .bind(lease_id)
                     .execute(&mut *transaction)
                     .await?;
@@ -1833,20 +1991,21 @@ impl SqliteStore {
         } else {
             sqlx::query(
                 r#"
-                INSERT INTO daemon_leases (lease_id, holder_pid, holder_host, fencing_token)
-                VALUES (?1, ?2, ?3, 1)
+                INSERT INTO daemon_leases (lease_id, holder_pid, holder_host, holder_instance, fencing_token)
+                VALUES (?1, ?2, ?3, ?4, 1)
                 "#,
             )
             .bind(lease_id)
             .bind(holder_pid)
             .bind(holder_host)
+            .bind(holder_instance)
             .execute(&mut *transaction)
             .await?;
         }
 
         let updated = sqlx::query(
             r#"
-            SELECT lease_id, holder_pid, holder_host, acquired_at, heartbeat_at, fencing_token
+            SELECT lease_id, holder_pid, holder_host, holder_instance, acquired_at, heartbeat_at, fencing_token
             FROM daemon_leases
             WHERE lease_id = ?1
             "#,
@@ -1859,6 +2018,7 @@ impl SqliteStore {
             lease_id: updated.try_get("lease_id")?,
             holder_pid: updated.try_get("holder_pid")?,
             holder_host: updated.try_get("holder_host")?,
+            holder_instance: updated.try_get("holder_instance")?,
             acquired_at: updated.try_get("acquired_at")?,
             heartbeat_at: updated.try_get("heartbeat_at")?,
             fencing_token: updated.try_get("fencing_token")?,
@@ -1868,28 +2028,40 @@ impl SqliteStore {
         Ok(record)
     }
 
+    /// Releases the daemon lease held by one daemon *instance*.
+    ///
+    /// Scoped to the exact instance that acquired it, so a failed or superseded
+    /// instance can never delete the row of a live successor - not even a
+    /// successor in the same process, where a pid-only delete would match.
     pub async fn release_daemon_lease(
         &self,
         lease_id: &str,
         holder_pid: i64,
+        holder_instance: &str,
     ) -> Result<(), StoreError> {
-        retry_on_transient_lock(|| self.release_daemon_lease_once(lease_id, holder_pid)).await
+        retry_on_transient_lock(|| {
+            self.release_daemon_lease_once(lease_id, holder_pid, holder_instance)
+        })
+        .await
     }
 
     async fn release_daemon_lease_once(
         &self,
         lease_id: &str,
         holder_pid: i64,
+        holder_instance: &str,
     ) -> Result<(), StoreError> {
         sqlx::query(
             r#"
             DELETE FROM daemon_leases
             WHERE lease_id = ?1
               AND holder_pid = ?2
+              AND holder_instance = ?3
             "#,
         )
         .bind(lease_id)
         .bind(holder_pid)
+        .bind(holder_instance)
         .execute(&self.pool)
         .await?;
 
@@ -2270,6 +2442,10 @@ fn is_migration_race(error: &sqlx::migrate::MigrateError) -> bool {
 
     (display.contains("_sqlx_migrations") && display.contains("UNIQUE constraint"))
         || display.contains("already exists")
+        // A migration that adds a column (0002, 0008, 0009) fails with this
+        // message - not "already exists" - when a concurrent first-time
+        // migrator applied it first. Same race, same recovery.
+        || display.contains("duplicate column name")
 }
 
 async fn insert_event(
@@ -2294,18 +2470,22 @@ async fn insert_event(
     Ok(())
 }
 
-/// Asserts that the daemon lease row still belongs to this process at the
-/// expected fencing token. Evaluated as the first statement of the same
+/// Asserts that the daemon lease row still belongs to this daemon instance at
+/// the expected fencing token. Evaluated as the first statement of the same
 /// transaction as the mutation it guards, so it cannot be satisfied by a
 /// lease that was valid when the command was admitted but lost before the
 /// write committed.
+///
+/// The instance identity is part of the comparison: a pid and token alone cannot
+/// distinguish two daemons sharing one process, nor a row re-acquired at the same
+/// pid after a release (where the token restarts at 1).
 async fn assert_daemon_fence<'a>(
     executor: impl sqlx::Executor<'a, Database = sqlx::Sqlite>,
     fence: &DaemonFence,
 ) -> Result<(), StoreError> {
     let row = sqlx::query(
         r#"
-        SELECT holder_pid, fencing_token
+        SELECT holder_pid, holder_instance, fencing_token
         FROM daemon_leases
         WHERE lease_id = ?1
         "#,
@@ -2317,6 +2497,7 @@ async fn assert_daemon_fence<'a>(
     let still_holds = match row {
         Some(row) => {
             row.try_get::<i64, _>("holder_pid")? == fence.holder_pid
+                && row.try_get::<String, _>("holder_instance")? == fence.holder_instance
                 && row.try_get::<i64, _>("fencing_token")? == fence.fencing_token
         }
         None => false,
@@ -2483,14 +2664,22 @@ fn row_to_resource_lease_record(
 /// Proof that a caller may still write on behalf of a daemon lease.
 ///
 /// A daemon mutates durable state inside a transaction that first asserts the
-/// `daemon_leases` row still belongs to this process at this exact fencing
-/// token. If a successor has taken the lease (which increments the token), the
-/// assertion fails and the mutation is refused, so a command admitted before
-/// authority was lost cannot commit after a successor took over.
+/// `daemon_leases` row still belongs to this exact daemon instance at this exact
+/// fencing token. If a successor has taken the lease (which increments the
+/// token), the assertion fails and the mutation is refused, so a command
+/// admitted before authority was lost cannot commit after a successor took
+/// over.
+///
+/// The instance identity is part of the fence, not just the process: two daemon
+/// instances inside one process share a pid and hostname, and a released row can
+/// be re-acquired at the same pid with the token restarting at 1, so a
+/// pid-plus-token fence alone would let a previous instance's write match a
+/// successor's row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonFence {
     pub lease_id: String,
     pub holder_pid: i64,
+    pub holder_instance: String,
     pub fencing_token: i64,
 }
 
@@ -3165,28 +3354,53 @@ mod tests {
         let store = SqliteStore::in_memory().await.unwrap();
 
         let lease = store
-            .acquire_or_renew_daemon_lease("daemon-main", 1001, "host-a", Duration::from_secs(60))
+            .acquire_or_renew_daemon_lease(
+                "daemon-main",
+                1001,
+                "host-a",
+                "inst-1001",
+                Duration::from_secs(60),
+            )
             .await
             .unwrap();
         assert_eq!(lease.holder_pid, 1001);
+        assert_eq!(lease.holder_instance, "inst-1001");
         assert_eq!(lease.fencing_token, 1);
 
-        // Same holder can renew
+        // The same instance can renew
         let renewed = store
-            .acquire_or_renew_daemon_lease("daemon-main", 1001, "host-a", Duration::from_secs(60))
+            .acquire_or_renew_daemon_lease(
+                "daemon-main",
+                1001,
+                "host-a",
+                "inst-1001",
+                Duration::from_secs(60),
+            )
             .await
             .unwrap();
         assert_eq!(renewed.fencing_token, 1);
 
         // Other holder is rejected while active
         let conflict = store
-            .acquire_or_renew_daemon_lease("daemon-main", 1002, "host-b", Duration::from_secs(60))
+            .acquire_or_renew_daemon_lease(
+                "daemon-main",
+                1002,
+                "host-b",
+                "inst-1002",
+                Duration::from_secs(60),
+            )
             .await;
         assert!(matches!(conflict, Err(StoreError::DaemonLeaseHeld { .. })));
 
         // Other holder succeeds when lease is stale (ttl = 0)
         let recovered = store
-            .acquire_or_renew_daemon_lease("daemon-main", 1002, "host-b", Duration::ZERO)
+            .acquire_or_renew_daemon_lease(
+                "daemon-main",
+                1002,
+                "host-b",
+                "inst-1002",
+                Duration::ZERO,
+            )
             .await
             .unwrap();
         assert_eq!(recovered.holder_pid, 1002);
@@ -3194,13 +3408,19 @@ mod tests {
 
         // Release lease
         store
-            .release_daemon_lease("daemon-main", 1002)
+            .release_daemon_lease("daemon-main", 1002, "inst-1002")
             .await
             .unwrap();
 
         // Now first holder can acquire fresh lease
         let fresh = store
-            .acquire_or_renew_daemon_lease("daemon-main", 1001, "host-a", Duration::from_secs(60))
+            .acquire_or_renew_daemon_lease(
+                "daemon-main",
+                1001,
+                "host-a",
+                "inst-1001",
+                Duration::from_secs(60),
+            )
             .await
             .unwrap();
         assert_eq!(fresh.holder_pid, 1001);
@@ -3212,12 +3432,19 @@ mod tests {
         let store = SqliteStore::in_memory().await.unwrap();
 
         let lease = store
-            .acquire_or_renew_daemon_lease("daemon-main", 1001, "host-a", Duration::from_secs(60))
+            .acquire_or_renew_daemon_lease(
+                "daemon-main",
+                1001,
+                "host-a",
+                "inst-1001",
+                Duration::from_secs(60),
+            )
             .await
             .unwrap();
         let fence = DaemonFence {
             lease_id: "daemon-main".to_owned(),
             holder_pid: lease.holder_pid,
+            holder_instance: lease.holder_instance.clone(),
             fencing_token: lease.fencing_token,
         };
 
@@ -3236,7 +3463,13 @@ mod tests {
         // A successor takes the lease (stale takeover), which increments the
         // fencing token and changes the holder.
         let successor = store
-            .acquire_or_renew_daemon_lease("daemon-main", 1002, "host-b", Duration::ZERO)
+            .acquire_or_renew_daemon_lease(
+                "daemon-main",
+                1002,
+                "host-b",
+                "inst-1002",
+                Duration::ZERO,
+            )
             .await
             .unwrap();
         assert_eq!(successor.fencing_token, lease.fencing_token + 1);
@@ -3268,12 +3501,19 @@ mod tests {
         let store = SqliteStore::in_memory().await.unwrap();
 
         let lease = store
-            .acquire_or_renew_daemon_lease("daemon-ledger", 2001, "host-a", Duration::from_secs(60))
+            .acquire_or_renew_daemon_lease(
+                "daemon-ledger",
+                2001,
+                "host-a",
+                "inst-2001",
+                Duration::from_secs(60),
+            )
             .await
             .unwrap();
         let fence = DaemonFence {
             lease_id: "daemon-ledger".to_owned(),
             holder_pid: lease.holder_pid,
+            holder_instance: lease.holder_instance.clone(),
             fencing_token: lease.fencing_token,
         };
 
@@ -3295,7 +3535,13 @@ mod tests {
         // A successor takes the lease (stale takeover), changing the holder and
         // incrementing the fencing token.
         let successor = store
-            .acquire_or_renew_daemon_lease("daemon-ledger", 2002, "host-b", Duration::ZERO)
+            .acquire_or_renew_daemon_lease(
+                "daemon-ledger",
+                2002,
+                "host-b",
+                "inst-2002",
+                Duration::ZERO,
+            )
             .await
             .unwrap();
         assert_eq!(successor.fencing_token, lease.fencing_token + 1);
@@ -3344,6 +3590,7 @@ mod tests {
                 "daemon-complete",
                 3001,
                 "host-a",
+                "inst-3001",
                 Duration::from_secs(60),
             )
             .await
@@ -3351,6 +3598,7 @@ mod tests {
         let fence = DaemonFence {
             lease_id: "daemon-complete".to_owned(),
             holder_pid: lease.holder_pid,
+            holder_instance: lease.holder_instance.clone(),
             fencing_token: lease.fencing_token,
         };
 
@@ -3386,6 +3634,355 @@ mod tests {
                 .await,
             Err(StoreError::CommandNotFound { .. })
         ));
+    }
+
+    /// DB-19-02: two daemon instances inside one process share a pid and a
+    /// hostname, so a process-scoped lease let the second instance renew the
+    /// first's row, and a pid-scoped release let a failed second startup delete
+    /// the lease the first, live instance was using. Ownership is per instance,
+    /// and a release only ever removes the row of the instance that wrote it.
+    #[tokio::test]
+    async fn daemon_lease_ownership_is_per_instance_not_per_process() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let pid = 4242;
+
+        let first = store
+            .acquire_or_renew_daemon_lease(
+                "daemon-instances",
+                pid,
+                "host-a",
+                "instance-a",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.fencing_token, 1);
+
+        // A second instance in the same process must not inherit the first's
+        // authority while the first is live.
+        let second = store
+            .acquire_or_renew_daemon_lease(
+                "daemon-instances",
+                pid,
+                "host-a",
+                "instance-b",
+                Duration::from_secs(60),
+            )
+            .await;
+        assert!(
+            matches!(second, Err(StoreError::DaemonLeaseHeld { .. })),
+            "a second daemon instance in one process must be refused, not treated as the live owner"
+        );
+
+        // ...and a failed second startup releasing under its own identity leaves
+        // the live instance's lease alone.
+        store
+            .release_daemon_lease("daemon-instances", pid, "instance-b")
+            .await
+            .unwrap();
+
+        let contested = store
+            .acquire_or_renew_daemon_lease(
+                "daemon-instances",
+                pid + 1,
+                "host-a",
+                "instance-c",
+                Duration::from_secs(60),
+            )
+            .await;
+        assert!(
+            matches!(contested, Err(StoreError::DaemonLeaseHeld { .. })),
+            "the first instance must still own its lease after a failed second startup"
+        );
+
+        let renewed = store
+            .acquire_or_renew_daemon_lease(
+                "daemon-instances",
+                pid,
+                "host-a",
+                "instance-a",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            renewed.fencing_token, first.fencing_token,
+            "renewal by the owning instance must not advance the fencing token"
+        );
+
+        // A stale row is still reclaimable by a different instance in the same
+        // process - that is what makes a crashed predecessor recoverable.
+        let successor = store
+            .acquire_or_renew_daemon_lease(
+                "daemon-instances",
+                pid,
+                "host-a",
+                "instance-d",
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        assert_eq!(successor.fencing_token, first.fencing_token + 1);
+        assert_eq!(successor.holder_instance, "instance-d");
+
+        // The superseded instance's release must not delete the successor's row.
+        store
+            .release_daemon_lease("daemon-instances", pid, "instance-a")
+            .await
+            .unwrap();
+        let after_superseded_release = store
+            .acquire_or_renew_daemon_lease(
+                "daemon-instances",
+                pid + 1,
+                "host-a",
+                "instance-e",
+                Duration::from_secs(60),
+            )
+            .await;
+        assert!(
+            matches!(
+                after_superseded_release,
+                Err(StoreError::DaemonLeaseHeld { .. })
+            ),
+            "a superseded instance's release must not delete a successor's lease"
+        );
+
+        // The owning instance's release does remove its row, so the next holder
+        // acquires a fresh lease instead of waiting out the TTL.
+        store
+            .release_daemon_lease("daemon-instances", pid, "instance-d")
+            .await
+            .unwrap();
+        let after_release = store
+            .acquire_or_renew_daemon_lease(
+                "daemon-instances",
+                pid + 1,
+                "host-a",
+                "instance-e",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            after_release.fencing_token, 1,
+            "a released lease is re-acquired as a fresh generation"
+        );
+    }
+
+    /// FLOW-19-01: the daemon's effect worker mutates the same canonical
+    /// `pending_effects` / `effect_results` ledger the daemon owns, so its writes
+    /// are fenced on the lease *and* conditional on the state it claimed. A
+    /// worker whose claim was overtaken must neither record a result nor move an
+    /// effect back out of a settled state.
+    #[tokio::test]
+    async fn effect_worker_writes_are_fenced_and_cannot_regress_a_settled_effect() {
+        use sqlx::Row;
+
+        let store = SqliteStore::in_memory().await.unwrap();
+
+        let lease = store
+            .acquire_or_renew_daemon_lease(
+                "daemon-effects",
+                5001,
+                "host-a",
+                "inst-5001",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        let fence = DaemonFence {
+            lease_id: "daemon-effects".to_owned(),
+            holder_pid: lease.holder_pid,
+            holder_instance: lease.holder_instance.clone(),
+            fencing_token: lease.fencing_token,
+        };
+
+        store
+            .insert_pending_effect(&NewPendingEffectRecord {
+                id: "eff-worker".to_owned(),
+                effect_type: "test_effect".to_owned(),
+                idempotency_key: "idem-eff-worker".to_owned(),
+                payload_json: "{}".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        // The worker claims the effect while it holds the lease.
+        assert!(
+            store
+                .update_effect_state_fenced("eff-worker", "in_flight", None, "pending", &fence)
+                .await
+                .unwrap(),
+            "the lease holder must be able to claim a pending effect"
+        );
+
+        // A successor takes over and settles the effect successfully.
+        let successor = store
+            .acquire_or_renew_daemon_lease(
+                "daemon-effects",
+                5002,
+                "host-b",
+                "inst-5002",
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        let successor_fence = DaemonFence {
+            lease_id: "daemon-effects".to_owned(),
+            holder_pid: successor.holder_pid,
+            holder_instance: successor.holder_instance.clone(),
+            fencing_token: successor.fencing_token,
+        };
+        store
+            .record_effect_result_fenced(
+                "success-result",
+                "eff-worker",
+                "success",
+                r#"{"ok":true}"#,
+                &successor_fence,
+            )
+            .await
+            .unwrap();
+
+        // The stale worker's late result is refused outright: the lease is gone.
+        assert!(
+            matches!(
+                store
+                    .settle_effect_from_worker_fenced(
+                        "eff-worker-worker-result",
+                        "eff-worker",
+                        "failure",
+                        "handler failed",
+                        &fence
+                    )
+                    .await,
+                Err(StoreError::DaemonAuthorityLost { .. })
+            ),
+            "a worker that lost the lease must not settle an effect"
+        );
+        // ...and so is its state transition, on the claim path as well.
+        assert!(
+            matches!(
+                store
+                    .update_effect_state_fenced("eff-worker", "pending", None, "in_flight", &fence)
+                    .await,
+                Err(StoreError::DaemonAuthorityLost { .. })
+            ),
+            "a worker that lost the lease must not move effect state"
+        );
+
+        let settled = store
+            .get_pending_effect("eff-worker")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            settled.state, "completed",
+            "a stale worker must not regress a settled effect"
+        );
+
+        // The lease holder that no longer owns the claim is refused too: the
+        // effect is no longer in flight, so the second settle records nothing.
+        assert!(
+            !store
+                .settle_effect_from_worker_fenced(
+                    "successor-late-result",
+                    "eff-worker",
+                    "failure",
+                    "late failure",
+                    &successor_fence
+                )
+                .await
+                .unwrap(),
+            "an effect that is no longer in flight must not be settled again"
+        );
+
+        let rows =
+            sqlx::query("SELECT id, outcome FROM effect_results WHERE effect_id = ?1 ORDER BY id")
+                .bind("eff-worker")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        let recorded: Vec<(String, String)> = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.try_get::<String, _>("id").unwrap(),
+                    row.try_get::<String, _>("outcome").unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![("success-result".to_owned(), "success".to_owned())],
+            "a stale or superseded worker must not leave a contradictory result row"
+        );
+    }
+
+    /// A released lease is re-acquired at the same pid with the token restarting
+    /// at 1, so pid plus token cannot identify a generation: the instance is part
+    /// of the fence, otherwise the previous instance's stale writes would satisfy
+    /// the assertion against the new instance's row.
+    #[tokio::test]
+    async fn a_reacquired_lease_does_not_accept_the_previous_instances_fence() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let pid = 6001;
+
+        let first = store
+            .acquire_or_renew_daemon_lease(
+                "daemon-reacquire",
+                pid,
+                "host-a",
+                "instance-first",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        let stale_fence = DaemonFence {
+            lease_id: "daemon-reacquire".to_owned(),
+            holder_pid: first.holder_pid,
+            holder_instance: first.holder_instance.clone(),
+            fencing_token: first.fencing_token,
+        };
+
+        store
+            .release_daemon_lease("daemon-reacquire", pid, "instance-first")
+            .await
+            .unwrap();
+
+        let second = store
+            .acquire_or_renew_daemon_lease(
+                "daemon-reacquire",
+                pid,
+                "host-a",
+                "instance-second",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second.fencing_token, stale_fence.fencing_token,
+            "the token alone cannot distinguish the two generations"
+        );
+
+        store
+            .record_command_fenced("cmd-reacquire", "submit_handoff", "{}", &stale_fence)
+            .await
+            .expect_err("the previous instance's fence must not satisfy the new instance's row");
+
+        let current_fence = DaemonFence {
+            lease_id: "daemon-reacquire".to_owned(),
+            holder_pid: second.holder_pid,
+            holder_instance: second.holder_instance.clone(),
+            fencing_token: second.fencing_token,
+        };
+        assert!(
+            store
+                .record_command_fenced("cmd-reacquire", "submit_handoff", "{}", &current_fence)
+                .await
+                .unwrap(),
+            "the current instance must still be able to write"
+        );
     }
 
     #[tokio::test]

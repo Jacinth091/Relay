@@ -55,17 +55,45 @@ Relay persists SQLite state and can launch coding-agent processes.
 
 ### Local state and configuration
 
+Relay keeps its durable state under your user profile unless you override it:
+
+| File | Default (Windows) | Contents |
+|---|---|---|
+| `config.toml` | `%APPDATA%\Relay\config.toml` | trusted project registry: local paths and expected Git remotes |
+| `state.sqlite3` | `%APPDATA%\Relay\state.sqlite3` | durable tasks, leases, events, and the rest of the SQLite store |
+| `runtimes.toml` | `%APPDATA%\Relay\runtimes.toml` | runtime profiles, default provider/model/reasoning, project tuning |
+
+On Windows all three live in that one folder: Windows paths are
+case-insensitive, so the lowercase `relay` and uppercase `Relay` spellings used
+internally resolve to the same directory. On a case-sensitive platform the
+folders do differ — the registry and the runtime settings share
+`$XDG_CONFIG_HOME/relay/` (or `~/.config/relay/`), and the store lives in
+`$XDG_STATE_HOME/relay/` (or `~/.local/state/relay/`).
+
 | Variable | Effect |
 |---|---|
-| `RELAY_CONFIG_PATH` | Override the config file location |
-| `RELAY_DATABASE_PATH` | Override the SQLite database location |
+| `RELAY_CONFIG_PATH` | Override the config file location (default `%APPDATA%\Relay\config.toml`) |
+| `RELAY_DATABASE_PATH` | Override the SQLite database location (default `%APPDATA%\Relay\state.sqlite3`) |
+| `RELAY_RUNTIME_CONFIG_PATH` | Override the runtime settings file location (default `%APPDATA%\Relay\runtimes.toml`) |
 | `RELAY_CODEX_TRANSPORT` | Set to `exec` to opt out of the default Codex `app-server` transport |
 | `RELAY_TUI_INPUT_TRACE` | Enable TUI input diagnostics |
 | `RELAY_DAEMON_PIPE_SUFFIX` | Test-only override for the daemon's named-pipe suffix |
 
-Both `RELAY_CONFIG_PATH` and `RELAY_DATABASE_PATH` are useful for hermetic
-manual testing: point them at a temporary directory so a run cannot touch your
-normal local state.
+All three state variables are useful for hermetic manual testing: point them at a
+temporary directory so a run cannot touch your normal local state. A fresh,
+isolated first run on Windows:
+
+```powershell
+$iso = Join-Path $env:TEMP "relay-isolated"
+New-Item -ItemType Directory -Path $iso -Force | Out-Null
+$env:RELAY_CONFIG_PATH         = Join-Path $iso "config.toml"
+$env:RELAY_DATABASE_PATH       = Join-Path $iso "state.sqlite3"
+$env:RELAY_RUNTIME_CONFIG_PATH = Join-Path $iso "runtimes.toml"
+cargo run --locked -p relay-tui
+```
+
+Projects registered while those variables point at the isolated copy are
+invisible to your normal state, and vice versa.
 
 You do **not** need to isolate the daemon transport by hand. The daemon's named
 pipe is derived from the durable identity of the database it serves (a value

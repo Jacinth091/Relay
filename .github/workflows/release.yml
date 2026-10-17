@@ -1,0 +1,180 @@
+name: Release
+
+# Builds the prebuilt Windows x86_64 package and publishes it as a GitHub
+# Release for a version tag.
+#
+# Design constraints (deliberate, do not relax without review):
+#   - a release can only be created by pushing a `v*` tag; `workflow_dispatch` is
+#     a dry run that builds the package and uploads it as a workflow artifact but
+#     never publishes anything;
+#   - no `pull_request` trigger: this workflow never runs for a pull request or a
+#     fork, and `ci.yml` remains the merge gate;
+#   - the build job keeps the read-only token (`contents: read` at the top level);
+#     only the publish job is granted `contents: write`, and only for a tag ref;
+#   - no third-party publish action and no stored secrets: publishing uses the
+#     `gh` CLI already installed on the runner with the automatic `GITHUB_TOKEN`;
+#   - `actions/checkout` does not persist credentials, so no step here can push to
+#     the repository with the workflow token;
+#   - the built version must match the pushed tag (D5): a mismatched tag fails the
+#     build instead of publishing a mislabelled binary;
+#   - dependencies come from the checked-in `Cargo.lock` (`--locked`);
+#   - Windows is the only supported host today (see CONTRIBUTING.md, "Supported
+#     platforms"), so the package and the checksum are the whole deliverable: the
+#     binary is not signed and no installer is produced;
+#   - a tag containing `-` (for example `v0.1.0-rc.1`) is published as a
+#     prerelease, so a test tag never becomes the repository's "latest" release.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Keyed on the ref so two runs for the same tag cannot publish at once.
+  # `cancel-in-progress` is intentionally left off: a release run must not be
+  # cancelled by a later push, and a pushed tag is never rewritten in place.
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # A tag push uses the tag itself (for example `v0.1.0`); a manual dry run uses a
+  # label that cannot be mistaken for a release.
+  RELEASE_LABEL: ${{ github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.run_number) || github.ref_name }}
+
+jobs:
+  build:
+    name: Build the Windows package
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify the tag version matches the crate version
+        # D5: a tag `vX.Y.Z` or `vX.Y.Z-<suffix>` must match the `version` in
+        # apps/relay-tui/Cargo.toml. Skipped for a `workflow_dispatch` dry run,
+        # which has no tag to check.
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          # Passed through the environment rather than interpolated into the
+          # script, so a tag name can never be executed as PowerShell.
+          TAG: ${{ github.ref_name }}
+        run: |
+          $tag = $env:TAG
+          $tagMatch = [regex]::Match($tag, '^v(?<ver>\d+\.\d+\.\d+)(?:-.+)?$')
+          if (-not $tagMatch.Success) {
+            throw "Tag '$tag' is not of the form vX.Y.Z or vX.Y.Z-<suffix>."
+          }
+          $tagVersion = $tagMatch.Groups['ver'].Value
+
+          $manifest = Get-Content -Raw apps/relay-tui/Cargo.toml
+          $crateMatch = [regex]::Match($manifest, '(?m)^version\s*=\s*"([^"]+)"')
+          if (-not $crateMatch.Success) {
+            throw "Could not read the package version from apps/relay-tui/Cargo.toml."
+          }
+          $crateVersion = $crateMatch.Groups[1].Value
+
+          if ($crateVersion -ne $tagVersion) {
+            throw "Tag '$tag' implies version $tagVersion, but apps/relay-tui/Cargo.toml declares $crateVersion. Push the matching tag or bump the crate version."
+          }
+          Write-Host "Version check passed: '$tag' matches $crateVersion."
+
+      - name: Build the release binary
+        run: cargo build --release --locked -p relay-tui
+
+      - name: Package relay.exe, LICENSE and README.md
+        shell: pwsh
+        run: |
+          $label = $env:RELEASE_LABEL
+          $stage = "relay-$label-windows-x86_64"
+          $zip = "$stage.zip"
+
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item "target/release/relay.exe" $stage
+          Copy-Item "LICENSE" $stage
+          Copy-Item "README.md" $stage
+
+          # The files sit at the root of the archive, so a user can unzip it and
+          # run `relay.exe` without hunting through a nested folder.
+          Compress-Archive -Path "$stage/relay.exe", "$stage/LICENSE", "$stage/README.md" -DestinationPath $zip
+
+          # `sha256sum` format: lowercase hex, two spaces, then the file name.
+          # Written as ASCII with LF endings (not the PowerShell default CRLF) so
+          # `sha256sum -c` also accepts the file, not just PowerShell.
+          $hash = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText("$zip.sha256", "$hash  $zip`n", [System.Text.Encoding]::ASCII)
+
+          Write-Host "Packaged $zip"
+          Get-Content "$zip.sha256"
+
+      - name: Upload the package and checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-${{ env.RELEASE_LABEL }}-windows-x86_64
+          path: |
+            relay-${{ env.RELEASE_LABEL }}-windows-x86_64.zip
+            relay-${{ env.RELEASE_LABEL }}-windows-x86_64.zip.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish the GitHub Release
+    needs: build
+    # Only a real tag publishes. A `workflow_dispatch` dry run stops after the
+    # build job has uploaded its artifact.
+    if: startsWith(github.ref, 'refs/tags/v')
+    # Nothing is built here, so the host does not matter: `gh` ships with every
+    # GitHub-hosted runner.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download the packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: relay-${{ env.RELEASE_LABEL }}-windows-x86_64
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          zip="relay-${TAG}-windows-x86_64.zip"
+          notes="$(cat <<EOF
+          Relay ${TAG} - prebuilt Windows x86_64 package.
+
+          - Download ${zip} and ${zip}.sha256.
+          - Verify the checksum before running the binary; see docs/installation.md.
+          - The binary is unsigned, so Windows SmartScreen may warn on first launch.
+          - Real provider runs still need that provider's CLI installed and authenticated by you.
+          EOF
+          )"
+
+          # A tag containing `-` (for example `v0.1.0-rc.1`) is a prerelease, so it
+          # never becomes the repository's "latest" release.
+          if [ "${TAG#*-}" != "$TAG" ]; then
+            gh release create "$TAG" "$zip" "$zip.sha256" \
+              --repo "${{ github.repository }}" \
+              --title "$TAG" \
+              --verify-tag \
+              --prerelease \
+              --notes "$notes"
+          else
+            gh release create "$TAG" "$zip" "$zip.sha256" \
+              --repo "${{ github.repository }}" \
+              --title "$TAG" \
+              --verify-tag \
+              --notes "$notes"
+          fi

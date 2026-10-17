@@ -93,11 +93,15 @@ already running, the TUI and `relay serve-mcp` embed one in-process
 
 | Variable | Purpose |
 |---|---|
-| `RELAY_CONFIG_PATH` | Override config file location |
-| `RELAY_DATABASE_PATH` | Override SQLite database location |
+| `RELAY_CONFIG_PATH` | Override config file location (default `%APPDATA%\Relay\config.toml`) |
+| `RELAY_DATABASE_PATH` | Override SQLite database location (default `%APPDATA%\Relay\state.sqlite3`) |
+| `RELAY_RUNTIME_CONFIG_PATH` | Override runtime settings location (default `%APPDATA%\Relay\runtimes.toml`) |
 | `RELAY_CODEX_TRANSPORT` | Set to `exec` to opt out of the default Codex `app-server` transport |
 | `RELAY_TUI_INPUT_TRACE` | Enable TUI input diagnostics |
 | `RELAY_DAEMON_PIPE_SUFFIX` | Test-only override for the daemon named-pipe suffix (unset is the production default) |
+
+Setting all three path variables gives a fully isolated first run; see
+[DEVELOPMENT.md](DEVELOPMENT.md#local-state-and-configuration).
 
 ## TUI Command Palette
 

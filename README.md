@@ -89,6 +89,11 @@ test, or run the local source.
 
 ## Prerequisites
 
+> Running a **published release binary** needs none of this — see
+> [Download a release (Windows x86_64)](#download-a-release-windows-x86_64).
+> The list below applies to building from source (and to `cargo install`, which
+> still compiles the code).
+
 To build and test from source you need:
 
 - **Git**
@@ -111,9 +116,117 @@ authenticated by you.
 
 ---
 
+## Download a release (Windows x86_64)
+
+> **A release exists only if one is listed on the
+> [Releases page](https://github.com/Jacinth091/Relay/releases).** Packages are
+> produced by [`.github/workflows/release.yml`](.github/workflows/release.yml)
+> when the maintainer pushes a version tag (`v*`), so **no release may exist
+> yet**. If the Releases page is empty, use `cargo install` or build from source
+> instead (below). Never guess a download URL for a version that has not been
+> published.
+
+1. On the Releases page, download both `relay-<tag>-windows-x86_64.zip` and its
+   `relay-<tag>-windows-x86_64.zip.sha256` checksum file (for example
+   `relay-v0.1.0-windows-x86_64.zip`).
+2. Verify the checksum before running anything — see
+   [Verify the checksum](#verify-the-checksum).
+3. Unzip the archive. It holds `relay.exe`, `LICENSE` and `README.md` at the top
+   level, with no nested folder.
+4. Run it from Windows Terminal or PowerShell:
+
+   ```powershell
+   .\relay.exe
+   ```
+
+   Relay is a **terminal (TUI) program**. Double-clicking `relay.exe` starts it
+   too, but in a bare console window, so Windows Terminal is the better host.
+   With no arguments it opens the TUI; `relay --help` lists the subcommands.
+
+### Verify the checksum
+
+The `.sha256` file holds the SHA-256 of the zip in `sha256sum` format (lowercase
+hex, two spaces, then the file name). `Get-FileHash` prints uppercase, so compare
+case-insensitively:
+
+```powershell
+# Run this in the folder holding the downloaded zip.
+$zip = ".\relay-v0.1.0-windows-x86_64.zip"   # the file you downloaded
+$expected = ((Get-Content "$zip.sha256" -Raw).Trim() -split '\s+')[0]
+$actual   = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "Checksum mismatch - do not run this file." }
+"Checksum OK: $actual"
+```
+
+To compare by eye instead:
+
+```powershell
+(Get-FileHash .\relay-v0.1.0-windows-x86_64.zip -Algorithm SHA256).Hash
+```
+
+### First launch: Windows SmartScreen
+
+Release binaries are **not code-signed**. Windows may show *"Windows protected
+your PC"* the first time you run `relay.exe`. Verify the checksum first, then
+choose **More info** → **Run anyway**.
+
+### Put `relay` on your PATH (optional)
+
+To run `relay` from any folder, add the unzipped folder to your **user** `PATH`.
+Use System Properties → Environment Variables → *User variables* → `Path`, or the
+same change as one copy-paste command (run it inside the unzipped folder):
+
+```powershell
+$dir = (Resolve-Path .).Path
+[Environment]::SetEnvironmentVariable(
+  "Path",
+  [Environment]::GetEnvironmentVariable("Path", "User").TrimEnd(";") + ";$dir",
+  "User"
+)
+```
+
+New terminals pick this up; already-open ones do not. For the current terminal
+only, use `$env:Path += ";$dir"`.
+
+### What the package does not include
+
+`relay.exe` is the whole package. No provider CLI is bundled: Relay launches,
+imports tasks, shows diffs and history without one, but executing a real run
+requires the provider's own CLI (for example Codex) installed and authenticated
+by you, separately, and billed by that provider.
+
+Relay keeps its local state in `%APPDATA%\Relay\` — `config.toml`,
+`state.sqlite3` and `runtimes.toml`. Register a **disposable** test repository
+with `/project add <path>` in the TUI before your first run; see
+[docs/local-ingress.md](docs/local-ingress.md) and
+[docs/data-persistence.md](docs/data-persistence.md).
+
+---
+
+## Install with Cargo (Rust users)
+
+With a Rust toolchain in place, the same binary installs straight from the
+repository:
+
+```sh
+cargo install --git https://github.com/Jacinth091/Relay --locked relay-tui
+```
+
+That builds the `relay-tui` package and installs its `relay` binary into
+`~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` on Windows, normally already on
+`PATH`). It installs from the Git repository, not from crates.io: Relay is not
+published there (`publish = false`).
+
+On Windows this still needs the MSVC toolchain (Microsoft C++ build tools and
+Windows SDK — see [Prerequisites](#prerequisites)), so unlike the release zip it
+is not a no-build-tools install.
+
+---
+
 ## Build and run from source
 
-From a fresh clone:
+For contributors — build, test and run the whole workspace. On Windows this needs
+Rust plus the MSVC build tools listed above. From a fresh clone:
 
 ```sh
 cargo build --workspace --locked
@@ -227,7 +340,7 @@ contexts/                  Project context documents
 - [docs/adr/0020-relay-architecture-v2.md](docs/adr/0020-relay-architecture-v2.md) — architecture authority
 - [docs/architecture.md](docs/architecture.md) — current architecture guide
 - [docs/cli.md](docs/cli.md) — binary commands and TUI command palette
-- [docs/installation.md](docs/installation.md) — source build vs. unpublished installers
+- [docs/installation.md](docs/installation.md) — prebuilt releases (when listed), `cargo install`, source build
 - [docs/roadmap.md](docs/roadmap.md) — roadmap pointers (v1 ladder is historical)
 - [docs/task-protocol.md](docs/task-protocol.md) — `HandoffTask v1`
 - [docs/local-ingress.md](docs/local-ingress.md) — local file and paste formats

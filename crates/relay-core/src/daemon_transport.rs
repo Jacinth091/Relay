@@ -83,17 +83,20 @@ async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> std::io::Result<
 /// `server.handle_request`. Returns once `shutdown` is signalled.
 ///
 /// Binds the first pipe instance before returning to the caller's control: the
-/// `ready` signal fires exactly once when the listener owns its transport, so
-/// the daemon host does not report a running daemon that has no listener. If a
-/// stale predecessor still holds the pipe (for example during a lease takeover),
-/// binding is retried within a bounded window instead of failing immediately; if
-/// it still cannot bind, the listener returns an error and `ready` is dropped
-/// unsent, which the host treats as a failed startup.
+/// `ready` signal fires exactly once with `Ok(())` when the listener owns its
+/// transport, so the daemon host does not report a running daemon that has no
+/// listener. If a stale predecessor still holds the pipe (for example during a
+/// lease takeover), binding is retried within a bounded window instead of
+/// failing immediately; if it still cannot bind, the listener returns an error
+/// and `ready` is dropped unsent, which the host treats as a failed startup.
+/// If startup is cancelled (shared shutdown) while the pipe is still held, the
+/// listener reports that cancellation through `ready` rather than a successful
+/// bind, so a cancelled startup can never be mistaken for a bound listener.
 pub async fn run_named_pipe_listener(
     server: Arc<DaemonServer>,
     pipe_name: &str,
     mut shutdown: watch::Receiver<bool>,
-    ready: tokio::sync::oneshot::Sender<()>,
+    ready: tokio::sync::oneshot::Sender<Result<(), String>>,
 ) -> Result<(), DaemonError> {
     const BIND_RETRY_ATTEMPTS: u32 = 200;
     const BIND_RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -124,8 +127,16 @@ pub async fn run_named_pipe_listener(
                             _ = tokio::time::sleep(BIND_RETRY_INTERVAL) => {}
                             _ = shutdown.changed() => {
                                 if *shutdown.borrow() {
+                                    // Startup was cancelled while a predecessor
+                                    // still held the pipe. Report the cancellation
+                                    // instead of a successful bind: signalling
+                                    // readiness here would let the host return a
+                                    // "running" daemon that has no listener at all.
                                     if let Some(ready) = ready.take() {
-                                        let _ = ready.send(());
+                                        let _ = ready.send(Err(
+                                            "daemon startup was cancelled before the pipe bound"
+                                                .to_owned(),
+                                        ));
                                     }
                                     return Ok(());
                                 }
@@ -138,7 +149,7 @@ pub async fn run_named_pipe_listener(
         first_instance = false;
 
         if let Some(ready) = ready.take() {
-            let _ = ready.send(());
+            let _ = ready.send(Ok(()));
         }
 
         tokio::select! {
@@ -482,6 +493,7 @@ mod tests {
             };
             ready_rx
                 .await
+                .expect("the test listener must report its bind outcome")
                 .expect("the test listener must bind its pipe");
 
             Self {
@@ -647,5 +659,59 @@ mod tests {
         }
 
         harness.stop().await;
+    }
+
+    /// R18-02: a startup that is cancelled while the pipe is still held by a
+    /// predecessor must not report a bound listener. Previously this branch sent
+    /// the *success* signal, which the host read as "the transport is bound" even
+    /// though nothing had bound and authority had already been lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_startup_does_not_report_a_bound_listener() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let state_identity = store.store_identity().await.unwrap();
+        let server = Arc::new(
+            DaemonServer::start(
+                store,
+                test_relay(),
+                "test-lease-cancelled",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let pipe_name = default_pipe_name(&state_identity);
+        // Hold the pipe for the whole test, so the listener cannot bind and has
+        // to enter its bounded takeover retry loop.
+        let blocker = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+            .expect("the test must be able to hold the pipe first");
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let listener = tokio::spawn({
+            let server = Arc::clone(&server);
+            let pipe_name = pipe_name.clone();
+            async move {
+                let _ = run_named_pipe_listener(server, &pipe_name, shutdown_rx, ready_tx).await;
+            }
+        });
+
+        // Let the listener reach its retry loop, then cancel startup, as a
+        // heartbeat failure or host shutdown would.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = shutdown_tx.send(true);
+
+        let outcome = ready_rx
+            .await
+            .expect("the listener must report a startup outcome");
+        assert!(
+            outcome.is_err(),
+            "a cancelled startup must not report a bound listener"
+        );
+
+        let _ = listener.await;
+        drop(blocker);
     }
 }

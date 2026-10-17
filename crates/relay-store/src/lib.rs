@@ -1088,13 +1088,38 @@ impl SqliteStore {
         rows.into_iter().map(row_to_task_record).collect()
     }
 
+    /// Records a command for idempotency, without an authority check.
+    ///
+    /// The daemon must use [`SqliteStore::record_command_fenced`] instead: this
+    /// form exists for store-level tests that seed command rows directly.
     pub async fn record_command(
         &self,
         id: &str,
         command_type: &str,
         payload_json: &str,
     ) -> Result<bool, StoreError> {
-        retry_on_transient_lock(|| self.record_command_once(id, command_type, payload_json)).await
+        retry_on_transient_lock(|| self.record_command_once(id, command_type, payload_json, None))
+            .await
+    }
+
+    /// Fenced variant used by the daemon command path.
+    ///
+    /// The insert is refused unless this process still holds `fence` at the
+    /// moment it commits, so a command admitted before authority was lost
+    /// cannot create a durable command row after a successor took the lease.
+    /// The command ledger is part of the daemon's canonical state, so it is
+    /// fenced on the same lease as the semantic mutations.
+    pub async fn record_command_fenced(
+        &self,
+        id: &str,
+        command_type: &str,
+        payload_json: &str,
+        fence: &DaemonFence,
+    ) -> Result<bool, StoreError> {
+        retry_on_transient_lock(|| {
+            self.record_command_once(id, command_type, payload_json, Some(fence))
+        })
+        .await
     }
 
     async fn record_command_once(
@@ -1102,7 +1127,14 @@ impl SqliteStore {
         id: &str,
         command_type: &str,
         payload_json: &str,
+        fence: Option<&DaemonFence>,
     ) -> Result<bool, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        if let Some(fence) = fence {
+            assert_daemon_fence(&mut *transaction, fence).await?;
+        }
+
         let res = sqlx::query(
             r#"
             INSERT OR IGNORE INTO commands (id, command_type, payload_json, status)
@@ -1112,9 +1144,10 @@ impl SqliteStore {
         .bind(id)
         .bind(command_type)
         .bind(payload_json)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
 
+        transaction.commit().await?;
         Ok(res.rows_affected() > 0)
     }
 
@@ -1183,13 +1216,45 @@ impl SqliteStore {
         .transpose()
     }
 
+    /// Rewrites a command's status row, without an authority check and without
+    /// the terminal-status guard of [`SqliteStore::complete_command_fenced`].
+    ///
+    /// The daemon must use `complete_command_fenced` instead. This form exists for
+    /// store-level tests that reproduce crash windows by rewinding a row to a
+    /// non-terminal status.
     pub async fn complete_command(
         &self,
         id: &str,
         status: &str,
         response_json: Option<&str>,
     ) -> Result<(), StoreError> {
-        retry_on_transient_lock(|| self.complete_command_once(id, status, response_json)).await
+        retry_on_transient_lock(|| self.complete_command_once(id, status, response_json, None))
+            .await
+            .map(|_| ())
+    }
+
+    /// Fenced variant used by the daemon command path.
+    ///
+    /// The write is refused unless this process still holds `fence` when it
+    /// commits, and it is additionally guarded on the command still being
+    /// non-terminal, so neither a stale daemon nor a duplicated completion can
+    /// overwrite a terminal result that another applier already recorded.
+    ///
+    /// Returns `true` when this call recorded the terminal result, and `false`
+    /// when the command had already reached a terminal status - in which case
+    /// nothing is written and the existing terminal row is authoritative. A
+    /// command id that does not exist at all is still a typed error.
+    pub async fn complete_command_fenced(
+        &self,
+        id: &str,
+        status: &str,
+        response_json: Option<&str>,
+        fence: &DaemonFence,
+    ) -> Result<bool, StoreError> {
+        retry_on_transient_lock(|| {
+            self.complete_command_once(id, status, response_json, Some(fence))
+        })
+        .await
     }
 
     async fn complete_command_once(
@@ -1197,26 +1262,63 @@ impl SqliteStore {
         id: &str,
         status: &str,
         response_json: Option<&str>,
-    ) -> Result<(), StoreError> {
-        let res = sqlx::query(
+        fence: Option<&DaemonFence>,
+    ) -> Result<bool, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        if let Some(fence) = fence {
+            assert_daemon_fence(&mut *transaction, fence).await?;
+        }
+
+        // The fenced (daemon) path never overwrites a terminal row: `received`
+        // and `needs_reconciliation` are the only completable statuses, so a late
+        // duplicate cannot turn a recorded `applied` into `failed`. The unfenced
+        // path is relied on by crash-window tests that deliberately rewind a row,
+        // so it keeps its unconditional rewrite.
+        let query = if fence.is_some() {
             r#"
             UPDATE commands
             SET status = ?1,
                 response_json = ?2,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE id = ?3
-            "#,
-        )
-        .bind(status)
-        .bind(response_json)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+              AND status IN ('received', 'needs_reconciliation')
+            "#
+        } else {
+            r#"
+            UPDATE commands
+            SET status = ?1,
+                response_json = ?2,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?3
+            "#
+        };
+
+        let res = sqlx::query(query)
+            .bind(status)
+            .bind(response_json)
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
 
         if res.rows_affected() == 0 {
+            // Distinguish "no such command" (fail closed) from "already
+            // terminal" (another applier won; its result stands).
+            let exists =
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM commands WHERE id = ?1")
+                    .bind(id)
+                    .fetch_one(&mut *transaction)
+                    .await?
+                    > 0;
+            transaction.commit().await?;
+            if exists {
+                return Ok(false);
+            }
             return Err(StoreError::CommandNotFound { id: id.to_owned() });
         }
-        Ok(())
+
+        transaction.commit().await?;
+        Ok(true)
     }
 
     /// Atomically claims an unfinished command for execution.
@@ -1224,11 +1326,38 @@ impl SqliteStore {
     /// Returns `true` only for the caller that won the claim, so concurrent replays
     /// of the same command id resolve through a single applier and a single terminal
     /// result instead of racing each other into inconsistent state.
+    ///
+    /// The daemon must use [`SqliteStore::claim_command_fenced`]: this form has no
+    /// authority check.
     pub async fn claim_command(&self, id: &str) -> Result<bool, StoreError> {
-        retry_on_transient_lock(|| self.claim_command_once(id)).await
+        retry_on_transient_lock(|| self.claim_command_once(id, None)).await
     }
 
-    async fn claim_command_once(&self, id: &str) -> Result<bool, StoreError> {
+    /// Fenced variant used by the daemon command path.
+    ///
+    /// A claim is refused unless this process still holds `fence` when it
+    /// commits. Without this, a daemon that lost the lease could claim a command
+    /// *after* the successor's one-time startup reconciliation had already run,
+    /// stranding that command until the next restart.
+    pub async fn claim_command_fenced(
+        &self,
+        id: &str,
+        fence: &DaemonFence,
+    ) -> Result<bool, StoreError> {
+        retry_on_transient_lock(|| self.claim_command_once(id, Some(fence))).await
+    }
+
+    async fn claim_command_once(
+        &self,
+        id: &str,
+        fence: Option<&DaemonFence>,
+    ) -> Result<bool, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        if let Some(fence) = fence {
+            assert_daemon_fence(&mut *transaction, fence).await?;
+        }
+
         let res = sqlx::query(
             r#"
             UPDATE commands
@@ -1239,18 +1368,46 @@ impl SqliteStore {
             "#,
         )
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
 
+        transaction.commit().await?;
         Ok(res.rows_affected() > 0)
     }
 
     /// Clears command claims left behind by a crashed process.
     ///
-    /// Only safe during single-threaded startup reconciliation, before the request
-    /// listener accepts connections; a live applier holds its claim precisely so a
+    /// Only safe during startup reconciliation, before the request listener
+    /// accepts connections; a live applier holds its claim precisely so a
     /// concurrent replay cannot steal it.
+    ///
+    /// The daemon must use [`SqliteStore::reset_command_claims_fenced`]: this form
+    /// has no authority check.
     pub async fn reset_command_claims(&self) -> Result<u64, StoreError> {
+        retry_on_transient_lock(|| self.reset_command_claims_once(None)).await
+    }
+
+    /// Fenced variant used by the daemon startup reconciliation.
+    ///
+    /// The reset is refused unless this process still holds `fence`, so a stale
+    /// daemon cannot clear a successor's claims.
+    pub async fn reset_command_claims_fenced(
+        &self,
+        fence: &DaemonFence,
+    ) -> Result<u64, StoreError> {
+        retry_on_transient_lock(|| self.reset_command_claims_once(Some(fence))).await
+    }
+
+    async fn reset_command_claims_once(
+        &self,
+        fence: Option<&DaemonFence>,
+    ) -> Result<u64, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        if let Some(fence) = fence {
+            assert_daemon_fence(&mut *transaction, fence).await?;
+        }
+
         let res = sqlx::query(
             r#"
             UPDATE commands
@@ -1259,9 +1416,10 @@ impl SqliteStore {
               AND status IN ('received', 'needs_reconciliation')
             "#,
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
 
+        transaction.commit().await?;
         Ok(res.rows_affected())
     }
 
@@ -3098,6 +3256,136 @@ mod tests {
             task.state, "running",
             "a stale fenced write must not change durable state"
         );
+    }
+
+    /// R18-01: the command ledger is part of the daemon's canonical state, so it
+    /// is fenced on the same lease as the semantic writes. A stale daemon must not
+    /// be able to record, claim, complete, or reset command rows after a successor
+    /// took over - that is what could strand a command past startup
+    /// reconciliation or overwrite a newer terminal result.
+    #[tokio::test]
+    async fn command_ledger_writes_are_refused_after_a_successor_takes_the_daemon_lease() {
+        let store = SqliteStore::in_memory().await.unwrap();
+
+        let lease = store
+            .acquire_or_renew_daemon_lease("daemon-ledger", 2001, "host-a", Duration::from_secs(60))
+            .await
+            .unwrap();
+        let fence = DaemonFence {
+            lease_id: "daemon-ledger".to_owned(),
+            holder_pid: lease.holder_pid,
+            fencing_token: lease.fencing_token,
+        };
+
+        // While this process holds the lease, its ledger writes commit.
+        assert!(
+            store
+                .record_command_fenced("cmd-ledger", "submit_handoff", "{}", &fence)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .claim_command_fenced("cmd-ledger", &fence)
+                .await
+                .unwrap(),
+            "the lease holder must be able to claim its own command"
+        );
+
+        // A successor takes the lease (stale takeover), changing the holder and
+        // incrementing the fencing token.
+        let successor = store
+            .acquire_or_renew_daemon_lease("daemon-ledger", 2002, "host-b", Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(successor.fencing_token, lease.fencing_token + 1);
+
+        // Every ledger write a stale daemon could still attempt is now refused.
+        let refused = [
+            store
+                .record_command_fenced("cmd-late", "submit_handoff", "{}", &fence)
+                .await,
+            store
+                .claim_command_fenced("cmd-late", &fence)
+                .await
+                .map(|_| true),
+            store
+                .complete_command_fenced("cmd-ledger", "failed", None, &fence)
+                .await
+                .map(|_| true),
+            store
+                .reset_command_claims_fenced(&fence)
+                .await
+                .map(|_| true),
+        ];
+        for refusal in refused {
+            assert!(
+                matches!(refusal, Err(StoreError::DaemonAuthorityLost { .. })),
+                "a stale command-ledger write must be refused, got {refusal:?}"
+            );
+        }
+
+        // The durable ledger is unchanged: no late row was created, and the
+        // claimed command is still non-terminal for the successor to resolve.
+        assert!(store.get_command("cmd-late").await.unwrap().is_none());
+        let row = store.get_command("cmd-ledger").await.unwrap().unwrap();
+        assert_eq!(row.status, "received");
+    }
+
+    /// R18-01: a command that already reached a terminal status is never
+    /// overwritten by a later completion, so a stale or duplicated completion
+    /// cannot turn a recorded `applied` into `failed`.
+    #[tokio::test]
+    async fn a_terminal_command_is_not_overwritten_by_a_duplicate_completion() {
+        let store = SqliteStore::in_memory().await.unwrap();
+
+        let lease = store
+            .acquire_or_renew_daemon_lease(
+                "daemon-complete",
+                3001,
+                "host-a",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        let fence = DaemonFence {
+            lease_id: "daemon-complete".to_owned(),
+            holder_pid: lease.holder_pid,
+            fencing_token: lease.fencing_token,
+        };
+
+        store
+            .record_command_fenced("cmd-once", "submit_handoff", "{}", &fence)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .complete_command_fenced("cmd-once", "applied", Some(r#"{"ok":true}"#), &fence)
+                .await
+                .unwrap(),
+            "the first completion must record the terminal result"
+        );
+
+        assert!(
+            !store
+                .complete_command_fenced("cmd-once", "failed", Some(r#"{"ok":false}"#), &fence)
+                .await
+                .unwrap(),
+            "a duplicate completion must not overwrite the terminal result"
+        );
+
+        let row = store.get_command("cmd-once").await.unwrap().unwrap();
+        assert_eq!(row.status, "applied");
+        assert_eq!(row.response_json.as_deref(), Some(r#"{"ok":true}"#));
+
+        // A genuinely absent command is still a typed error, not a silent no-op.
+        assert!(matches!(
+            store
+                .complete_command_fenced("cmd-absent", "applied", None, &fence)
+                .await,
+            Err(StoreError::CommandNotFound { .. })
+        ));
     }
 
     #[tokio::test]

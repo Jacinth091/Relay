@@ -141,6 +141,73 @@ review's own finding text was verified against source before any change.
   not reach, and the reviewer recommended tracking it separately rather than
   widening this correction.
 
+### PR #16 second re-review corrections (R18)
+
+The governed re-review of the R17 head (`0ff8807`) confirmed the Windows CI
+evidence (37 test groups, 443 passed, 0 failed, 0 ignored) but returned
+**BLOCK / RETURN TO DEV**: R16-02, R17-01 and R17-05 **CLOSED**; R16-04, R16-05,
+R17-02, R17-03 and R17-04 **PARTIAL**, because two authority-boundary holes
+remained. The R18 corrections land on `fix/v2-pr16-r18-corrections` (no R12-02
+work mixed in). Both findings were reproduced in source before any change.
+
+- **R18-01 (re-opens R16-04/R16-05/R17-03/R17-04, command ledger)** — R17-03
+  fenced the *semantic* writes but left the **command ledger** unfenced:
+  `record_command`, `claim_command`, `complete_command` and `reset_command_claims`
+  were plain writes with no authority check. A command admitted while this process
+  was authoritative could therefore, *after* a successor had taken the lease and
+  already run its one-time `reset_command_claims` + reconciliation, still
+  `claim_command` itself durably and then fail its semantic fence — leaving a
+  non-terminal command claimed with nobody left to clear it until the next
+  restart. Separately, `complete_command` was an unconditional
+  `UPDATE ... WHERE id = ?3`, so a delayed stale completion could overwrite a
+  newer terminal result (e.g. turn a successor's `applied` into `failed`).
+  The store now exposes fenced variants — `record_command_fenced`,
+  `claim_command_fenced`, `complete_command_fenced`,
+  `reset_command_claims_fenced` — each asserting `assert_daemon_fence` as the
+  first statement of its own transaction, and `complete_command_fenced` is
+  additionally guarded on the command still being non-terminal
+  (`status IN ('received','needs_reconciliation')`): it returns
+  `Ok(false)` when another applier already recorded a terminal result (that
+  result stands, and the caller reports the committed outcome) and a typed
+  `StoreError::CommandNotFound` for a genuinely absent row. The daemon command
+  path uses only the fenced variants. The unfenced variants remain for
+  store-level tests that seed or rewind the ledger, and are documented as
+  authority-unchecked; in particular the unfenced `complete_command` keeps its
+  unconditional rewrite because the crash-window tests depend on being able to
+  rewind a terminal row to a non-terminal one. Regression coverage:
+  `command_ledger_writes_are_refused_after_a_successor_takes_the_daemon_lease`,
+  `a_terminal_command_is_not_overwritten_by_a_duplicate_completion`,
+  `a_daemon_that_lost_the_lease_cannot_write_the_command_ledger` (stale daemon
+  cannot write the ledger, no row is created, the successor resolves the same
+  command id to exactly one truthful terminal state, a late stale completion is
+  refused, and no command is left stuck).
+- **R18-02 (re-opens R16-04/R17-02, startup truthfulness)** — two defects in the
+  bind-retry path. First, if the shared shutdown fired while the listener was
+  still retrying a pipe held by a predecessor, the listener sent its **success**
+  signal (`ready.send(())`) and returned, so `run_full_daemon` reported a running
+  daemon whose transport had never bound. The readiness channel now carries a
+  truthful outcome (`Result<(), String>`): bound, cancelled, or an error, and the
+  cancellation branch reports the cancellation instead of readiness. Second, the
+  failure arms tore down only the listener — the heartbeat task was left running
+  and the lease acquired by the failed startup was never released, pinning the
+  daemon lease until its TTL elapsed. Every post-acquisition failure path now
+  broadcasts the shared shutdown, joins **both** the heartbeat and the listener,
+  and then releases the lease; `release_daemon_lease` is scoped to
+  `lease_id + holder_pid`, so a failed startup can release only the lease it still
+  owns and can never delete a successor's row. Regression coverage:
+  `cancelled_startup_does_not_report_a_bound_listener`,
+  `a_startup_cancelled_while_binding_fails_and_keeps_the_successor_lease`,
+  `a_daemon_that_cannot_bind_its_pipe_reports_startup_failure` (now also asserts
+  the failed startup did not pin the lease).
+- **WARN-02 (optional hardening)** — a stale instance could still acknowledge a
+  matching raw-pipe handshake after its authority had been marked lost, which
+  reads as "healthy" to a caller treating the ack as proof of authority.
+  `handshake_response` now fails closed when authority is lost, so the connection
+  is never admitted.
+- **WARN-01 / DOC-02** — the tracked migration race remains an owner-accepted
+  exclusion (unchanged); the PR #16 description was resynced to the corrected head
+  after this branch landed.
+
 ## Wave C — Harden runtime/provider semantics
 
 Status: **NOT STARTED**

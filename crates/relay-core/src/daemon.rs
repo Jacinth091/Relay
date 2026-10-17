@@ -315,6 +315,17 @@ impl DaemonServer {
         protocol_version: u32,
         state_identity: &str,
     ) -> DaemonResponse {
+        if let Some(reason) = self.authority_lost_reason() {
+            // Fail closed: a stale instance must not acknowledge a handshake as
+            // if it were the live authority. The transport treats any non-ack
+            // response as "connection not admitted", so a matching handshake
+            // against a lost lease can no longer make a stale daemon look
+            // healthy to a caller that treats the ack as proof of authority.
+            return DaemonResponse::Error(format!(
+                "daemon is no longer authoritative over this database: {reason}"
+            ));
+        }
+
         if protocol_version != DAEMON_PROTOCOL_VERSION {
             return DaemonResponse::Error(format!(
                 "protocol version mismatch: client requested {protocol_version}, daemon supports {DAEMON_PROTOCOL_VERSION}"
@@ -530,7 +541,7 @@ impl DaemonServer {
     ) -> Result<(), DaemonError> {
         let is_new = self
             .store
-            .record_command(command_id, command_type, payload_json)
+            .record_command_fenced(command_id, command_type, payload_json, &self.fence())
             .await?;
 
         if !is_new {
@@ -592,7 +603,15 @@ impl DaemonServer {
             _ => {}
         }
 
-        match self.store.claim_command(command_id).await {
+        // The claim is fenced with the semantic write below: a daemon that lost
+        // the lease must not claim a command after a successor has already run
+        // its one-time startup reconciliation, or the command would be stranded
+        // with a claim no one will clear until the next restart.
+        match self
+            .store
+            .claim_command_fenced(command_id, &self.fence())
+            .await
+        {
             Ok(true) => {}
             Ok(false) => return self.await_concurrent_resolution(command_id).await,
             Err(err) => return DaemonResponse::Error(err.to_string()),
@@ -618,17 +637,31 @@ impl DaemonServer {
             CommandStatus::Applied => "applied",
             _ => "failed",
         };
-        if let Err(err) = self
+        match self
             .store
-            .complete_command(command_id, terminal_status, result_json.as_deref())
+            .complete_command_fenced(
+                command_id,
+                terminal_status,
+                result_json.as_deref(),
+                &self.fence(),
+            )
             .await
         {
-            // Fail closed: the caller must not be told the command succeeded
-            // when we could not durably record that outcome. The command stays
-            // non-terminal and startup reconciliation will resolve it.
-            return DaemonResponse::Error(format!(
-                "command {command_id} was applied but its terminal result could not be recorded: {err}"
-            ));
+            Ok(true) => {}
+            Ok(false) => {
+                // Another applier recorded this command's terminal result first.
+                // Report that committed outcome instead of this call's own, so a
+                // caller can never see an outcome that is not the durable one.
+                return self.await_concurrent_resolution(command_id).await;
+            }
+            Err(err) => {
+                // Fail closed: the caller must not be told the command succeeded
+                // when we could not durably record that outcome. The command stays
+                // non-terminal and startup reconciliation will resolve it.
+                return DaemonResponse::Error(format!(
+                    "command {command_id} was applied but its terminal result could not be recorded: {err}"
+                ));
+            }
         }
 
         DaemonResponse::CommandResult {
@@ -680,8 +713,11 @@ impl DaemonServer {
     pub async fn reconcile_on_startup(&self) -> Result<(), DaemonError> {
         // Claims held by the previous process died with it. This runs before the
         // request listener accepts connections, so clearing them cannot steal a
-        // live claim.
-        self.store.reset_command_claims().await?;
+        // live claim. It is fenced on this daemon's lease so a stale daemon can
+        // never clear a live successor's claims.
+        self.store
+            .reset_command_claims_fenced(&self.fence())
+            .await?;
 
         let incomplete = self.store.list_incomplete_commands().await?;
         for row in incomplete {
@@ -702,7 +738,12 @@ impl DaemonServer {
                 let reason = format!("payload deserialization failed: {err}");
                 let _ = self
                     .store
-                    .complete_command(&row.id, "needs_reconciliation", Some(&reason))
+                    .complete_command_fenced(
+                        &row.id,
+                        "needs_reconciliation",
+                        Some(&reason),
+                        &self.fence(),
+                    )
                     .await;
                 return;
             }
@@ -1531,6 +1572,151 @@ mod tests {
             }
             other => panic!("expected a snapshot, got {other:?}"),
         }
+    }
+
+    /// R18-01: the command ledger is authority-scoped, like the semantic writes.
+    /// A daemon that lost the lease must not create, claim, or complete command
+    /// rows: otherwise a request admitted before a takeover could claim a command
+    /// after the successor's one-time startup reconciliation had already scanned,
+    /// leaving it stranded, and a late completion could overwrite the successor's
+    /// terminal result. The successor must still resolve the same command id to
+    /// exactly one truthful terminal state.
+    #[tokio::test]
+    async fn a_daemon_that_lost_the_lease_cannot_write_the_command_ledger() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let stale = DaemonServer::start(
+            store.clone(),
+            test_relay(),
+            "test-lease-ledger",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+        let request = |identity: &str| DaemonRequest::SubmitCommand {
+            command_id: "cmd-stale-ledger".to_owned(),
+            command: DaemonCommand::SubmitHandoff {
+                project_key: "test-proj".to_owned(),
+                handoff_json: TEST_HANDOFF.to_owned(),
+                submission_transport: "local-paste".to_owned(),
+            },
+            state_identity: identity.to_owned(),
+        };
+
+        // A successor takes the lease. A different holder identity with a zero TTL
+        // is the same stale-takeover trigger the relay-store fence test uses: it
+        // moves the holder generation forward and increments the fencing token
+        // exactly as a real takeover does. The stale daemon keeps its old snapshot
+        // of the lease, so its fence is now behind the durable one.
+        let successor = store
+            .acquire_or_renew_daemon_lease(
+                "test-lease-ledger",
+                std::process::id() as i64 + 1,
+                "successor-host",
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        assert_eq!(successor.fencing_token, stale.fencing_token() + 1);
+
+        // The stale daemon cannot even record the command: the ledger write is
+        // refused before it commits, so nothing is left for the successor to
+        // reconcile or for a late completion to overwrite.
+        let refused = stale.handle_request(request(stale.state_identity())).await;
+        assert!(
+            matches!(refused, DaemonResponse::Error(_)),
+            "a daemon that lost the lease must not write the command ledger, got {refused:?}"
+        );
+        assert!(
+            stale
+                .store()
+                .get_command("cmd-stale-ledger")
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused ledger write must not be durably recorded"
+        );
+
+        // The successor owns the database now: it resolves the same command id
+        // exactly once, through the same fenced ledger the daemon drives, and a
+        // second completion cannot overwrite the result it recorded.
+        let successor_fence = DaemonFence {
+            lease_id: "test-lease-ledger".to_owned(),
+            holder_pid: successor.holder_pid,
+            fencing_token: successor.fencing_token,
+        };
+        assert!(
+            store
+                .record_command_fenced("cmd-stale-ledger", "submit_handoff", "{}", &successor_fence)
+                .await
+                .unwrap(),
+            "the lease owner must be able to record the command"
+        );
+        assert!(
+            store
+                .claim_command_fenced("cmd-stale-ledger", &successor_fence)
+                .await
+                .unwrap(),
+            "the lease owner must be able to claim the command"
+        );
+        assert!(
+            store
+                .complete_command_fenced(
+                    "cmd-stale-ledger",
+                    "applied",
+                    Some(r#"{"ok":true}"#),
+                    &successor_fence
+                )
+                .await
+                .unwrap(),
+            "the lease owner must be able to record the terminal result"
+        );
+        assert!(
+            !store
+                .complete_command_fenced(
+                    "cmd-stale-ledger",
+                    "failed",
+                    Some(r#"{"ok":false}"#),
+                    &successor_fence
+                )
+                .await
+                .unwrap(),
+            "a second completion must not overwrite the terminal result"
+        );
+
+        let row = store
+            .get_command("cmd-stale-ledger")
+            .await
+            .unwrap()
+            .expect("the successor must have recorded the command");
+        assert_eq!(row.status, "applied");
+        assert_eq!(row.response_json.as_deref(), Some(r#"{"ok":true}"#));
+        assert_eq!(
+            store
+                .count_commands_with_status("needs_reconciliation")
+                .await
+                .unwrap(),
+            0,
+            "no command may be left stuck by the takeover"
+        );
+
+        // A late request from the stale daemon - a replay of a command the
+        // successor already resolved - is refused and cannot change the recorded
+        // terminal result.
+        let late = stale.handle_request(request(stale.state_identity())).await;
+        assert!(
+            matches!(late, DaemonResponse::Error(_)),
+            "a stale daemon must not touch a command the successor resolved, got {late:?}"
+        );
+        assert_eq!(
+            store
+                .get_command("cmd-stale-ledger")
+                .await
+                .unwrap()
+                .expect("the successor's terminal result must still be recorded")
+                .status,
+            "applied"
+        );
     }
 
     /// R17-01: a mutating request must name the database it means to write; a

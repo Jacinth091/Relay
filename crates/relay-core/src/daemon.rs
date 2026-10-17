@@ -283,7 +283,22 @@ impl DaemonServer {
                 other => DaemonError::Store(other),
             })?;
 
-        let state_identity = store.store_identity().await?;
+        let state_identity = match store.store_identity().await {
+            Ok(identity) => identity,
+            Err(err) => {
+                // The lease was acquired, but this process cannot serve the
+                // database it just claimed. Release the lease rather than pinning
+                // it until the TTL elapses; the release is scoped to our own holder
+                // pid, so it can never delete a successor's row.
+                if let Err(release_err) = store.release_daemon_lease(lease_id, pid).await {
+                    tracing::warn!(
+                        error = %release_err,
+                        "failed to release the daemon lease after a failed startup"
+                    );
+                }
+                return Err(DaemonError::Store(err));
+            }
+        };
 
         Ok(Self {
             store,

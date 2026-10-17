@@ -46,17 +46,45 @@ function Install-RelayWindows {
         }
     }
 
+    # Tells running Explorer and new terminals that the user environment changed.
+    function Send-EnvironmentChange {
+        if (-not ('Relay.NativeEnv' -as [type])) {
+            Add-Type -TypeDefinition @'
+namespace Relay {
+    public static class NativeEnv {
+        [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+        public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint msg, System.UIntPtr wParam, string lParam, uint flags, uint timeout, out System.UIntPtr result);
+    }
+}
+'@
+        }
+        $result = [UIntPtr]::Zero
+        # HWND_BROADCAST, WM_SETTINGCHANGE, SMTO_ABORTIFHUNG, 5 s. A failed broadcast is not fatal.
+        [void][Relay.NativeEnv]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$result)
+    }
+
     # Adds or removes $InstallDir in the user PATH and in this session's PATH. Never machine PATH.
     function Update-RelayPath {
         param([bool]$Add)
         $same = { param($entry) [Environment]::ExpandEnvironmentVariables($entry).TrimEnd('\') -ieq $InstallDir }
 
-        $user = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_ })
-        $userHasDir = @($user | Where-Object { & $same $_ }).Count -gt 0
-        if ($Add -and -not $userHasDir) {
-            [Environment]::SetEnvironmentVariable('Path', (@($user + $InstallDir) -join ';'), 'User')
-        } elseif (-not $Add -and $userHasDir) {
-            [Environment]::SetEnvironmentVariable('Path', (@($user | Where-Object { -not (& $same $_) }) -join ';'), 'User')
+        # Raw registry edit: SetEnvironmentVariable would rewrite Path as REG_SZ and store %VAR% entries expanded.
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+        try {
+            $raw = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+
+            $user = @($raw -split ';' | Where-Object { $_ })
+            $userHasDir = @($user | Where-Object { & $same $_ }).Count -gt 0
+            $newUser = $null
+            if ($Add -and -not $userHasDir) { $newUser = @($user + $InstallDir) }
+            elseif (-not $Add -and $userHasDir) { $newUser = @($user | Where-Object { -not (& $same $_) }) }
+
+            if ($null -ne $newUser) {
+                $key.SetValue('Path', ($newUser -join ';'), [Microsoft.Win32.RegistryValueKind]::ExpandString)
+                Send-EnvironmentChange
+            }
+        } finally {
+            $key.Close()
         }
 
         $session = @($env:Path -split ';' | Where-Object { $_ })

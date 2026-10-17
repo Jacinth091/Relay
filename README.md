@@ -154,8 +154,10 @@ your **user** `PATH`. Open a new terminal and run `relay`.
   ```powershell
   irm https://raw.githubusercontent.com/Jacinth091/Relay/main/install.ps1 -OutFile install.ps1
   notepad .\install.ps1
-  .\install.ps1
+  powershell -ExecutionPolicy Bypass -File .\install.ps1
   ```
+
+The `-ExecutionPolicy Bypass` flag applies to that one PowerShell process only; it does not change your system policy.
 
 The installer does not install a provider CLI (for example Codex); see
 [What the package does not include](#what-the-package-does-not-include). It is

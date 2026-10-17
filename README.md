@@ -25,6 +25,23 @@ historical evidence.
 
 ---
 
+## Install
+
+On Windows x86_64, run this in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Jacinth091/Relay/main/install.ps1 | iex
+```
+
+Then open a **new** terminal and type `relay`.
+
+- **Upgrade, uninstall, options:** see [the one-line installer details](#one-line-installer-details).
+- **Manual zip:** see [Download a release](#download-a-release-windows-x86_64).
+- **Rust users:** see [Install with Cargo](#install-with-cargo-rust-users).
+- **Build from source:** see [Build and run from source](#build-and-run-from-source).
+
+---
+
 ## ⚠️ Experimental hobby project
 
 Relay is a **personal, experimental hobby and development project**, published
@@ -54,6 +71,7 @@ read it before trusting any claim below.
 
 | | Capability | Notes |
 |---|---|---|
+| ✅ **Today** | Prebuilt Windows x86_64 release (v0.1.0) and one-line installer | Zip + SHA-256 checksum on the [Releases page](https://github.com/Jacinth091/Relay/releases); the installer verifies the checksum before installing |
 | ✅ **Today** | Build and test the whole workspace from source | Stable Rust, no provider account needed |
 | ✅ **Today** | `relay` TUI: tasks, projects, runtimes, diffs, logs, command palette | First presentation client of Relay Core |
 | ✅ **Today** | Local handoff intake: JSON file / paste → validate → preview → persist `READY` | `HandoffTask v1` wire format |
@@ -71,7 +89,7 @@ read it before trusting any claim below.
 | ⛔ **Planned** | Web UI (ROADMAP phase 12) | Deliberately not started |
 | ⛔ **Planned** | Durable Herdr production backplane, Exchange/delegation durability, privilege-binding corrections | Not started |
 | ⛔ **Planned** | GitHub ingress | Descoped from v0.1 by [ADR-0016](docs/adr/0016-mcp-first-submission-and-v0-1-local-descope.md) |
-| ⛔ **Planned** | Release binaries, installers, package managers, auto-update | Not published |
+| ⛔ **Planned** | Package managers, code signing, auto-update, non-Windows binaries | Not published |
 | ⛔ **Planned** | Cross-provider fan-out / health-aware routing | Unimplemented portion of ADR-0018 superseded by ADR-0020 |
 
 **On `relay serve-mcp`:** it is a **local stdio** server. A cloud-hosted planner
@@ -87,10 +105,10 @@ test, or run the local source.
 
 ---
 
-## Prerequisites
+## Building from source: requirements
 
-> Running a **published release binary** needs none of this — see
-> [Download a release (Windows x86_64)](#download-a-release-windows-x86_64).
+> The one-line installer and the **published release zip** need none of this —
+> see [Download a release (Windows x86_64)](#download-a-release-windows-x86_64).
 > The list below applies to building from source (and to `cargo install`, which
 > still compiles the code).
 
@@ -116,13 +134,10 @@ authenticated by you.
 
 ---
 
-## Install (Windows, one line)
+## One-line installer: details
 
-> **Availability:** this installer works once the repository is public and a
-> non-prerelease release is listed on the
-> [Releases page](https://github.com/Jacinth091/Relay/releases). Until then, use
-> the manual download, `cargo install`, or build from source below; the commands
-> in this section will not resolve yet.
+The installer pulls the latest stable release from the
+[Releases page](https://github.com/Jacinth091/Relay/releases).
 
 ```powershell
 irm https://raw.githubusercontent.com/Jacinth091/Relay/main/install.ps1 | iex
@@ -168,13 +183,11 @@ variable with read access.
 
 ## Download a release (Windows x86_64)
 
-> **A release exists only if one is listed on the
-> [Releases page](https://github.com/Jacinth091/Relay/releases).** Packages are
+> Current release: **v0.1.0**, listed on the
+> [Releases page](https://github.com/Jacinth091/Relay/releases). Packages are
 > produced by [`.github/workflows/release.yml`](.github/workflows/release.yml)
-> when the maintainer pushes a version tag (`v*`), so **no release may exist
-> yet**. If the Releases page is empty, use `cargo install` or build from source
-> instead (below). Never guess a download URL for a version that has not been
-> published.
+> when the maintainer pushes a version tag (`v*`). Never guess a download URL for
+> a version that is not listed on the Releases page.
 
 1. On the Releases page, download both `relay-<tag>-windows-x86_64.zip` and its
    `relay-<tag>-windows-x86_64.zip.sha256` checksum file (for example
@@ -223,7 +236,7 @@ choose **More info** → **Run anyway**.
 ### Put `relay` on your PATH (optional)
 
 To run `relay` from any folder, add the unzipped folder to your **user** `PATH`.
-The easiest route is the [one-line installer](#install-windows-one-line) above,
+The easiest route is the [one-line installer](#one-line-installer-details) above,
 which does this for you. Otherwise use System Properties → Environment Variables →
 *User variables* → `Path`, or this copy-paste command (run it inside the unzipped
 folder). It reads and writes the registry value directly, so `%VAR%` entries in your
@@ -274,7 +287,7 @@ That builds the `relay-tui` package and installs its `relay` binary into
 published there (`publish = false`).
 
 On Windows this still needs the MSVC toolchain (Microsoft C++ build tools and
-Windows SDK — see [Prerequisites](#prerequisites)), so unlike the release zip it
+Windows SDK — see [Building from source: requirements](#building-from-source-requirements)), so unlike the release zip it
 is not a no-build-tools install.
 
 ---

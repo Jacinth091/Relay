@@ -133,7 +133,13 @@ cargo clippy --workspace --all-targets --all-features --locked
 cargo test --workspace --locked
 ```
 
-These are the same gates the GitHub Actions workflow runs on Ubuntu and Windows.
+The GitHub Actions workflow (`.github/workflows/ci.yml`) runs exactly these three
+commands on `windows-latest`, which is the merge gate, and on `ubuntu-latest` for
+visibility only (advisory — see "Supported platforms"). Because the commands are
+identical, a green Windows CI run **on a specific commit** is the authoritative gate
+evidence for that commit: prefer citing the run for the commit you are reviewing over
+re-running the commands locally. A local run remains useful while iterating, but it
+is optional, and build output (`target/`) must not be left behind in worktrees.
 A green build checks the source; it is **not** a security certification.
 
 ### Focused suites

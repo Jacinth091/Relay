@@ -70,9 +70,23 @@ function Install-RelayWindows {
 
     if ($Uninstall) {
         Test-RelayRunning
-        if (Test-Path -LiteralPath $InstallDir) { Remove-Item -LiteralPath $InstallDir -Recurse -Force }
+        # Delete only Relay's own files; the folder goes only if nothing else is left in it.
+        if (-not (Test-Path -LiteralPath (Join-Path $InstallDir 'relay.exe'))) {
+            Write-Host "Relay is not installed in $InstallDir."
+        } else {
+            foreach ($file in 'relay.exe', 'LICENSE', 'README.md') {
+                $path = Join-Path $InstallDir $file
+                if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+            }
+            if (@(Get-ChildItem -LiteralPath $InstallDir -Force).Count -eq 0) {
+                Remove-Item -LiteralPath $InstallDir -Force
+                Write-Host "Removed Relay from $InstallDir."
+            } else {
+                Write-Host "Removed Relay's files; left $InstallDir in place because other files remain in it."
+            }
+        }
         Update-RelayPath -Add $false
-        Write-Host "Removed Relay from $InstallDir and from your user PATH."
+        Write-Host "Removed $InstallDir from your user PATH (if it was there)."
         Write-Host "Kept your data in $env:APPDATA\Relay (not touched)."
         return
     }

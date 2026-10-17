@@ -195,9 +195,9 @@ imports tasks, shows diffs and history without one, but executing a real run
 requires the provider's own CLI (for example Codex) installed and authenticated
 by you, separately, and billed by that provider.
 
-Relay keeps local state in `%APPDATA%\Relay\` (`config.toml`, `state.sqlite3`)
-and runtime settings in `%APPDATA%\relay\runtimes.toml`. Register a **disposable**
-test repository with `/project add <path>` in the TUI before your first run; see
+Relay keeps its local state in `%APPDATA%\Relay\` — `config.toml`,
+`state.sqlite3` and `runtimes.toml`. Register a **disposable** test repository
+with `/project add <path>` in the TUI before your first run; see
 [docs/local-ingress.md](docs/local-ingress.md) and
 [docs/data-persistence.md](docs/data-persistence.md).
 

@@ -85,6 +85,62 @@ P1 and two P2 findings. The corrections landed on `fix/v2-pr16-promotion-correct
 - **R16-06** — the PR #16 description was resynced to the exact reviewed head and
   the owner's accepted deferrals; no status table was rewritten.
 
+### PR #16 re-review corrections (R17)
+
+The governed re-review of the corrected head (`048f5c9`) returned **BLOCK /
+RETURN TO DEV**: R16-01, R16-03 and R16-06 were **CLOSED**, while R16-02, R16-04
+and R16-05 were **PARTIAL**, with two P2 follow-ups. The R17 corrections land on
+`fix/v2-pr16-rereview-corrections` (again with no R12-02 work mixed in). The
+review's own finding text was verified against source before any change.
+
+- **R17-01 (re-opens R16-02)** — the typed client verified identity, but the
+  *server* did not: a raw pipe peer could send `SubmitCommand` with no handshake
+  at all, or after a failed one, and it would be dispatched. A connection is now
+  admitted only after a matching-identity handshake succeeds
+  (`daemon_transport::serve_connection`); every other request on an unadmitted
+  connection is refused without being dispatched. Each mutating request also
+  carries the `state_identity` it is bound to, so the direct request path
+  (`DaemonServer::handle_request`) fails closed too. The daemon wire protocol
+  version is raised to 2 for that field. Regression coverage:
+  `raw_peer_without_a_handshake_cannot_submit_a_command`,
+  `mismatched_handshake_does_not_admit_the_connection`,
+  `matching_handshake_admits_subsequent_commands`,
+  `submit_command_requires_the_matching_database_identity`.
+- **R17-02 (re-opens R16-04, first half)** — `run_full_daemon` spawned the
+  listener and returned immediately, so a successor could report a running daemon
+  whose pipe had never bound (a bind failure was only logged). Startup now waits
+  for the listener to actually bind, retries binding within a bounded window while
+  a stale instance still holds the pipe, and fails startup truthfully if it cannot
+  bind. Regression coverage: `a_daemon_waits_for_a_held_pipe_and_then_serves`,
+  `a_daemon_that_cannot_bind_its_pipe_reports_startup_failure`.
+- **R17-03 (re-opens R16-04, second half)** — in-flight fencing was missing: a
+  command admitted while this process was authoritative could still commit after a
+  successor took the lease. Every daemon command write is now fenced inside its own
+  transaction on the lease's fencing token (`DaemonFence`,
+  `assert_daemon_fence`); a stale write is refused with
+  `StoreError::DaemonAuthorityLost`, and a command refused that way is left
+  non-terminal (not falsely recorded as `failed`) for the successor to reconcile.
+  Regression coverage:
+  `fenced_writes_are_refused_after_a_successor_takes_the_daemon_lease`.
+- **R17-04 (re-opens R16-05)** — `resolve_command` discarded `complete_command`'s
+  result and still reported success, a crash between the compare-and-set commit
+  and the terminal write recorded a false `failed` on replay, and a cached
+  `failed` command was returned as `Duplicate`. Completion errors are now
+  propagated (never an optimistic `applied`); a replay whose transition is already
+  present converges on `applied`; and a cached `failed` command replays as
+  `failed`. Regression coverage:
+  `replaying_a_committed_state_transition_reports_applied_not_failed`,
+  `a_failed_command_replays_as_failed_not_duplicate`,
+  `concurrent_replays_of_one_command_id_converge_on_one_result`.
+- **R17-05 (P2)** — the durable-lease expiry comment claimed the store "tolerated"
+  date-text rows; the store actually compares the column as an integer, so such a
+  row reads as expired. The comment now states the real invariant.
+- **P2 follow-up, not fixed here** — the two-database migration race (identical
+  `SQLITE_BUSY`/duplicate-column classification gap at startup) remains a separate
+  tracked item: it is a migration-time defect that R17's command-path fencing does
+  not reach, and the reviewer recommended tracking it separately rather than
+  widening this correction.
+
 ## Wave C — Harden runtime/provider semantics
 
 Status: **NOT STARTED**

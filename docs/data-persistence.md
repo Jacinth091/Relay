@@ -222,6 +222,35 @@ status therefore cannot drift from the status a caller was told. Claims are
 cleared at startup before the listener accepts connections (`reconcile_on_startup`),
 because a claim can only be held by a live process.
 
+### Fenced daemon writes and command terminal semantics
+
+Every durable write on the daemon command path runs in a transaction whose first
+statement asserts that this process still holds the daemon lease at its fencing
+token (`DaemonFence`; `assert_daemon_fence`). If a successor has taken the lease —
+which increments the token — the write is refused with
+`StoreError::DaemonAuthorityLost` and durable state is unchanged. This closes the
+window where a command was admitted while this process was authoritative but
+committed after authority moved.
+
+A refused-by-fence command is **not** recorded as `failed`. Its outcome is
+unknown and a successor owns the database now, so the command is left
+non-terminal for that successor's reconciliation; the caller receives an
+authority-loss error instead of a false terminal status.
+
+The semantic effect and the command's terminal row are two separate durable
+writes, so a crash between them is possible. Two rules keep that window honest:
+
+- the compare-and-set transition is idempotent on its *desired end state*: if the
+  transition is already present when a command is replayed, the replay converges
+  on `applied` rather than recording a false `failed`;
+- a command's terminal record is never reported optimistically. If the effect
+  committed but the terminal row could not be written, the caller is told the
+  outcome could not be recorded (and the command stays non-terminal for
+  reconciliation) rather than being told it succeeded.
+
+A cached `failed` command replays as `failed`, never as `Duplicate`, so a caller
+that reuses a command id cannot read a failed command as a successful one.
+
 ## Export / Backup
 
 A future export command may package:

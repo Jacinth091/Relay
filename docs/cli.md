@@ -50,10 +50,30 @@ proof of matching state. Submissions additionally resolve the project against th
 persisted trusted registry at submit time, so a project added while the daemon is
 running is honoured without restarting it.
 
+Admission is enforced **server-side**, not just by the typed client. A connection
+is not trusted until it completes a matching handshake, so a raw peer that skips
+the handshake (or fails it against the wrong database) cannot mutate state even if
+it speaks the framing protocol directly; non-handshake requests on an unadmitted
+connection are refused without being dispatched. Each mutating request also names
+the state identity it is bound to, so the direct request path fails closed too.
+The protocol version was raised to 2 for this field.
+
+Each command's durable write is **fenced on the daemon lease**: the mutation runs
+in a transaction that first asserts this process still holds the lease at its
+fencing token, so a command admitted before authority was lost cannot commit after
+a successor took over. A refused write is reported as an authority-loss error, not
+as a command failure, and the command is left non-terminal for the successor to
+reconcile.
+
 If the daemon loses its lease (a successor reclaimed an expired lease, or the
 heartbeat cannot be renewed), it stops claiming authority: every request fails
 closed, the listener and effect worker shut down, and the `relay daemon` process
 exits instead of idling while a successor owns the database.
+
+`run_full_daemon` does not report a running daemon until the listener has actually
+bound the pipe. If a stale instance still holds it (the normal case during a
+takeover overlap), binding is retried for a bounded window; if it still cannot
+bind, startup fails instead of returning a daemon with no listener.
 
 | Flag | Default | Purpose |
 |---|---|---|

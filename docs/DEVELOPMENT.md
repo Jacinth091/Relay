@@ -72,9 +72,13 @@ pipe is derived from the durable identity of the database it serves (a value
 generated inside that database by migration 0007), so two databases never share
 one transport address and a client cannot reach a daemon serving different state
 — every request opens a connection, performs a state-identity handshake, and is
-refused if the identities disagree. `RELAY_DAEMON_PIPE_SUFFIX` exists only for
-tests that deliberately need to influence the pipe name; leaving it unset is the
-production behavior.
+refused if the identities disagree. The daemon enforces this on its side too: a
+connection is not admitted until a matching handshake succeeds, so a peer that
+speaks the raw framing protocol without one cannot mutate state. The daemon also
+fences its own durable writes on its lease, so a command admitted before a
+takeover cannot land after the successor took over. `RELAY_DAEMON_PIPE_SUFFIX`
+exists only for tests that deliberately need to influence the pipe name; leaving
+it unset is the production behavior.
 
 Relay reads repository-local `.relay/project.toml` and `.relay/policies.toml`
 as **untrusted portable declarations**. Such declarations may *restrict* what a

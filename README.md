@@ -116,6 +116,56 @@ authenticated by you.
 
 ---
 
+## Install (Windows, one line)
+
+> **Availability:** this installer works once the repository is public and a
+> non-prerelease release is listed on the
+> [Releases page](https://github.com/Jacinth091/Relay/releases). Until then, use
+> the manual download, `cargo install`, or build from source below; the commands
+> in this section will not resolve yet.
+
+```powershell
+irm https://raw.githubusercontent.com/Jacinth091/Relay/main/install.ps1 | iex
+```
+
+This installs the latest stable release to `%LOCALAPPDATA%\Programs\Relay`,
+verifies its SHA-256 checksum before installing anything, and adds that folder to
+your **user** `PATH`. Open a new terminal and run `relay`.
+
+- **Upgrade:** run the same command again.
+- **Uninstall:** removes the program and its `PATH` entry. Your data in
+  `%APPDATA%\Relay` is kept.
+
+  ```powershell
+  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Jacinth091/Relay/main/install.ps1))) -Uninstall
+  ```
+
+- **Options:** `irm ... | iex` cannot pass parameters, so use the scriptblock form
+  for them: `-IncludePrerelease` (allows `rc` builds), `-Version v0.1.0` (pins one
+  tag), `-InstallDir <path>`.
+
+  ```powershell
+  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Jacinth091/Relay/main/install.ps1))) -IncludePrerelease
+  ```
+
+- **Inspect first (recommended if you do not know the script):** download it, read
+  it, then run it.
+
+  ```powershell
+  irm https://raw.githubusercontent.com/Jacinth091/Relay/main/install.ps1 -OutFile install.ps1
+  notepad .\install.ps1
+  powershell -ExecutionPolicy Bypass -File .\install.ps1
+  ```
+
+The `-ExecutionPolicy Bypass` flag applies to that one PowerShell process only; it does not change your system policy.
+
+The installer does not install a provider CLI (for example Codex); see
+[What the package does not include](#what-the-package-does-not-include). It is
+Windows x86_64 only. A private repository needs a `GITHUB_TOKEN` environment
+variable with read access.
+
+---
+
 ## Download a release (Windows x86_64)
 
 > **A release exists only if one is listed on the
@@ -173,20 +223,26 @@ choose **More info** → **Run anyway**.
 ### Put `relay` on your PATH (optional)
 
 To run `relay` from any folder, add the unzipped folder to your **user** `PATH`.
-Use System Properties → Environment Variables → *User variables* → `Path`, or the
-same change as one copy-paste command (run it inside the unzipped folder):
+The easiest route is the [one-line installer](#install-windows-one-line) above,
+which does this for you. Otherwise use System Properties → Environment Variables →
+*User variables* → `Path`, or this copy-paste command (run it inside the unzipped
+folder). It reads and writes the registry value directly, so `%VAR%` entries in your
+`Path` keep expanding:
 
 ```powershell
 $dir = (Resolve-Path .).Path
-[Environment]::SetEnvironmentVariable(
-  "Path",
-  [Environment]::GetEnvironmentVariable("Path", "User").TrimEnd(";") + ";$dir",
-  "User"
-)
+$key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment", $true)
+try {
+  $entries = @($key.GetValue("Path", "", "DoNotExpandEnvironmentNames") -split ";" | Where-Object { $_ })
+  if ($entries -notcontains $dir) {
+    $key.SetValue("Path", (@($entries + $dir) -join ";"), [Microsoft.Win32.RegistryValueKind]::ExpandString)
+  }
+} finally { $key.Close() }
 ```
 
-New terminals pick this up; already-open ones do not. For the current terminal
-only, use `$env:Path += ";$dir"`.
+Open a **new** terminal to pick this up (this command does not notify running
+programs). If a new terminal still does not see `relay`, sign out and back in. For
+the current terminal only, use `$env:Path += ";$dir"`.
 
 ### What the package does not include
 

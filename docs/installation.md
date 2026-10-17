@@ -1,8 +1,8 @@
 # Installation
 
 > [!NOTE]
-> Relay is a source-buildable experimental prototype. **No release, installer or
-> package-manager entry is published yet.** A release package is produced by
+> Relay is a source-buildable experimental prototype. **No release is published
+> yet, so the one-line installer below cannot resolve a package yet.** A release package is produced by
 > [`.github/workflows/release.yml`](../.github/workflows/release.yml) when the
 > maintainer pushes a version tag (`v*`), so whether a download exists is a fact
 > about the
@@ -10,6 +10,24 @@
 > and expect it to be empty until the first version tag is pushed. Until a release
 > is listed, build from source (below) or
 > `cargo install --git https://github.com/Jacinth091/Relay --locked relay-tui`.
+
+## One-line installer (Windows, after a release is published)
+
+Works once the repository is public and a non-prerelease release is listed on the
+Releases page. Until then it fails to find a release; use the other paths on this
+page.
+
+```powershell
+irm https://raw.githubusercontent.com/Jacinth091/Relay/main/install.ps1 | iex
+```
+
+The script ([`install.ps1`](../install.ps1)) downloads the release zip and its
+`.sha256`, refuses to install on a checksum mismatch, copies `relay.exe`, `LICENSE`
+and `README.md` into `%LOCALAPPDATA%\Programs\Relay`, and adds that folder to the
+user `PATH` if it is absent. Re-running it upgrades. `-Uninstall` removes the folder
+and its `PATH` entry and keeps `%APPDATA%\Relay`. Parameters (`-IncludePrerelease`,
+`-Version`, `-InstallDir`) need the scriptblock form; the README has the commands
+and the inspect-first alternative.
 
 ## Available today: build from source
 

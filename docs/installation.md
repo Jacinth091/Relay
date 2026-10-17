@@ -1,10 +1,15 @@
 # Installation
 
 > [!NOTE]
-> Relay is a source-buildable experimental prototype. There is **no published
-> installer, package-manager entry, or prebuilt binary release** yet. Build from
-> source. The sections about future packages below describe intent, not shipped
-> artifacts.
+> Relay is a source-buildable experimental prototype. **No release, installer or
+> package-manager entry is published yet.** A release package is produced by
+> [`.github/workflows/release.yml`](../.github/workflows/release.yml) when the
+> maintainer pushes a version tag (`v*`), so whether a download exists is a fact
+> about the
+> [Releases page](https://github.com/Jacinth091/Relay/releases) — check it there,
+> and expect it to be empty until the first version tag is pushed. Until a release
+> is listed, build from source (below) or
+> `cargo install --git https://github.com/Jacinth091/Relay --locked relay-tui`.
 
 ## Available today: build from source
 
@@ -29,6 +34,34 @@ A coding-agent CLI, API key, hosted service, or GitHub mailbox is **not**
 required to build, test, or start the TUI. Executing a real provider run
 additionally requires that provider's CLI, installed and authenticated by you.
 
+## Prebuilt releases (only when one is listed)
+
+The release workflow
+([`.github/workflows/release.yml`](../.github/workflows/release.yml)) builds and
+publishes a package when the maintainer pushes a version tag (`v*`). Published
+asset names:
+
+```text
+relay-<tag>-windows-x86_64.zip
+relay-<tag>-windows-x86_64.zip.sha256
+```
+
+Windows x86_64 is the only platform built today; there is no Linux or macOS
+package, no installer, and no package-manager entry. A tag containing `-` (for
+example `v0.1.0-rc.1`) is published as a **prerelease**.
+
+If the Releases page lists a release, download the zip and its `.sha256` file,
+verify the checksum, unzip it and run `relay.exe` from Windows Terminal or
+PowerShell. The full walkthrough — checksum verification, the SmartScreen prompt
+for an unsigned binary, and adding the folder to `PATH` — is in
+[README.md](../README.md#download-a-release-windows-x86_64). Running real work
+still requires your provider's CLI (for example Codex) installed and
+authenticated separately.
+
+> **No prebuilt release exists yet.** None of the asset names above can be
+> assumed to resolve until the Releases page shows one. Do not document an
+> installer command as working until it is actually published and tested.
+
 ## Goal
 
 Installing Relay should be separate from configuring a planner, a submission
@@ -43,22 +76,14 @@ relay
 Users should not need to memorize a large command surface for everyday use.
 For the command surface that exists today, see [cli.md](cli.md).
 
-## Future release packages
+## Future distribution
 
-A future release may publish prebuilt binaries for supported platforms through
-GitHub Releases or another official channel. Conceptual examples:
+Additional platforms (Linux, macOS) and package-manager distribution such as
+Homebrew, Scoop or WinGet are **not implemented**. `cargo install --git` (above)
+and building from a clone are the only paths besides a published Windows release.
 
-```text
-relay-v0.x.y-windows-x86_64.zip
-relay-v0.x.y-linux-x86_64.tar.gz
-relay-v0.x.y-macos-aarch64.tar.gz
-```
-
-Package-manager distribution such as Cargo, Homebrew, Scoop, or WinGet may be
-added later, after the release process is stable.
-
-> None of these exist yet. Do not document an installer command as working until
-> it is actually published and tested.
+> Do not document an installer or package-manager command as working until it is
+> actually published and tested.
 
 ## First launch
 

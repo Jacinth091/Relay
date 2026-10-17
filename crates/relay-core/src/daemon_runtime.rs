@@ -138,7 +138,18 @@ pub async fn run_full_daemon(
 ) -> Result<(Arc<DaemonServer>, EmbeddedDaemon), DaemonError> {
     let daemon = DaemonServer::start(store, relay, lease_id, lease_ttl).await?;
 
-    daemon.reconcile_on_startup().await?;
+    if let Err(err) = daemon.reconcile_on_startup().await {
+        // Startup failed after the lease was acquired but before anything was
+        // spawned, so there is nothing to join; release the lease this process
+        // still owns so a successor does not have to wait out the TTL.
+        if let Err(release_err) = daemon.release_lease().await {
+            tracing::warn!(
+                error = %release_err,
+                "failed to release the daemon lease after a failed startup"
+            );
+        }
+        return Err(err);
+    }
 
     let server = Arc::new(daemon);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

@@ -1,0 +1,13 @@
+[package]
+name = "relay-decision-jev"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+relay-core = { path = "../../crates/relay-core" }
+
+[dev-dependencies]
+tokio = { version = "1.43.0", features = ["macros", "rt", "rt-multi-thread"] }

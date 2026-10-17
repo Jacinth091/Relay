@@ -1,6 +1,12 @@
 # Build Plan
 
-This is the implementation sequence for Relay.
+> **Status: HISTORICAL / PARTIALLY SUPERSEDED.** This was the original
+> implementation sequence. Day-to-day milestone tracking has moved to the
+> M-ladder (M2 through M9); ADR-0016 superseded the original GitHub-first
+> ingress ordering (original Phase 8) in favor of MCP-first submission with
+> local file/paste as the fallback. The phases below are retained as the
+> record of intent, annotated where reality diverged. Current status lives in
+> [docs/status-2026-08.md](status-2026-08.md).
 
 The goal is to prove boundaries in small vertical slices.
 
@@ -137,6 +143,11 @@ Implement:
 
 ## Phase 8 — GitHub Integration and Binding Boundary
 
+Status: **descoped from v0.1 (ADR-0016); future optional compatibility path.** No `gh` ingress adapter exists in the
+codebase. GitHub appears today only as expected-remote metadata used by
+repository safety checks (Phase 3). This phase remains intent, not a claim of
+current capability.
+
 Implement the initial `gh` GitHub adapter for GitHub Issue ingestion and establish the separate external-binding abstraction.
 
 Capabilities:
@@ -172,6 +183,12 @@ Codex integration:
 ---
 
 ## Phase 10 — End-to-End Reference Loop
+
+Status: **partial**. The loop works end-to-end today with local file/paste
+ingress instead of GitHub: local task -> review -> Run -> Codex (app-server by
+default, `codex exec` also supported) -> events/diff/logs -> DONE or escalation.
+The GitHub leg of the loop does not exist. See
+[docs/status-2026-08.md](status-2026-08.md).
 
 Prove:
 
@@ -232,6 +249,11 @@ Before promoting an experimental adapter to first-class, run the shared conforma
 ---
 
 ## Phase 12 — Relay Direct / MCP Submission
+
+Status: **implemented (M9, on `feat/m9-relay-direct-mcp`) — Phase 1 submission
+only.** `relay serve-mcp` exposes `submit_handoff` over stdio MCP with dual-era
+protocol support. Bidirectional capabilities below that are not yet built are
+future phases, deliberately specified before implementation.
 
 Expose a direct planner-to-Relay submission interface without requiring GitHub.
 

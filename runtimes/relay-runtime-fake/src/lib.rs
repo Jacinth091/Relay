@@ -119,6 +119,7 @@ impl Runtime for FakeRuntime {
             streaming_output: true,
             cancellation: true,
             deterministic_outcome: true,
+            permission_support: relay_runtime::RuntimePermissionSupport::PreapprovedOnly,
         }
     }
 
@@ -157,6 +158,7 @@ impl Runtime for FakeRuntime {
             Ok(RuntimeSession {
                 session_id,
                 events: rx,
+                control: None,
             })
         })
     }
@@ -258,4 +260,133 @@ async fn finish(tx: &mpsc::Sender<RuntimeEvent>, kind: RuntimeOutcomeKind) {
 #[allow(dead_code)]
 fn _runtime_error_type_is_public(error: RuntimeError) -> RuntimeError {
     error
+}
+
+// ---------------------------------------------------------------------------
+// Phase 06: RuntimeBackplane implementation for FakeRuntime
+// ---------------------------------------------------------------------------
+
+use relay_runtime::{
+    BackplaneError, BackplaneFuture, BackplaneId, BackplaneSnapshot, DisposeReceipt,
+    InterruptReceipt, ProcessStatus, ReconcileOutcome, RuntimeBackplane, RuntimeHandle,
+    RuntimeObservation, RuntimeProvisionRequest, SendReceipt,
+};
+
+#[derive(Clone, Default)]
+pub struct FakeBackplane {
+    inner: FakeRuntime,
+    active_handles: Arc<Mutex<HashMap<String, RuntimeProvisionRequest>>>,
+    sent_inputs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+}
+
+use std::collections::HashMap;
+
+impl FakeBackplane {
+    pub fn new() -> Self {
+        Self {
+            inner: FakeRuntime::default(),
+            active_handles: Arc::new(Mutex::new(HashMap::new())),
+            sent_inputs: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn inner(&self) -> &FakeRuntime {
+        &self.inner
+    }
+
+    pub fn get_sent_input(&self, handle_id: &str) -> Option<Vec<u8>> {
+        self.sent_inputs.lock().unwrap().get(handle_id).cloned()
+    }
+}
+
+impl RuntimeBackplane for FakeBackplane {
+    fn id(&self) -> BackplaneId {
+        BackplaneId::new("fake-backplane")
+    }
+
+    fn provision<'a>(&'a self, req: RuntimeProvisionRequest) -> BackplaneFuture<'a, RuntimeHandle> {
+        Box::pin(async move {
+            let handle_id = format!("fake-h-{}", req.role_attempt_id);
+            let handle = RuntimeHandle {
+                handle_id: handle_id.clone(),
+                backplane_id: self.id(),
+                pid: Some(42),
+                created_at: "now".to_owned(),
+            };
+            self.active_handles.lock().unwrap().insert(handle_id, req);
+            Ok(handle)
+        })
+    }
+
+    fn observe<'a>(&'a self, handle: &'a RuntimeHandle) -> BackplaneFuture<'a, RuntimeObservation> {
+        Box::pin(async move {
+            let active = self.active_handles.lock().unwrap();
+            if active.contains_key(&handle.handle_id) {
+                Ok(RuntimeObservation {
+                    handle_id: handle.handle_id.clone(),
+                    status: ProcessStatus::ExitedSuccess { exit_code: 0 },
+                    stdout_chunk: b"fake backplane execution output\n".to_vec(),
+                    stderr_chunk: Vec::new(),
+                    total_bytes_captured: 32,
+                })
+            } else {
+                Err(BackplaneError::HandleNotFound(handle.handle_id.clone()))
+            }
+        })
+    }
+
+    fn send<'a>(
+        &'a self,
+        handle: &'a RuntimeHandle,
+        input: &'a [u8],
+    ) -> BackplaneFuture<'a, SendReceipt> {
+        Box::pin(async move {
+            self.sent_inputs
+                .lock()
+                .unwrap()
+                .entry(handle.handle_id.clone())
+                .or_default()
+                .extend_from_slice(input);
+            Ok(SendReceipt {
+                bytes_written: input.len(),
+            })
+        })
+    }
+
+    fn interrupt<'a>(
+        &'a self,
+        _handle: &'a RuntimeHandle,
+    ) -> BackplaneFuture<'a, InterruptReceipt> {
+        Box::pin(async move { Ok(InterruptReceipt { initiated: true }) })
+    }
+
+    fn dispose<'a>(&'a self, handle: &'a RuntimeHandle) -> BackplaneFuture<'a, DisposeReceipt> {
+        Box::pin(async move {
+            let mut active = self.active_handles.lock().unwrap();
+            let reaped = active.remove(&handle.handle_id).is_some();
+            Ok(DisposeReceipt { reaped })
+        })
+    }
+
+    fn snapshot<'a>(&'a self) -> BackplaneFuture<'a, BackplaneSnapshot> {
+        Box::pin(async move {
+            let count = self.active_handles.lock().unwrap().len();
+            Ok(BackplaneSnapshot {
+                backplane_id: self.id(),
+                active_processes: count,
+                capacity_slots: 100,
+            })
+        })
+    }
+
+    fn reconcile<'a>(&'a self, handle: &'a RuntimeHandle) -> BackplaneFuture<'a, ReconcileOutcome> {
+        Box::pin(async move {
+            let active = self.active_handles.lock().unwrap();
+            if active.contains_key(&handle.handle_id) {
+                Ok(ReconcileOutcome::Alive { pid: 42 })
+            } else {
+                Ok(ReconcileOutcome::ResourceNotFound)
+            }
+        })
+    }
 }

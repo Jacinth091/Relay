@@ -6,6 +6,9 @@ members = [
     "crates/relay-runtime",
     "crates/relay-store",
     "runtimes/relay-runtime-fake",
+    "runtimes/relay-runtime-codex",
+    "runtimes/relay-runtime-antigravity",
+    "runtimes/relay-decision-jev",
 ]
 resolver = "3"
 
@@ -14,3 +17,8 @@ edition = "2024"
 rust-version = "1.85"
 repository = "https://github.com/Jacinth091/Relay"
 publish = false
+
+[workspace.dependencies]
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"

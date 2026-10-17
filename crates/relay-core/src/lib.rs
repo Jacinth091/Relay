@@ -2,36 +2,144 @@
 //!
 //! Presentation-framework types do not belong in this crate.
 
+pub mod artifact;
+pub mod candidate;
+pub mod daemon;
+#[cfg(windows)]
+pub mod daemon_runtime;
+#[cfg(windows)]
+pub mod daemon_transport;
+pub mod decision;
+pub mod delegation;
+pub mod digest;
 mod durable_state;
+pub mod effect_worker;
+pub mod exchange;
 mod execution;
+mod execution_planning;
+pub mod legacy_adapter;
+pub mod policy;
+pub mod portable_config;
+pub mod privileged;
+pub mod project_identity;
 mod project_registry;
+pub mod recovery_v2;
 mod repository_safety;
+pub mod retention;
+pub mod scheduler_v2;
 mod task_ingress;
+pub mod workflow;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use relay_protocol::{AmbiguityPolicy, HandoffTask};
+pub use relay_runtime::{
+    ReasoningEffort, RuntimeExecutionSelection, RuntimeModelSelection, RuntimeReasoningSelection,
+};
 
+pub use artifact::{
+    ArtifactError, ArtifactId, ArtifactKind, ArtifactMetadata, ArtifactSensitivity,
+    ArtifactStorageRef, ArtifactStore, ArtifactTrustClass, CreateArtifactRequest, RetentionClass,
+};
+pub use candidate::{
+    Candidate, CandidateError, CandidateFingerprint, CandidateId, Lease, LeaseHolder, LeaseId,
+    LeaseKind, LeaseResource, LeaseState, WorktreeHandle, WorktreeManager, compute_digest,
+};
+pub use daemon::{
+    CommandStatus, DAEMON_PROTOCOL_NAME, DAEMON_PROTOCOL_VERSION, DEFAULT_LEASE_ID,
+    DEFAULT_LEASE_TTL, DaemonClient, DaemonCommand, DaemonError, DaemonEvent, DaemonPendingEffect,
+    DaemonRequest, DaemonResponse, DaemonServer, DaemonSnapshot, DaemonTaskSummary,
+    InProcessDaemonClient,
+};
+#[cfg(windows)]
+pub use daemon_runtime::{
+    DaemonClientHandle, EmbeddedDaemon, connect_or_embed, new_command_id, run_full_daemon,
+};
+#[cfg(windows)]
+pub use daemon_transport::{NamedPipeDaemonClient, default_pipe_name};
+pub use decision::{
+    ChoiceProbability, DecisionAuditRecord, DecisionChoice, DecisionEngineId, DecisionFuture,
+    DecisionManager, DecisionManagerConfig, DecisionOutcome, DecisionResolution,
+    FakeDecisionEngine, RuleDecisionEngine, SanitizedDecisionState, SemanticDecisionEngine,
+    SemanticDecisionError, SemanticDecisionId, SemanticDecisionKind, SemanticDecisionOutcome,
+    SemanticDecisionPolicy, SemanticDecisionRequest,
+};
+pub use delegation::{
+    BudgetAccounting, BudgetError, ConsultationRequest, DelegationError, DelegationManager,
+    DelegationMode, DelegationOutcome, DelegationRequest, IndependenceRequirement,
+    RoleDependencyGraph, RoleDependencyNode, RoleDependencyState,
+};
+pub use digest::sha256_digest;
 pub use durable_state::{
     SqliteStore, StoredTask, TaskPersistenceError, TaskState, default_database_path,
-    get_stored_task, list_stored_tasks, update_stored_task_state,
+    get_stored_task, list_stored_tasks, list_stored_tasks_with_quarantined,
+    update_stored_task_state,
+};
+pub use effect_worker::{EffectHandler, EffectOutcome, EffectWorkerRegistry, run_effect_worker};
+pub use exchange::{
+    ExchangeError, ExchangeMessage, ExchangeMessageId, ExchangeMessageKind, ExchangeOperation,
+    IssueCapabilityRequest, PublishResultRequest, RelayExchange, RoleInbox, RoleSessionCapability,
+    RoleSessionToken, SendMessageRequest,
 };
 pub use execution::{
     BoundedOutputSnapshot, CoreExecutionEvent, ExecutionLimits, ExecutionReport,
-    ExecutionScheduler, ExecutionSchedulerError, PreflightFailure, RetainedOutputChunk,
-    SchedulerSnapshot, SchedulerTaskSnapshot, SchedulerTaskStatus,
+    ExecutionRunPolicy, ExecutionScheduler, ExecutionSchedulerError, PreflightFailure,
+    RetainedOutputChunk, SchedulerSnapshot, SchedulerTaskSnapshot, SchedulerTaskStatus,
+};
+pub use execution_planning::{
+    ExecutionPlan, ExecutionPlanEnvironment, ExecutionPlanIntent, ExecutionPlanningError,
+    PLANNED_MAX_DURATION, PLANNED_MAX_REPAIR_ATTEMPTS, build_execution_plan,
+};
+pub use legacy_adapter::{
+    LegacyAdapterError, adapt_v1_handoff_to_approved_intent, create_v1_compatibility_run,
+    v1_compatibility_workflow_definition,
+};
+pub use policy::{
+    Capability, EnforcementClass, PolicyCompiler, PolicyDecision, PolicyDisposition, PolicyLayer,
+    built_in_safety_floor,
+};
+pub use portable_config::{
+    POLICIES_CONFIG_FILE, PROJECT_CONFIG_FILE, PortableConfigError, PortableRepositoryConfig,
+    RELAY_DIR, RawPoliciesToml, RawRestrictionsSection, TrustClassification,
+};
+pub use privileged::{
+    ApprovalGrant, ApprovalRequest, ApprovalRequestId, GitOperationRunner, ParameterDigest,
+    PrivilegedAction, PrivilegedActionExecutor, PrivilegedError, PrivilegedExecutionOutcome,
+    PrivilegedOperationRunner, PrivilegedRunOutcome,
+};
+pub use project_identity::{
+    Checkout, CheckoutId, CheckoutTrustState, DeclaredProjectIdentity, ProjectId,
+    ProjectIdentityError, RemoteFingerprint, TrustedProjectRegistration,
 };
 pub use project_registry::{
     ExpectedRemote, GitHubRepositoryMetadata, ProjectKey, ProjectRegistry, ProjectRegistryError,
     RegisterProject, TrustedProject, default_config_path,
 };
+pub use recovery_v2::{
+    AttemptReconciliation, CandidateIntegrity, RecoveryCoordinator, RecoveryError, RecoveryReport,
+};
+pub use relay_store::PendingEffectRecord;
 pub use repository_safety::{
     BranchState, GitInspectionOperation, NormalizedRemote, RepositoryEligibility,
     RepositoryInspection, RepositorySafetyFailure, RepositoryStatus,
-    inspect_trusted_project_repository,
+    inspect_trusted_project_repository, read_repository_remote_origin,
+};
+pub use retention::{CleanupReport, RetentionError, RetentionManager, RetentionPolicy};
+pub use scheduler_v2::{
+    ActiveExecutionSlot, QueuedWorkItem, SchedulePriority, SchedulerV2, SchedulerV2Config,
+    SchedulerV2Error,
 };
 pub use task_ingress::{
-    ImportedTask, SubmissionTransport, TaskId, TaskImportCandidate, TaskIngressError,
+    ImportedTask, MAX_LOCAL_TASK_INPUT_BYTES, SubmissionTransport, TaskId, TaskImportCandidate,
+    TaskIngressError,
+};
+pub use workflow::{
+    ApprovedIntent, ApprovedIntentId, ClarificationRequest, ConfigSnapshot, ConfigSnapshotId,
+    DecisionRequest, ExecutionBudget, ExecutionGrant, ExecutionGrantId, ExecutionTarget,
+    RoleAttempt, RoleAttemptId, RoleAttemptState, RoleDefinition, RoleDefinitionId, RoleInstance,
+    RoleInstanceId, RoleInstanceState, RoleWriteMode, ScopeExpansionRequest, TransitionCondition,
+    WorkflowDefinition, WorkflowDefinitionId, WorkflowError, WorkflowNodeDefinition, WorkflowRun,
+    WorkflowRunId, WorkflowRunState, WorkflowTransitionDefinition,
 };
 
 /// Minimal Relay application state.
@@ -39,6 +147,12 @@ pub use task_ingress::{
 pub struct Relay {
     project_registry: ProjectRegistry,
     reviewed_task: Option<ImportedTask>,
+    /// Trusted config path this Relay was loaded from, when it came from disk.
+    ///
+    /// The daemon re-reads the authoritative persisted registry from here when a
+    /// submission arrives, so a project registered *after* the daemon started is
+    /// honoured immediately instead of being rejected against a stale snapshot.
+    config_path: Option<PathBuf>,
 }
 
 impl Relay {
@@ -52,12 +166,26 @@ impl Relay {
         Self {
             project_registry,
             reviewed_task: None,
+            config_path: None,
         }
     }
 
     /// Loads Relay's trusted local project registry from a TOML config path.
+    ///
+    /// The path is retained ([`Relay::config_path`]) so a daemon built from this
+    /// Relay can re-read the persisted registry when submissions arrive.
     pub fn load_from_config_path(path: impl AsRef<Path>) -> Result<Self, ProjectRegistryError> {
-        Ok(Self::with_project_registry(ProjectRegistry::load(path)?))
+        let path = path.as_ref();
+        Ok(Self {
+            project_registry: ProjectRegistry::load(path)?,
+            reviewed_task: None,
+            config_path: Some(path.to_path_buf()),
+        })
+    }
+
+    /// The trusted config path this Relay was loaded from, if it came from disk.
+    pub fn config_path(&self) -> Option<&Path> {
+        self.config_path.as_deref()
     }
 
     /// Returns the number of configured projects currently visible to Relay.

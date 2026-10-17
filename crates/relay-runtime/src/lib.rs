@@ -62,6 +62,24 @@ pub struct RuntimeCapabilities {
     pub streaming_output: bool,
     pub cancellation: bool,
     pub deterministic_outcome: bool,
+    pub permission_support: RuntimePermissionSupport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimePermissionSupport {
+    PreapprovedOnly,
+    LiveApproval,
+}
+
+impl Default for RuntimeCapabilities {
+    fn default() -> Self {
+        Self {
+            streaming_output: true,
+            cancellation: true,
+            deterministic_outcome: true,
+            permission_support: RuntimePermissionSupport::PreapprovedOnly,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +99,16 @@ pub struct RuntimeRequest {
     pub trusted_working_dir: PathBuf,
     pub action: RuntimeAction,
     pub profile_id: String,
+    pub runtime_selection: RuntimeExecutionSelection,
+}
+
+/// Frozen capability ceiling attached to one approved execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RuntimePermissionEnvelope {
+    pub trusted_workspace: Option<PathBuf>,
+    pub workspace_write: bool,
+    pub network: bool,
+    pub additional_writable_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,7 +129,9 @@ pub enum RuntimeOutputStream {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum RuntimeEvent {
+    Activity(RuntimeActivity),
     Output {
         stream: RuntimeOutputStream,
         bytes: Vec<u8>,
@@ -110,6 +140,83 @@ pub enum RuntimeEvent {
     InvalidOutput {
         reason: String,
     },
+    PermissionRequested(RuntimePermissionRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePermissionRequest {
+    pub request_id: String,
+    pub kind: RuntimePermissionKind,
+    pub reason: Option<String>,
+    pub command: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub requested: RuntimeRequestedPermissions,
+    #[serde(default)]
+    pub available_decisions: Vec<RuntimePermissionDecisionKind>,
+    pub item_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub environment_id: Option<String>,
+    pub grant_root: Option<PathBuf>,
+    pub command_actions: Option<Vec<String>>,
+    pub network_approval_context: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuntimePermissionKind {
+    CommandExecution,
+    FileChange,
+    Network,
+    Permissions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RuntimeRequestedPermissions {
+    pub workspace_write: bool,
+    pub network: bool,
+    pub paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimePermissionScope {
+    Once,
+    Turn,
+    Session,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePermissionGrant {
+    pub decision: RuntimePermissionDecision,
+    pub scope: RuntimePermissionScope,
+    pub granted_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeControl {
+    PermissionDecision {
+        request_id: String,
+        grant: RuntimePermissionGrant,
+    },
+    UserInputResponse {
+        request_id: String,
+        response: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuntimePermissionDecision {
+    AllowOnce,
+    AllowForRun,
+    Deny,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuntimePermissionDecisionKind {
+    AllowOnce,
+    AllowForRun,
+    Deny,
+    Cancel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +268,7 @@ impl RuntimeOutcomeKind {
 pub struct RuntimeSession {
     pub session_id: String,
     pub events: mpsc::Receiver<RuntimeEvent>,
+    pub control: Option<mpsc::Sender<RuntimeControl>>,
 }
 
 pub trait Runtime: Send + Sync + 'static {
@@ -214,3 +322,25 @@ impl CancellationToken {
 pub struct RuntimeDeadline {
     pub max_duration: Duration,
 }
+
+mod activity;
+pub mod backplane;
+pub mod herdr;
+mod integration;
+pub mod local_process_backplane;
+mod profile;
+mod provider;
+mod resolver;
+mod router;
+pub mod sanitizer;
+
+pub use activity::*;
+pub use backplane::*;
+pub use herdr::*;
+pub use integration::*;
+pub use local_process_backplane::*;
+pub use profile::*;
+pub use provider::*;
+pub use resolver::*;
+pub use router::*;
+pub use sanitizer::*;

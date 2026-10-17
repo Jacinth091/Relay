@@ -1,62 +1,98 @@
 # Contributing to Relay
 
-Relay is private during initial development.
+Relay is an **experimental personal hobby/development project**. It is shared so
+people can learn from it, test ideas, and propose improvements. Issues and pull
+requests are welcome, but there is **no guarantee of review, acceptance, support,
+or response time**.
 
-These rules establish the intended contribution style before public release.
+Be constructive and respectful. Small, focused contributions are easiest to
+review.
 
-## Before Coding
+## Start here
 
-Read:
+Read, in this order:
 
-1. `README.md`
-2. `contexts/PROJECT_CONTEXT.md`
-3. `docs/design-principles.md`
-4. `docs/architecture.md`
-5. relevant ADRs
+1. `README.md` — what Relay is and what currently works.
+2. `docs/DEVELOPMENT.md` — build, test, and source layout.
+3. `AGENTS.md` — invariants for coding agents working **on Relay**.
+4. `docs/adr/0020-relay-architecture-v2.md` — the accepted architecture authority.
+5. `docs/v2_architecture_rebaseline/ROADMAP.md` — the honest per-phase status table.
 
-## Change Ownership
+Check existing issues before starting substantial work, and open an issue to
+discuss anything large before writing code.
 
-Determine the correct layer before implementation:
+## Supported platforms
 
-- core;
-- ingress;
-- runtime;
-- stack;
-- planner specification / provider adapter;
-- presentation client.
+**Windows with the MSVC toolchain is the only supported host today**, and CI
+gates merges on it. The other leg of the CI matrix (`ubuntu-latest`) is
+*advisory*: it is labelled `[advisory]`, its build steps tolerate their own
+failure, and it never blocks a merge. Read its logs for the real errors, not its
+check mark.
 
-Do not put provider-specific shortcuts in core.
+Linux fails for one concrete reason. The local Relay Daemon transport is a
+Windows named pipe, gated `#![cfg(windows)]`
+(`crates/relay-core/src/daemon_transport.rs` and the `daemon_runtime` module),
+while `apps/relay-tui` (`main.rs`, `state.rs`, `mcp/*`) imports those types
+unconditionally. Removing that blocker means either adding a platform-neutral
+transport or compiling the daemon path out behind a platform gate.
 
-## Architectural Changes
+A portability contribution is welcome — [issue #17](https://github.com/Jacinth091/Relay/issues/17)
+tracks it. Until it lands, do not claim Linux or macOS support in code,
+documentation, or pull request descriptions.
 
-If a change affects a product invariant, task protocol, security boundary, persistence strategy, runtime contract, or presentation independence:
+## Architecture and boundaries
 
-- add/update an ADR;
-- update relevant docs;
-- add boundary tests.
+Decide which layer owns a change before implementing it:
 
-## Expected Checks
+- `crates/relay-core` — deterministic domain engine (provider-agnostic, no LLM reasoning);
+- `crates/relay-protocol` — `HandoffTask v1` wire format and validation;
+- `crates/relay-store` — SQLite persistence;
+- `crates/relay-runtime` — runtime/backplane seam and router;
+- `runtimes/*` — provider adapters (Codex, Antigravity, fake);
+- `integrations/planners/*` — planner-side specifications and adapter documents;
+- `apps/relay-tui` — presentation client (must not own policy).
 
-When Rust implementation exists:
+Preserve the product invariants in `AGENTS.md`: explicit human approval, trusted
+local project resolution, no arbitrary execution paths, no automatic push, and
+fail-closed behavior for unknown protocols or malformed input. Do not put
+provider-specific shortcuts in `relay-core`.
 
-```text
-cargo fmt --check
-cargo clippy --workspace --all-targets --all-features
-cargo test --workspace
+Changes to contracts, product invariants, persistence, or the security boundary
+require a corresponding ADR (`docs/adr/`), updated documentation, and boundary
+tests in the same change.
+
+## Validation
+
+Run the workspace gates before opening a pull request:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked
+cargo test --workspace --locked
 ```
 
-## Pull Requests
+State clearly which checks you ran, skipped, or that failed. Do not claim
+compatibility with an OS, provider, or integration you did not actually test.
+Tests are expected to stay hermetic: use the fake runtime and temporary
+directories, never real provider accounts, quotas, or credentials.
 
-Prefer small, coherent changes.
+## Pull requests
 
-Describe:
+Keep PRs small and coherent. Describe the problem, the scope, the affected
+architectural layers, any security or invariant implications, the tests you ran,
+and the documentation you updated. Split large changes rather than expanding one
+PR indefinitely.
 
-- problem;
-- layer changed;
-- security implications;
-- tests;
-- documentation impact.
+## Licensing
 
-## Public Contribution Policy
+The repository is released under the [MIT License](LICENSE). Unless you state
+otherwise, contributions submitted for inclusion are offered under the same MIT
+terms. By contributing you represent that you have the right to submit the
+material and agree to its distribution under that license. No CLA is required.
 
-A public code of conduct, contribution workflow, and license policy will be added before open-source release.
+Do not submit secrets, credentials, private logs, personal data, private task
+handoffs, or unlicensed third-party content.
+
+## Security
+
+Do not report vulnerabilities in public issues. Follow [SECURITY.md](SECURITY.md).

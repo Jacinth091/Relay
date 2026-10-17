@@ -1,11 +1,16 @@
 use std::fmt;
 
 use relay_protocol::{HandoffTask, parse_handoff_task_json};
-use relay_store::{NewTaskRecord, StoreError, TaskRecord};
+use relay_store::{
+    NewResourceLeaseRecord, NewTaskRecord, ResourceLeaseRecord, StoreError, TaskRecord,
+};
 pub use relay_store::{SqliteStore, default_database_path};
 use thiserror::Error;
 
-use crate::{ImportedTask, ProjectKey, Relay, SubmissionTransport, TaskId, TaskImportCandidate};
+use crate::{
+    CheckoutId, ImportedTask, Lease, LeaseHolder, LeaseId, LeaseKind, LeaseResource, LeaseState,
+    ProjectKey, Relay, SubmissionTransport, TaskId, TaskImportCandidate, WorkflowRunId,
+};
 
 /// Durable Relay task state stored locally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,9 +87,32 @@ pub(crate) async fn persist_imported_task(
     store: &SqliteStore,
     task: &ImportedTask,
 ) -> Result<StoredTask, TaskPersistenceError> {
+    record_to_stored_task(store.insert_task(&new_task_record(task)?).await?)
+}
+
+/// Persists an imported task idempotently: replaying the same task id (e.g.
+/// a daemon command retried after a crash) returns the existing row instead
+/// of erroring or duplicating the `task_ready` event.
+///
+/// Fenced on the daemon lease, because the only caller is the daemon's handoff
+/// submission path: a submission admitted before authority was lost must not
+/// land after a successor took the lease.
+pub(crate) async fn persist_imported_task_if_absent(
+    store: &SqliteStore,
+    task: &ImportedTask,
+    fence: &relay_store::DaemonFence,
+) -> Result<StoredTask, TaskPersistenceError> {
+    record_to_stored_task(
+        store
+            .insert_task_if_absent_fenced(&new_task_record(task)?, fence)
+            .await?,
+    )
+}
+
+fn new_task_record(task: &ImportedTask) -> Result<NewTaskRecord, TaskPersistenceError> {
     let handoff = task.handoff();
     let source = handoff.source.as_ref();
-    let record = NewTaskRecord {
+    Ok(NewTaskRecord {
         id: task.id().to_string(),
         project_key: task.project_key().as_str().to_owned(),
         title: handoff.title.clone(),
@@ -95,9 +123,7 @@ pub(crate) async fn persist_imported_task(
         state: TaskState::Ready.as_str().to_owned(),
         protocol_version: i64::from(handoff.protocol_version),
         handoff_json: serde_json::to_string(handoff)?,
-    };
-
-    record_to_stored_task(store.insert_task(&record).await?)
+    })
 }
 
 pub async fn get_stored_task(
@@ -114,12 +140,29 @@ pub async fn get_stored_task(
 pub async fn list_stored_tasks(
     store: &SqliteStore,
 ) -> Result<Vec<StoredTask>, TaskPersistenceError> {
-    store
-        .list_tasks()
-        .await?
-        .into_iter()
-        .map(record_to_stored_task)
-        .collect()
+    Ok(list_stored_tasks_with_quarantined(store).await?.0)
+}
+
+/// Lists stored tasks, quarantining records that fail revalidation.
+///
+/// A single corrupt row must not hide every task from the user, so rows that
+/// cannot be revalidated are skipped instead of failing the whole listing.
+/// The number of quarantined records is returned alongside the parsed tasks
+/// so callers can surface partial corruption.
+pub async fn list_stored_tasks_with_quarantined(
+    store: &SqliteStore,
+) -> Result<(Vec<StoredTask>, usize), TaskPersistenceError> {
+    let mut tasks = Vec::new();
+    let mut quarantined = 0usize;
+
+    for record in store.list_tasks().await? {
+        match record_to_stored_task(record) {
+            Ok(task) => tasks.push(task),
+            Err(_) => quarantined += 1,
+        }
+    }
+
+    Ok((tasks, quarantined))
 }
 
 pub async fn update_stored_task_state(
@@ -185,6 +228,7 @@ fn parse_submission_transport(input: &str) -> Result<SubmissionTransport, TaskPe
     match input {
         "local-file" => Ok(SubmissionTransport::LocalFile),
         "local-paste" => Ok(SubmissionTransport::LocalPaste),
+        "relay-mcp" => Ok(SubmissionTransport::RelayMcp),
         transport => Err(TaskPersistenceError::UnknownSubmissionTransport {
             transport: transport.to_owned(),
         }),
@@ -223,12 +267,135 @@ pub enum TaskPersistenceError {
     },
     #[error("{0}")]
     ProjectRegistry(#[from] crate::ProjectRegistryError),
+    #[error("{0}")]
+    ProjectIdentity(#[from] crate::project_identity::ProjectIdentityError),
+    #[error("unknown stored lease resource type '{resource_type}'")]
+    UnknownLeaseResourceType { resource_type: String },
+    #[error("unknown stored lease kind '{lease_kind}'")]
+    UnknownLeaseKind { lease_kind: String },
+    #[error("unknown stored lease state '{state}'")]
+    UnknownLeaseState { state: String },
+}
+
+pub fn record_to_lease(record: ResourceLeaseRecord) -> Result<Lease, TaskPersistenceError> {
+    let resource = match record.resource_type.as_str() {
+        "checkout" => LeaseResource::Checkout(CheckoutId::parse(&record.resource_id)?),
+        "task" => LeaseResource::Task(TaskId::parse(&record.resource_id).map_err(|source| {
+            TaskPersistenceError::InvalidTaskId {
+                input: record.resource_id,
+                source,
+            }
+        })?),
+        "workflow_run" => LeaseResource::WorkflowRun(WorkflowRunId(record.resource_id)),
+        other => {
+            return Err(TaskPersistenceError::UnknownLeaseResourceType {
+                resource_type: other.to_string(),
+            });
+        }
+    };
+
+    let kind = match record.lease_kind.as_str() {
+        "exclusive_write" => LeaseKind::ExclusiveWrite,
+        "shared_read" => LeaseKind::SharedRead,
+        "verification" => LeaseKind::Verification,
+        other => {
+            return Err(TaskPersistenceError::UnknownLeaseKind {
+                lease_kind: other.to_string(),
+            });
+        }
+    };
+
+    let state = match record.state.as_str() {
+        "active" => LeaseState::Active,
+        "expired" => LeaseState::Expired,
+        "superseded" => LeaseState::Superseded,
+        "released" => LeaseState::Released,
+        other => {
+            return Err(TaskPersistenceError::UnknownLeaseState {
+                state: other.to_string(),
+            });
+        }
+    };
+
+    Ok(Lease {
+        id: LeaseId::new(record.id),
+        resource,
+        kind,
+        holder: LeaseHolder {
+            holder_id: record.holder_id,
+            pid: record.holder_pid as u32,
+            host: record.holder_host,
+        },
+        fencing_token: record.fencing_token as u64,
+        acquired_at: record.acquired_at,
+        expires_at: record.expires_at,
+        state,
+    })
+}
+
+pub async fn acquire_durable_lease(
+    store: &SqliteStore,
+    id: &LeaseId,
+    resource: &LeaseResource,
+    kind: &LeaseKind,
+    holder: &LeaseHolder,
+    ttl_seconds: u64,
+) -> Result<Lease, TaskPersistenceError> {
+    let (resource_type, resource_id) = match resource {
+        LeaseResource::Checkout(chk) => ("checkout".to_string(), chk.to_string()),
+        LeaseResource::Task(tsk) => ("task".to_string(), tsk.to_string()),
+        LeaseResource::WorkflowRun(wfr) => ("workflow_run".to_string(), wfr.to_string()),
+    };
+
+    let lease_kind_str = match kind {
+        LeaseKind::ExclusiveWrite => "exclusive_write".to_string(),
+        LeaseKind::SharedRead => "shared_read".to_string(),
+        LeaseKind::Verification => "verification".to_string(),
+    };
+
+    // Canonical durable-lease expiry representation: Unix epoch seconds as text.
+    // The store compares expiry as an integer against the current epoch second
+    // (`CAST(expires_at AS INTEGER)`), and `Lease::assert_valid` parses this field
+    // as epoch seconds. Only this wrapper writes the column; any other
+    // representation (for example an ISO date string) is read as that string's
+    // leading integer and would appear already expired, not "tolerated". If this
+    // changes, both the store comparison and `assert_valid` must change with it.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expires_at = (now + ttl_seconds).to_string();
+
+    let new_rec = NewResourceLeaseRecord {
+        id: id.to_string(),
+        resource_type,
+        resource_id,
+        lease_kind: lease_kind_str,
+        holder_id: holder.holder_id.clone(),
+        holder_pid: holder.pid as i64,
+        holder_host: holder.host.clone(),
+        expires_at,
+    };
+
+    let record = store.acquire_resource_lease(&new_rec).await?;
+    record_to_lease(record)
+}
+
+pub async fn release_durable_lease(
+    store: &SqliteStore,
+    lease_id: &LeaseId,
+    holder_id: &str,
+) -> Result<(), TaskPersistenceError> {
+    store
+        .release_resource_lease(&lease_id.to_string(), holder_id)
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ProjectRegistry, RegisterProject};
+    use crate::{CandidateError, ProjectRegistry, RegisterProject};
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -251,6 +418,110 @@ mod tests {
         },
         "ambiguity_policy": "needs_clarification"
     }"#;
+
+    #[tokio::test]
+    async fn durable_lease_expiry_is_reclaimed_once_ttl_elapses() {
+        // Regression for PR #16 review finding R16-01: this wrapper writes
+        // `expires_at` as Unix epoch seconds, but the store evaluated expiry as
+        // SQLite date text, so an elapsed durable lease was never detected and a
+        // crashed holder permanently pinned the resource.
+        let store = SqliteStore::in_memory().await.unwrap();
+        let resource = LeaseResource::WorkflowRun(WorkflowRunId("wfr-r16-01".to_owned()));
+        let kind = LeaseKind::ExclusiveWrite;
+        let holder_one = LeaseHolder {
+            holder_id: "holder-one".to_string(),
+            pid: std::process::id(),
+            host: "localhost".to_string(),
+        };
+        let holder_two = LeaseHolder {
+            holder_id: "holder-two".to_string(),
+            pid: std::process::id(),
+            host: "localhost".to_string(),
+        };
+
+        // ttl_seconds = 0 => already expired when the next holder asks for it.
+        let first = acquire_durable_lease(
+            &store,
+            &LeaseId::new("lease-r16-01-a"),
+            &resource,
+            &kind,
+            &holder_one,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.fencing_token, 1);
+        assert_eq!(first.state, LeaseState::Active);
+        assert!(
+            first.expires_at.parse::<u64>().is_ok(),
+            "durable lease expiry must be canonical Unix epoch seconds, got {}",
+            first.expires_at
+        );
+
+        // A competing holder reclaims the elapsed lease with a monotonic token.
+        let second = acquire_durable_lease(
+            &store,
+            &LeaseId::new("lease-r16-01-b"),
+            &resource,
+            &kind,
+            &holder_two,
+            3600,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.fencing_token, 2, "fencing token must stay monotonic");
+        assert_eq!(second.state, LeaseState::Active);
+
+        // The elapsed lease no longer validates; the reclaimed one does.
+        assert!(matches!(
+            first.assert_valid(first.fencing_token),
+            Err(CandidateError::LeaseExpired { .. })
+        ));
+        assert!(second.assert_valid(second.fencing_token).is_ok());
+    }
+
+    #[tokio::test]
+    async fn durable_lease_with_live_ttl_still_blocks_competing_holder() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let resource = LeaseResource::WorkflowRun(WorkflowRunId("wfr-r16-02".to_owned()));
+        let kind = LeaseKind::ExclusiveWrite;
+        let holder_one = LeaseHolder {
+            holder_id: "holder-one".to_string(),
+            pid: std::process::id(),
+            host: "localhost".to_string(),
+        };
+        let holder_two = LeaseHolder {
+            holder_id: "holder-two".to_string(),
+            pid: std::process::id(),
+            host: "localhost".to_string(),
+        };
+
+        acquire_durable_lease(
+            &store,
+            &LeaseId::new("lease-r16-02-a"),
+            &resource,
+            &kind,
+            &holder_one,
+            3600,
+        )
+        .await
+        .unwrap();
+
+        let err = acquire_durable_lease(
+            &store,
+            &LeaseId::new("lease-r16-02-b"),
+            &resource,
+            &kind,
+            &holder_two,
+            3600,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            TaskPersistenceError::Store(StoreError::ResourceLeaseHeld { .. })
+        ));
+    }
 
     #[tokio::test]
     async fn stores_imported_task_as_canonical_ready_state() {
@@ -297,6 +568,7 @@ mod tests {
         let mut relay = relay_with_project("relay");
 
         for title in ["First task", "Second task"] {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             let json = TASK_JSON.replace("Persist imported task", title);
             let candidate = relay.preview_local_paste(&json).unwrap();
             let imported = relay.confirm_task_import(candidate).clone();
@@ -367,6 +639,24 @@ mod tests {
         assert_eq!(loaded.state, TaskState::Ready);
     }
 
+    #[tokio::test]
+    async fn mcp_submission_persists_with_relay_mcp_transport_and_round_trips() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let mut relay = relay_with_project("relay");
+        let candidate = relay.preview_mcp_submission(TASK_JSON).unwrap();
+
+        let stored = relay
+            .confirm_task_import_with_store(&store, candidate)
+            .await
+            .unwrap();
+
+        assert_eq!(stored.submission_transport, SubmissionTransport::RelayMcp);
+        assert_eq!(stored.state, TaskState::Ready);
+
+        let loaded = get_stored_task(&store, stored.id).await.unwrap().unwrap();
+        assert_eq!(loaded.submission_transport, SubmissionTransport::RelayMcp);
+    }
+
     #[test]
     fn unknown_stored_state_is_rejected() {
         let record = task_record(
@@ -385,117 +675,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stored_handoff_json_is_revalidated_on_load() {
+    async fn listing_skips_corrupt_row_and_returns_good_row() {
         let store = SqliteStore::in_memory().await.unwrap();
-        let record = NewTaskRecord {
-            id: "bad-json".to_owned(),
+        let mut relay = relay_with_project("relay");
+        let candidate = relay.preview_local_paste(TASK_JSON).unwrap();
+        let imported = relay.confirm_task_import(candidate).clone();
+        let good = persist_imported_task(&store, &imported).await.unwrap();
+
+        let corrupt = NewTaskRecord {
+            id: "corrupt-json".to_owned(),
             project_key: "relay".to_owned(),
-            title: "Bad JSON".to_owned(),
+            title: "Corrupt JSON".to_owned(),
             requested_stack: None,
             submission_transport: "local-paste".to_owned(),
             source_kind: None,
             source_provider: None,
             state: "ready".to_owned(),
             protocol_version: 1,
-            handoff_json: r#"{
+            handoff_json: "{not valid json".to_owned(),
+        };
+        store.insert_task(&corrupt).await.unwrap();
+
+        let tasks = list_stored_tasks(&store).await.unwrap();
+        let (tasks_with_count, quarantined) =
+            list_stored_tasks_with_quarantined(&store).await.unwrap();
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, good.id);
+        assert_eq!(tasks_with_count.len(), 1);
+        assert_eq!(tasks_with_count[0].id, good.id);
+        assert_eq!(quarantined, 1);
+    }
+
+    #[test]
+    fn stored_handoff_json_is_revalidated_on_load() {
+        let record = task_record(
+            "550e8400-e29b-41d4-a716-446655440000",
+            "Bad JSON",
+            "ready",
+            r#"{
                 "protocol_version": 2,
                 "project": "relay",
                 "title": "Bad JSON",
                 "task": {"goal": "Invalid protocol."},
                 "ambiguity_policy": "needs_clarification"
-            }"#
-            .to_owned(),
-        };
-        store.insert_task(&record).await.unwrap();
+            }"#,
+        );
 
-        let error = list_stored_tasks(&store).await.unwrap_err();
+        let error = record_to_stored_task(record).unwrap_err();
 
         assert!(error.to_string().contains("unsupported protocol version 2"));
     }
 
-    #[tokio::test]
-    async fn stored_handoff_with_empty_required_field_is_rejected_on_load() {
-        let store = SqliteStore::in_memory().await.unwrap();
-        let record = NewTaskRecord {
-            id: "empty-title".to_owned(),
-            project_key: "relay".to_owned(),
-            title: "Stored title".to_owned(),
-            requested_stack: None,
-            submission_transport: "local-paste".to_owned(),
-            source_kind: None,
-            source_provider: None,
-            state: "ready".to_owned(),
-            protocol_version: 1,
-            handoff_json: r#"{
+    #[test]
+    fn stored_handoff_with_empty_required_field_is_rejected_on_load() {
+        let record = task_record(
+            "550e8400-e29b-41d4-a716-446655440001",
+            "Stored title",
+            "ready",
+            r#"{
                 "protocol_version": 1,
                 "project": "relay",
                 "title": "",
                 "task": {"goal": "Invalid empty title."},
                 "ambiguity_policy": "needs_clarification"
-            }"#
-            .to_owned(),
-        };
-        store.insert_task(&record).await.unwrap();
+            }"#,
+        );
 
-        let error = list_stored_tasks(&store).await.unwrap_err();
+        let error = record_to_stored_task(record).unwrap_err();
 
         assert!(error.to_string().contains("title cannot be empty"));
     }
 
-    #[tokio::test]
-    async fn stored_project_key_must_match_handoff_project() {
-        let store = SqliteStore::in_memory().await.unwrap();
-        let record = NewTaskRecord {
-            id: "project-mismatch".to_owned(),
-            project_key: "relay".to_owned(),
-            title: "Mismatch".to_owned(),
-            requested_stack: None,
-            submission_transport: "local-paste".to_owned(),
-            source_kind: None,
-            source_provider: None,
-            state: "ready".to_owned(),
-            protocol_version: 1,
-            handoff_json: r#"{
+    #[test]
+    fn stored_project_key_must_match_handoff_project() {
+        let record = task_record(
+            "550e8400-e29b-41d4-a716-446655440002",
+            "Mismatch",
+            "ready",
+            r#"{
                 "protocol_version": 1,
                 "project": "other",
                 "title": "Mismatch",
                 "task": {"goal": "Mismatch."},
                 "ambiguity_policy": "needs_clarification"
-            }"#
-            .to_owned(),
-        };
-        store.insert_task(&record).await.unwrap();
+            }"#,
+        );
 
-        let error = list_stored_tasks(&store).await.unwrap_err();
+        let error = record_to_stored_task(record).unwrap_err();
 
         assert!(error.to_string().contains("does not match handoff project"));
     }
 
-    #[tokio::test]
-    async fn stored_title_must_match_handoff_title() {
-        let store = SqliteStore::in_memory().await.unwrap();
-        let record = NewTaskRecord {
-            id: "title-mismatch".to_owned(),
-            project_key: "relay".to_owned(),
-            title: "Stored title".to_owned(),
-            requested_stack: None,
-            submission_transport: "local-paste".to_owned(),
-            source_kind: None,
-            source_provider: None,
-            state: "ready".to_owned(),
-            protocol_version: 1,
-            handoff_json: r#"{
+    #[test]
+    fn stored_title_must_match_handoff_title() {
+        let record = task_record(
+            "550e8400-e29b-41d4-a716-446655440003",
+            "Stored title",
+            "ready",
+            r#"{
                 "protocol_version": 1,
                 "project": "relay",
                 "title": "Canonical title",
                 "task": {"goal": "Mismatch."},
                 "ambiguity_policy": "needs_clarification"
-            }"#
-            .to_owned(),
-        };
-        store.insert_task(&record).await.unwrap();
+            }"#,
+        );
 
-        let error = list_stored_tasks(&store).await.unwrap_err();
+        let error = record_to_stored_task(record).unwrap_err();
 
         assert!(error.to_string().contains("does not match handoff title"));
     }

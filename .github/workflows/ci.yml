@@ -1,0 +1,87 @@
+name: Rust CI
+
+# Compiles and tests the Relay workspace on Windows (the supported host and
+# the merge gate) and on Linux (advisory - see the `continue-on-error` note on
+# the job below).
+#
+# Design constraints (deliberate, do not relax without review):
+#   - read-only token; no secrets, no provider logins, no network calls to AI
+#     services, and no spending of anyone's coding-agent quota;
+#   - no pull_request_target and no other privileged fork trigger;
+#   - dependency set comes from the checked-in Cargo.lock (`--locked`).
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - staging
+      - feat/v2-architecture-rebaseline
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})${{ matrix.os == 'ubuntu-latest' && ' [advisory]' || '' }}
+    runs-on: ${{ matrix.os }}
+    # Windows is the supported host, so it is the gate. Linux runs for
+    # visibility only: the local-daemon transport
+    # (crates/relay-core/src/daemon_transport.rs, gated `#![cfg(windows)]`) uses
+    # a Windows named pipe, so the Linux leg cannot build `apps/relay-tui` yet.
+    # See CONTRIBUTING.md, "Supported platforms".
+    #
+    # Two layers keep that known breakage from blocking a merge and from showing
+    # up as a failed check on a pull request:
+    #   - the build steps that cannot pass on Linux tolerate their own failure,
+    #     so the job reports success while the log still carries the real errors;
+    #   - this job-level `continue-on-error` covers unexpected step failures
+    #     (toolchain setup, for example), so the workflow run itself still passes.
+    # Remove both once a contributor lands a platform-neutral transport.
+    continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        # Linux cannot build `apps/relay-tui` yet (see the job comment above):
+        # keep the errors in the log without failing the job, so the check does
+        # not read as a blocker on a pull request.
+        continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Test workspace
+        continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
+        run: cargo test --workspace --locked

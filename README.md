@@ -2,698 +2,268 @@
 
 > **Planning is a conversation. Execution is a handoff.**
 
-Relay is a local, developer-controlled handoff engine that moves **user-approved implementation intent** from a planning surface into a coding agent.
+Relay is a **local-first, policy-governed orchestration control plane for
+user-approved software work**.
 
-Relay is one implementation with multiple integration points around the same core.
+The human owns intent and privileged decisions. Relay owns controlled
+orchestration: durable tasks, approved intent, execution grants, workflows,
+roles, policy, provider resolution, scheduling, recovery, and the state you
+actually see. Runtime backplanes host processes. Provider CLIs perform assigned
+role attempts.
 
-The first experience is terminal-first, but Relay is **not architecturally a TUI application**. The TUI is the first client of Relay Core. Future desktop, local web, MCP, or API integrations must be able to use the same core without rewriting execution logic.
+> *"The human owns intent. Relay owns controlled orchestration. Runtime
+> backplanes host execution. Providers perform assigned roles."*
+> — [ADR-0020](docs/adr/0020-relay-architecture-v2.md)
+
+Relay begins *after* you decide a piece of work is ready. It never infers that a
+conversation has gone on long enough and starts implementing on its own, and it
+never pushes to a remote repository automatically.
+
+This repository tracks **Relay Architecture v2**, which supersedes the original
+v1 handoff engine framing (ADR-0020). The M0–M9 lineage is preserved as
+historical evidence.
 
 ---
 
-## Why Relay Exists
+## ⚠️ Experimental hobby project
 
-Coding agents are good at implementation, but planning and implementation are different activities.
+Relay is a **personal, experimental hobby and development project**, published
+as source for learning, testing, and contributions.
 
-A developer may want to:
+- It is **not** a supported product, and there is **no** stability, uptime,
+  compatibility, or response-time commitment.
+- It is **not** audited or production-safe. It can start coding-agent processes
+  that modify files and run commands on your machine.
+- It **never** bypasses provider quotas, billing, authentication, or usage
+  controls. Any model or CLI you connect stays separately authenticated and
+  separately charged by its provider.
+- Start with a **disposable Git repository**, a least-privilege account, and
+  reviewed permissions.
 
-- explore multiple designs;
-- disagree with an AI suggestion;
-- ask for counterarguments;
-- change requirements during discussion;
-- investigate trade-offs before committing;
-- abandon an idea without starting an implementation agent;
-- decide personally when implementation intent is ready.
+See [SECURITY.md](SECURITY.md) and [docs/security-model.md](docs/security-model.md).
 
-Relay deliberately preserves that freedom.
+---
 
-Its default model is:
+## What works today
+
+Relay is under active v2 development. Modules and tests existing in
+the source tree is **not** the same as a capability being proven end to end on
+your OS. The authoritative per-phase status table lives in
+[`docs/v2_architecture_rebaseline/ROADMAP.md`](docs/v2_architecture_rebaseline/ROADMAP.md);
+read it before trusting any claim below.
+
+| | Capability | Notes |
+|---|---|---|
+| ✅ **Today** | Build and test the whole workspace from source | Stable Rust, no provider account needed |
+| ✅ **Today** | `relay` TUI: tasks, projects, runtimes, diffs, logs, command palette | First presentation client of Relay Core |
+| ✅ **Today** | Local handoff intake: JSON file / paste → validate → preview → persist `READY` | `HandoffTask v1` wire format |
+| ✅ **Today** | Explicit human **Run** approval before any execution | Execution grants are never automatic |
+| ✅ **Today** | `relay serve-mcp`: MCP over **stdio** exposing `submit_handoff` | Validates, resolves a trusted project, persists `READY`, **never auto-runs** |
+| ✅ **Today** | `relay daemon`: store-lease ownership with a fencing token and heartbeat renewal, serving clients over a Windows named pipe | The TUI and `relay serve-mcp` submit task creation through the daemon instead of writing the store directly. The transport is Windows-only for now (see [Supported platforms](CONTRIBUTING.md#supported-platforms)) |
+| ✅ **Today** | Trusted local project registry + repository safety preflight | Tasks carry a project *key*, never filesystem paths |
+| ✅ **Today** | Deterministic fake runtime + fake backplane for tests | Hermetic: no network, no credentials, no provider quota |
+| ✅ **Today** | `NEEDS_CLARIFICATION` / `NEEDS_DECISION` escalation packets | Structured, not a vague question |
+| 🟡 **Partial** | v2 orchestration domain: workflows, roles, execution grants, candidates, leases, artifacts, Exchange, delegation | Types and tests exist; most are **not yet on the production Run path** (ROADMAP phases 02–11, 13–14 are `PARTIAL`) |
+| 🟡 **Partial** | Provider adapters: Codex (`app-server` stdio default, `exec` fallback), Antigravity | Require separately installed/authenticated provider CLIs; not exercised in CI |
+| 🟡 **Partial** | Runtime backplanes: `LocalProcessBackplane` (minimal non-Herdr path), `FakeBackplane` | Containment/idempotency semantics still being hardened (ROADMAP phase 06) |
+| 🟡 **Partial** | `HerdrBackplane` | Reference/test shape only; no durable production transport yet (ROADMAP phase 07) |
+| 🟡 **Partial** | The user **Run** path | Still executes the v1 `ExecutionScheduler`; the cutover to the v2 orchestrator is not implemented at this revision |
+| ⛔ **Planned** | Web UI (ROADMAP phase 12) | Deliberately not started |
+| ⛔ **Planned** | Durable Herdr production backplane, Exchange/delegation durability, privilege-binding corrections | Not started |
+| ⛔ **Planned** | GitHub ingress | Descoped from v0.1 by [ADR-0016](docs/adr/0016-mcp-first-submission-and-v0-1-local-descope.md) |
+| ⛔ **Planned** | Release binaries, installers, package managers, auto-update | Not published |
+| ⛔ **Planned** | Cross-provider fan-out / health-aware routing | Unimplemented portion of ADR-0018 superseded by ADR-0020 |
+
+**On `relay serve-mcp`:** it is a **local stdio** server. A cloud-hosted planner
+(for example, a ChatGPT deployment that cannot spawn local processes) cannot
+reach your local Relay instance through it. Hosts without compatible local-MCP
+access use the same canonical `HandoffTask v1` payload through local file/paste
+import instead.
+
+**On optional components:** Herdr is the reference interactive backplane, not a
+requirement for Relay core correctness. Semantic decision engines such as Jev
+are optional advisers that never create authority. Neither is required to build,
+test, or run the local source.
+
+---
+
+## Prerequisites
+
+To build and test from source you need:
+
+- **Git**
+- **Rust stable 1.85 or newer** with Cargo (the workspace is Edition 2024;
+  `rust-version = "1.85"` in `Cargo.toml`)
+- A normal interactive terminal (for the TUI)
+- On Windows with the MSVC toolchain: the Microsoft C++ build tools and Windows
+  SDK, used from a **Developer Command Prompt / PowerShell**
+
+**Windows with the MSVC toolchain is the only supported host today.** The build
+is not yet portable: the local Relay Daemon transport is a Windows named pipe,
+so the `ubuntu-latest` CI leg is advisory and expected to fail. See
+[CONTRIBUTING.md](CONTRIBUTING.md#supported-platforms) if you would like to help
+change that.
+
+You do **not** need a coding-agent login, API key, hosted service, Herdr server,
+or a GitHub mailbox to compile and test the source. Real provider execution
+additionally requires the corresponding provider CLI, installed and
+authenticated by you.
+
+---
+
+## Build and run from source
+
+From a fresh clone:
+
+```sh
+cargo build --workspace --locked
+cargo test --workspace --locked
+cargo run --locked -p relay-tui -- --help
+```
+
+`relay-tui` produces the `relay` executable. To start the interactive TUI:
+
+```sh
+cargo run --locked -p relay-tui
+```
+
+> Run the TUI against a **disposable** test repository with isolated local
+> config/state, not a repository you care about. Relay writes local SQLite state
+> and can launch coding-agent processes.
+
+Other entry points:
+
+```sh
+cargo run --locked -p relay-tui -- serve-mcp    # MCP stdio submission server
+cargo run --locked -p relay-tui -- daemon        # durable daemon
+```
+
+See [docs/cli.md](docs/cli.md) for the full command and TUI palette reference.
+
+---
+
+## How a handoff flows today
 
 ```text
-You + Planner
-      |
-      | discuss, challenge, refine, decide
-      v
-Explicit user approval
-      |
-      | "Send to Relay"
-      v
-Planner Integration
-      |
-      | build HandoffTask v1
-      v
-Submission Transport
-      | Relay Direct/MCP when available
-      | provider-native remote compatibility
-      | local file/paste fallback
-      v
-Relay Core
-      |
-      | validate, route, persist, execute, recover
-      v
-Coding Runtime
-      |
-      v
-Target Repository
+planner surface (or your editor / your own tool)
+        |
+        | explicit human approval of the intent
+        v
+HandoffTask v1  ---->  relay serve-mcp (local stdio)  --\
+                        local JSON file / paste         |--> protocol validate
+                                                        |    -> preview
+                                                        |    -> human confirms import
+                                                        v
+                                              task READY (SQLite, canonical)
+                                                        |
+                                                        | explicit human Run approval
+                                                        v
+                                      execution scheduler -> runtime (e.g. Codex)
+                                                        |
+                    +-----------------------------------+-----------------------------------+
+                    |                                   |                                   |
+                    v                                   v                                   v
+                completed                        ordinary failure                    intent boundary crossed
+                 (DONE)                    -> bounded auto-repair                  -> NEEDS_CLARIFICATION
+                                                                                       or NEEDS_DECISION
 ```
 
-Relay should never infer that a conversation has gone on long enough and silently begin implementation.
+Two things are load-bearing:
 
-### Agentic usage is a resource
+1. **Submission never executes.** `submit_handoff` (and file/paste import) only
+   validates, resolves a trusted project, persists, and marks the task `READY`.
+2. **Execution requires an explicit human Run.** Nothing is spawned, and nothing
+   is pushed to a remote, without that approval.
 
-Another original motivation for Relay is practical: coding-agent access may be limited by quotas, rate limits, credits, or workspace allowances.
+Escalations produce a structured packet rather than a vague question — see
+[docs/clarification-protocol.md](docs/clarification-protocol.md).
 
-Relay lets the developer keep exploratory reasoning in the planning surface and delay coding-runtime usage until there is approved implementation work.
+---
 
-For the first ChatGPT + Codex workflow:
+## Architecture at a glance
 
 ```text
-Normal ChatGPT
-    |
-    | architecture / debugging / requirements / disagreement
-    v
-"Send to Relay"
-    |
-    v
-Relay
-    |
-    | Codex usage begins when implementation begins
-    v
-Codex
+Human              owns intent and privileged decisions
+Relay (Daemon)     owns tasks, grants, workflows, roles, policy, state, recovery
+Runtime backplane  hosts processes and sessions; does not own tasks
+Provider adapter   translates provider-specific launch/readiness/result behavior
+Provider CLI       performs one assigned role attempt
 ```
 
-The goal is **not** to bypass or circumvent provider limits. Relay simply avoids invoking the coding runtime before it is useful.
+Relay Core is deterministic, provider-agnostic, and contains no LLM reasoning
+requirement. Ratatui is the first presentation layer, not the architecture.
 
-Provider-specific quotas and billing models can change; Relay's portable principle is:
-
-> **Use scarce agentic execution capacity for execution.**
+Read [ADR-0020](docs/adr/0020-relay-architecture-v2.md) for the authority and
+[docs/architecture.md](docs/architecture.md) for the current guide.
 
 ---
 
-## One Relay, Multiple Doors
-
-There is not a separate "ChatGPT Relay" and "local Relay orchestrator."
-
-There is one Relay system.
-
-Planning surfaces and user interfaces are clients/integrations around it.
+## Repository layout
 
 ```text
-                          RELAY
-
-              +-------------------------+
-              |       Relay Core        |
-              |-------------------------|
-              | Task lifecycle          |
-              | Project registry        |
-              | Security policy         |
-              | Persistence             |
-              | Runtime registry        |
-              | Recovery policy         |
-              | Execution events        |
-              +------------+------------+
-                           |
-            +--------------+--------------+
-            |                             |
-            v                             v
-        Relay TUI                    Future Clients
-                                    Desktop / Web
-
-Submission transports feed the same core:
-
-ChatGPT -> Relay Direct/MCP ----\
-Claude  -> Relay Direct/MCP -----+--> Relay Core
-Provider GitHub compatibility ---/
-Local file/paste ----------------/
-```
-
-After Relay accepts a task, local durable state is canonical. GitHub can remain an ingress and can also be an optional external binding, but it is not required for every Relay task.
-
----
-
-## Product Definition
-
-**Relay is a local control plane for moving user-approved implementation intent from conversational planning into coding-agent execution.**
-
-Relay is responsible for:
-
-- receiving handoff tasks;
-- validating task envelopes;
-- resolving trusted local projects;
-- validating repositories;
-- selecting configured stacks and runtimes;
-- checking runtime capabilities;
-- requiring local execution approval by default;
-- spawning coding runtimes;
-- streaming execution events;
-- autonomously repairing implementation problems within approved scope;
-- detecting when execution crosses back into planning territory;
-- generating structured clarification/decision packets;
-- preserving execution history;
-- presenting results and repository changes.
-
-Relay is not responsible for inventing new product intent without permission.
-
----
-
-## Execution Autonomy
-
-Relay may autonomously pursue the approved implementation intent after handoff.
-
-That includes normal implementation recovery such as:
-
-```text
-implement
-   |
-   v
-tests fail
-   |
-   v
-inspect
-   |
-   v
-repair
-   |
-   v
-verify again
-```
-
-Examples that may be handled autonomously:
-
-- compiler errors;
-- type errors;
-- lint failures;
-- failing tests caused by the implementation;
-- missing imports;
-- incorrect queries;
-- implementation mistakes;
-- verification failures whose fix remains inside the approved task.
-
-Relay should stop and request input when continuing would require a material change to approved intent.
-
-Examples:
-
-- unresolved product behavior;
-- architecture choices not already decided;
-- scope expansion;
-- destructive data-model changes;
-- security-policy changes;
-- conflicting requirements.
-
-This is the core boundary:
-
-> **The human owns intent. Relay owns controlled execution.**
-
----
-
-## Clarification and Decision Packets
-
-A runtime must not return a vague message such as:
-
-```text
-NEEDS_INPUT: should I add a new table?
-```
-
-When Relay stops for planning input, it creates a structured packet explaining:
-
-- what was being implemented;
-- what was completed;
-- what caused the stop;
-- relevant implementation context;
-- the exact decision/question;
-- options discovered;
-- executor assessment;
-- current repository state;
-- how execution can resume.
-
-Relay distinguishes:
-
-```text
-NEEDS_CLARIFICATION
-```
-
-The approved intent exists, but something about it is unclear.
-
-and:
-
-```text
-NEEDS_DECISION
-```
-
-Implementation uncovered a material choice that changes architecture, scope, behavior, policy, or another aspect of intent.
-
-The packet can be:
-
-- displayed in the TUI;
-- persisted in SQLite;
-- published to an optional bound channel such as a GitHub Issue;
-- copied as Markdown for the planner;
-- sent directly through Relay MCP/another Relay submission interface when available.
-
-The matching planner response is a **Resolution Packet**.
-
-See [`docs/clarification-protocol.md`](docs/clarification-protocol.md).
-
----
-
-## First Reference Workflow
-
-The first deeply supported stack is:
-
-```text
-Normal ChatGPT conversation
-          |
-          | explicit user approval
-          | "Send to Relay"
-          v
-Relay Handoff planner adapter (ChatGPT)
-          |
-          | Relay Handoff Planner Specification + Task Protocol
-          v
-GitHub compatibility transport (v0.1 reference)
-          |
-          v
-Relay Core
-          |
-          | local execution approval
-          v
-Codex CLI
-          |
-          | implement / test / repair
-          v
-Local Git repository
-          |
-          +---- success ------------------------> DONE
-          |
-          +---- implementation problem ---------> auto-repair
-          |
-          `---- intent boundary crossed --------> NEEDS_CLARIFICATION
-                                                   or NEEDS_DECISION
-```
-
-The v0.1 reference workflow uses GitHub because it provides a practical durable bridge before Relay Direct is implemented. When this mailbox transport is used, each user/team configures its own repository; private visibility is the recommended default. Relay does not provide a maintainer-owned shared mailbox service.
-
-When direct Relay MCP access is available, it becomes the preferred planner submission path:
-
-```text
-ChatGPT / Claude / OpenCode -> Relay MCP -> Relay Core
-```
-
-GitHub may then be omitted or configured as an optional external binding. The rest of Relay does not change.
-
----
-
-## Core Philosophy
-
-### Human-directed planning
-
-Planning is genuine discussion, not merely a task-generation form.
-
-### Explicit handoff
-
-Execution begins only after the user deliberately crosses the planning-to-execution boundary.
-
-### Controlled execution autonomy
-
-After handoff, Relay may repair and retry implementation within the approved scope.
-
-### Explain before escalating
-
-When Relay needs input, it must explain why and provide enough context for the user and planner to make the next decision.
-
-### Deterministic core
-
-Relay should contain as little AI reasoning as possible. Routing, validation, policy, persistence, and execution control should be deterministic.
-
-### Provider-agnostic core
-
-Core domain logic must not contain provider-specific behavior.
-
-### Provider-native edges
-
-Stacks and runtimes may use native provider capabilities aggressively when doing so improves quality or reliability.
-
-### Local-first
-
-The default product runs locally and does not require a hosted Relay service.
-
-### Lightweight
-
-Relay itself should remain comfortable on ordinary developer hardware. The coding agent, not Relay, should normally be the meaningful compute consumer.
-
-### UI-independent core
-
-Ratatui is the first presentation layer, not the architecture.
-
----
-
-## High-Level Architecture
-
-```text
-                   PLANNER SURFACES
-
-            ChatGPT   Claude   Manual
-                \       |       /
-                 \      |      /
-                  v     v     v
-
-              PLANNER INTEGRATION
-                       |
-                       | Relay Task Protocol
-                       v
-
-              SUBMISSION TRANSPORT
-
-         Relay Direct/MCP / Provider GitHub / Local
-                       |
-                       v
-
-              +--------------------+
-              |     RELAY CORE     |
-              |--------------------|
-              | Task lifecycle     |
-              | Project registry   |
-              | Security policy    |
-              | Runtime registry   |
-              | Capabilities       |
-              | Persistence        |
-              | Recovery policy    |
-              | Clarification      |
-              | Execution events   |
-              +---------+----------+
-                        |\
-                        | \---- optional External Binding
-                        |          GitHub Issue / future systems
-                        |
-                Runtime Profile
-                        |
-          +-------------+-------------+
-          |                           |
-          v                           v
-
-        Codex                      Claude Code
-      CLI runtime                  CLI runtime
-          |                           |
-          +-------------+-------------+
-                        |
-                        v
-                 TARGET REPOSITORY
-
-
-                 PRESENTATION CLIENTS
-
-           +------------+------------+
-           |            |            |
-           v            v            v
-       Relay TUI    Relay Desktop  Relay Server
-        Ratatui        Future        Future
+apps/relay-tui/            Terminal UI (first presentation client)
+crates/
+  relay-core/              Deterministic domain engine
+  relay-protocol/          HandoffTask v1 wire format and validation
+  relay-runtime/           Runtime/backplane seam, profiles, router
+  relay-store/             SQLite persistence
+runtimes/
+  relay-runtime-codex/     Codex adapter (app-server stdio default)
+  relay-runtime-antigravity/
+  relay-runtime-fake/      Scriptable runtime for hermetic tests
+  relay-decision-jev/      Optional advisory decision adapter
+integrations/planners/     Planner specification + host adapter documents
+schemas/                   Wire format schemas
+docs/                      Architecture docs, ADRs, implementation packs
+contexts/                  Project context documents
 ```
 
 ---
 
-## Technology Direction
+## Documentation map
 
-Relay Foundation v1.7 chooses:
-
-```text
-Core language       Rust, stable, Edition 2024
-Workspace           Cargo workspace, resolver 3
-Async runtime       Tokio
-TUI                 Ratatui + Crossterm
-Serialization       Serde
-Local config        TOML
-Task wire format    JSON
-Persistence         SQLite through SQLx
-CLI parsing         clap
-Logging/events      tracing
-Library errors      thiserror
-App-boundary errors anyhow
-Git integration     git executable first
-GitHub integration  gh executable first
-Runtime execution   child processes via Tokio
-```
-
-Potential future frontends:
-
-```text
-Desktop             Tauri 2
-Local server/API    Axum
-Browser UI          optional client of Relay server
-```
+- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — **build, test, and source layout for contributors**
+- [docs/v2_architecture_rebaseline/ROADMAP.md](docs/v2_architecture_rebaseline/ROADMAP.md) — **authoritative phase status**
+- [docs/adr/0020-relay-architecture-v2.md](docs/adr/0020-relay-architecture-v2.md) — architecture authority
+- [docs/architecture.md](docs/architecture.md) — current architecture guide
+- [docs/cli.md](docs/cli.md) — binary commands and TUI command palette
+- [docs/installation.md](docs/installation.md) — source build vs. unpublished installers
+- [docs/roadmap.md](docs/roadmap.md) — roadmap pointers (v1 ladder is historical)
+- [docs/task-protocol.md](docs/task-protocol.md) — `HandoffTask v1`
+- [docs/local-ingress.md](docs/local-ingress.md) — local file and paste formats
+- [docs/planner-hosts/](docs/planner-hosts/) — registering `relay serve-mcp` per host
+- [docs/security-model.md](docs/security-model.md) — security posture and boundaries
+- [docs/data-persistence.md](docs/data-persistence.md) — local state and SQLite
+- [docs/glossary.md](docs/glossary.md) — terminology
+- [AGENTS.md](AGENTS.md) — invariants for coding agents working on Relay
 
 ---
 
-## Repository Layout
+## Contributing
 
-Target direction:
+Contributions, issues, and experiments are welcome — with no guarantee of
+review, acceptance, or support. Read [CONTRIBUTING.md](CONTRIBUTING.md) and
+[AGENTS.md](AGENTS.md) first.
 
-```text
-relay/
-|
-|-- apps/
-|   `-- relay-tui/
-|
-|-- crates/
-|   |-- relay-core/
-|   |-- relay-protocol/
-|   |-- relay-store/
-|   |-- relay-runtime/
-|   `-- relay-ingress/
-|
-|-- runtimes/
-|   `-- relay-runtime-codex/
-|
-|-- ingresses/
-|   `-- relay-ingress-github/
-|
-|-- stacks/
-|   `-- chatgpt-codex/
-|
-|-- integrations/
-|   `-- planners/relay-handoff/
-|
-|-- contexts/
-|-- schemas/
-|-- docs/
-|   `-- adr/
-|
-|-- AGENTS.md
-|-- README.md
-`-- Cargo.toml
-```
-
-This is a target structure. Do not create empty crates merely to satisfy the diagram.
+Report security problems privately per [SECURITY.md](SECURITY.md); do not open a
+public issue containing exploit details, credentials, or private data.
 
 ---
 
-## Important Terms
+## License
 
-**Planner**  
-The conversational or manual surface where implementation intent is formed.
+[MIT](LICENSE).
 
-**Planner Integration**  
-A thin client/integration that converts explicitly approved intent into the Relay protocol and selects a supported submission transport.
-
-**Handoff Task**  
-A user-approved implementation specification accepted by Relay.
-
-**Submission Transport**  
-How a planner delivers a HandoffTask to Relay, such as Relay Direct/MCP, provider GitHub submission, local file, or local paste.
-
-**Ingress**  
-A Relay-side receiving mechanism for tasks, such as GitHub ingestion, local import, or Relay Direct.
-
-**External Binding**  
-An optional remote record, such as a GitHub Issue, synchronized with a canonical local Relay task.
-
-**Provider**  
-The model/tool ecosystem behind a coding runtime.
-
-**Runtime**  
-The coding agent Relay executes.
-
-**Runtime Transport**  
-How Relay talks to that runtime: CLI, SDK, API, or another mechanism.
-
-**Runtime Profile**  
-Local configuration selecting a runtime, provider, transport, and native options.
-
-**Capability**  
-A feature a runtime profile can actually support.
-
-**Stack**  
-An opinionated composition of planner integration, submission preference, optional external binding policy, runtime profile, and provider-native behavior.
-
-**Clarification Request**  
-A structured request for explanation of already-approved intent.
-
-**Decision Request**  
-A structured request for a new material decision discovered during implementation.
-
-**Resolution Packet**  
-The approved answer that allows Relay to resume or restart execution.
+Relay is inspired by ideas from other open-source projects; see
+[ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md) and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ---
 
-## Planner Adapter Architecture
-
-Relay's planner integration is provider-neutral at the semantic layer and provider-native at the host edge.
-
-```text
-Planner Specification
-       |
-       +-- ChatGPT Skill
-       +-- Claude Code Skill
-       +-- OpenCode Skill
-       +-- GitHub Copilot Agent Skill
-       `-- Generic instructions
-              |
-              v
-       Handoff Task v1
-              |
-              v
-            Relay
-```
-
-All first-party adapters must pass the same conformance cases. Provider-specific installation or tool use may differ; task semantics may not.
-
-See `docs/provider-support.md`.
-
----
-
-## First Stack: `chatgpt-codex`
-
-This stack is intentionally first-class.
-
-It may eventually contain:
-
-```text
-Planner specification   Relay Handoff Planner Specification
-Planner adapter         ChatGPT Skill (first adapter)
-Submission              GitHub compatibility for v0.1; Relay Direct preferred when available
-Runtime                 Codex
-Runtime transport       CLI
-Project instructions    AGENTS.md
-Native extensions       Codex-specific capabilities/options
-Recovery                automatic within approved scope
-Clarification           structured packets
-Push policy             disabled by default
-```
-
-The core only understands the common lifecycle and security rules.
-
----
-
-## Safety Baseline
-
-A remote task may request:
-
-```json
-{
-  "project": "practicore"
-}
-```
-
-It may not request:
-
-```json
-{
-  "cwd": "C:\\some\\arbitrary\\directory"
-}
-```
-
-The trusted local project registry owns:
-
-- filesystem paths;
-- expected Git remotes;
-- default stack/runtime;
-- execution policies.
-
-Before launching a runtime, Relay must verify the project and repository.
-
-Unknown or invalid targets fail closed.
-
----
-
-## v0.1 Definition of Done
-
-Relay v0.1 is successful when a user can:
-
-1. launch `relay`;
-2. see configured local projects;
-3. receive a structured HandoffTask through GitHub or local import;
-4. review the task inside the TUI;
-5. see preflight repository/runtime checks;
-6. explicitly choose **Run**;
-7. have Codex CLI start in the correct local repository;
-8. see streaming execution output;
-9. allow bounded automatic implementation repair;
-10. cancel a running execution when technically supported;
-11. see `DONE`, `FAILED`, `NEEDS_CLARIFICATION`, or `NEEDS_DECISION`;
-12. inspect a Markdown clarification/decision packet;
-13. copy that packet for a planner;
-14. see changed-file and Git status information;
-15. restart Relay without losing task/execution history.
-
-v0.1 must **not** automatically push code.
-
----
-
-## Documentation Map
-
-Start here:
-
-- [`docs/product-context.md`](docs/product-context.md)
-- [`docs/design-principles.md`](docs/design-principles.md)
-- [`docs/agentic-usage-efficiency.md`](docs/agentic-usage-efficiency.md)
-- [`docs/architecture.md`](docs/architecture.md)
-- [`docs/planner-integrations.md`](docs/planner-integrations.md)
-- [`docs/provider-support.md`](docs/provider-support.md) — planner-host support and installation matrix.
-- [`docs/planner-adapter-conformance.md`](docs/planner-adapter-conformance.md) — shared behavioral contract for every adapter.
-- [`docs/technology-stack.md`](docs/technology-stack.md)
-- [`docs/task-protocol.md`](docs/task-protocol.md)
-- [`docs/local-ingress.md`](docs/local-ingress.md) — local file and paste formats.
-- [`docs/installation.md`](docs/installation.md) — proposed future installation experience.
-- [`docs/first-run-setup.md`](docs/first-run-setup.md) — proposed setup wizard and onboarding flow.
-- [`docs/github-integration.md`](docs/github-integration.md) — local GitHub detection, compatibility ingress, and optional bindings.
-- [`docs/github-mailbox-setup.md`](docs/github-mailbox-setup.md) — user-owned private bootstrap mailbox setup and routing behavior.
-- [`docs/submission-and-bindings.md`](docs/submission-and-bindings.md) — submission transports, canonical local state, and optional external bindings.
-- [`docs/clarification-protocol.md`](docs/clarification-protocol.md)
-- [`docs/runtime-stack-model.md`](docs/runtime-stack-model.md)
-- [`docs/security-model.md`](docs/security-model.md)
-- [`docs/data-persistence.md`](docs/data-persistence.md)
-- [`docs/tui-ux.md`](docs/tui-ux.md)
-- [`docs/testing-quality.md`](docs/testing-quality.md)
-- [`docs/future-frontends.md`](docs/future-frontends.md)
-- [`docs/build-plan.md`](docs/build-plan.md)
-- [`docs/roadmap.md`](docs/roadmap.md)
-- [`docs/glossary.md`](docs/glossary.md)
-- [`contexts/PROJECT_CONTEXT.md`](contexts/PROJECT_CONTEXT.md)
-- [`integrations/planners/relay-handoff/`](integrations/planners/relay-handoff/) — provider-neutral planner specification and adapters.
-- [`integrations/planners/relay-handoff/adapters/chatgpt/`](integrations/planners/relay-handoff/adapters/chatgpt/) — first-class ChatGPT adapter.
-- [`integrations/planners/relay-handoff/adapters/claude-code/`](integrations/planners/relay-handoff/adapters/claude-code/) — experimental Claude Code adapter.
-- [`integrations/planners/relay-handoff/adapters/opencode/`](integrations/planners/relay-handoff/adapters/opencode/) — experimental OpenCode adapter.
-- [`integrations/planners/relay-handoff/adapters/github-copilot/`](integrations/planners/relay-handoff/adapters/github-copilot/) — experimental GitHub Copilot adapter.
-- [`ACKNOWLEDGMENTS.md`](ACKNOWLEDGMENTS.md) — open-source inspirations and attribution boundary.
-- [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) — notices for any future copied/vendored third-party material.
-- [`AGENTS.md`](AGENTS.md)
-- [`docs/adr/`](docs/adr/) — architecture decision records, including ADR-0015 for canonical local state and optional external bindings.
-
----
-
-## Open-Source Direction
-
-Relay begins private so the real workflow can be exercised before a public API is promised.
-
-The intention is to open-source it after the first end-to-end workflow, recovery model, security boundaries, and protocol have been proven in daily use.
-
-No license is granted by this repository until a license file is intentionally added.
-
----
-
-## One Rule to Remember
+## One rule to remember
 
 Before adding a feature, ask:
 
-> **Does this help a developer deliberately move approved intent from planning into execution, or safely complete that execution without silently changing the intent?**
-
-If not, it may belong in a stack, runtime extension, frontend, or another project.
+> **Does this help a developer deliberately move approved intent from planning
+> into execution, or safely complete that execution without silently changing
+> the intent?**

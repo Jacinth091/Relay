@@ -1,5 +1,11 @@
 # GitHub Integration
 
+> **Status: FUTURE / OPTIONAL — not implemented, not a v0.1 blocker.**
+> GitHub ingress was descoped from v0.1 by ADR-0016; Relay Direct/MCP
+> (`relay serve-mcp`) and local file/paste are the implemented submission
+> transports. This document is preserved as future compatibility and optional
+> external-binding design material.
+
 ## Principle
 
 Relay's GitHub integration is local Relay functionality. It must not depend on the selected planner host having its own GitHub connector.

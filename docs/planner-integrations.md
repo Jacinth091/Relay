@@ -81,21 +81,30 @@ Those differences belong at the adapter edge and may not change the canonical Re
 
 Every adapter supports local JSON/Markdown generation.
 
+Relay Direct / MCP (`relay serve-mcp`) is implemented and is the preferred
+submission transport when the planner host can register and call the local
+Relay MCP server. Host capability varies — this is a host limitation, not a
+Relay one:
+
+| Planner host class | Relay Direct | Fallback |
+|---|---|---|
+| Local CLI with stdio MCP support (Codex CLI, Claude Code, OpenCode) | Preferred | file/paste |
+| Desktop/IDE host with compatible local MCP support | Preferred | file/paste |
+| ChatGPT deployment with permitted compatible custom MCP | Available when the host/workspace supports it | file/paste |
+| ChatGPT deployment without usable custom MCP | Not available | file/paste |
+| Host with no MCP support | Not available | file/paste |
+
 For an explicit handoff, adapters prefer:
 
 ```text
-Relay Direct / Relay MCP
+Relay Direct / Relay MCP (implemented)
           |
           | unavailable
           v
-provider-native remote transport
-          |
-          | unavailable
-          v
-local file / paste
+local file / paste (hard fallback, always works)
 ```
 
-GitHub Issue creation by the planner is therefore a compatibility transport, not a universal requirement.
+GitHub Issue creation by the planner was descoped from v0.1 (ADR-0016) and is a future optional compatibility transport, not a requirement or current behavior.
 
 The adapter must never claim success when it could only format the task.
 

@@ -1,5 +1,11 @@
 # Security Model
 
+> **Architecture generation note:** this document describes the original (v1)
+> security model. Relay Architecture v2 (ADR-0020) is accepted and partially
+> implemented, including truthfulness requirements about what Relay actually
+> enforces vs. advises; see `docs/v2_architecture_rebaseline/` and
+> `docs/v2_architecture_rebaseline/ROADMAP.md` for current per-phase status.
+
 Relay launches coding tools that can modify local repositories.
 
 Security is a core feature.
@@ -209,3 +215,16 @@ Future commit/push support requires a separate ADR.
 External-process extensions are preferred over in-process dynamic libraries.
 
 They remain untrusted processes and require explicit installation/configuration.
+
+---
+
+## MCP Submission Surface
+
+`relay serve-mcp` is ingress-only: it can validate and persist handoffs, never
+execute anything. Client-facing error messages never carry local filesystem
+paths: local-file error variants are scrubbed to a generic message with full
+detail kept on stderr diagnostics only; registry/protocol errors surface keys
+and protocol facts, not paths. Legacy-era MCP requests are served leniently
+before `notifications/initialized` (the specifications do not gate client
+requests on initialize); the lifecycle state is tracked for diagnostics, and
+every submission still passes the same fail-closed validation as local import.

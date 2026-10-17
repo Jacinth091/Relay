@@ -5,8 +5,8 @@ use std::{
 };
 
 use relay_runtime::{
-    CancellationToken, ExecutionId, Runtime, RuntimeAction, RuntimeEvent, RuntimeOutcome,
-    RuntimeOutcomeKind, RuntimeOutputStream, RuntimeRequest, RuntimeTaskIntent,
+    CancellationToken, ExecutionId, Runtime, RuntimeAction, RuntimeControl, RuntimeEvent,
+    RuntimeOutcome, RuntimeOutcomeKind, RuntimeOutputStream, RuntimeRequest, RuntimeTaskIntent,
 };
 use relay_store::NewExecutionRecord;
 use serde_json::json;
@@ -17,6 +17,23 @@ use crate::{
     ProjectKey, Relay, RepositoryEligibility, SqliteStore, StoredTask, TaskId,
     TaskPersistenceError, TaskState, TrustedProject, get_stored_task,
 };
+
+use relay_runtime::RuntimePermissionEnvelope;
+use relay_runtime::{RuntimeExecutionSelection, RuntimeModelSelection, RuntimeReasoningSelection};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionRunPolicy {
+    pub runtime_selection: RuntimeExecutionSelection,
+    pub permission_envelope: RuntimePermissionEnvelope,
+    pub max_duration: Duration,
+    pub max_repair_attempts: u32,
+}
+
+impl ExecutionRunPolicy {
+    pub fn profile_id(&self) -> &str {
+        &self.runtime_selection.profile_id
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionLimits {
@@ -79,6 +96,7 @@ impl Default for ExecutionLimits {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum CoreExecutionEvent {
     ExecutionQueued {
         task_id: TaskId,
@@ -102,6 +120,16 @@ pub enum CoreExecutionEvent {
         stream: RuntimeOutputStream,
         byte_len: usize,
         bytes: Vec<u8>,
+    },
+    RuntimeActivity {
+        task_id: TaskId,
+        execution_id: ExecutionId,
+        activity: relay_runtime::RuntimeActivity,
+    },
+    PermissionRequested {
+        task_id: TaskId,
+        execution_id: ExecutionId,
+        request: relay_runtime::RuntimePermissionRequest,
     },
     SchedulerStatusChanged {
         task_id: TaskId,
@@ -205,6 +233,7 @@ pub struct SchedulerTaskSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchedulerTaskStatus {
     Running,
+    WaitingPermission,
     QueuedReady,
     QueuedGlobal,
     QueuedProject,
@@ -219,6 +248,10 @@ pub struct ExecutionScheduler<R: Runtime> {
     inner: Arc<Mutex<SchedulerInner>>,
     notify: Arc<Notify>,
     event_tx: broadcast::Sender<CoreExecutionEvent>,
+    permission_channels: Arc<Mutex<HashMap<TaskId, mpsc::Sender<RuntimeControl>>>>,
+    pending_permissions: Arc<Mutex<HashMap<TaskId, relay_runtime::RuntimePermissionRequest>>>,
+    permission_envelopes: Arc<Mutex<HashMap<TaskId, RuntimePermissionEnvelope>>>,
+    permission_execution_ids: Arc<Mutex<HashMap<TaskId, ExecutionId>>>,
 }
 
 #[derive(Debug, Default)]
@@ -232,6 +265,7 @@ struct SchedulerInner {
 struct QueuedExecution {
     task_id: TaskId,
     project_key: ProjectKey,
+    run_policy: ExecutionRunPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -251,11 +285,135 @@ impl<R: Runtime> ExecutionScheduler<R> {
             inner: Arc::new(Mutex::new(SchedulerInner::default())),
             notify: Arc::new(Notify::new()),
             event_tx,
+            permission_channels: Arc::new(Mutex::new(HashMap::new())),
+            pending_permissions: Arc::new(Mutex::new(HashMap::new())),
+            permission_envelopes: Arc::new(Mutex::new(HashMap::new())),
+            permission_execution_ids: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn limits(&self) -> &ExecutionLimits {
+        &self.limits
+    }
+
+    /// Deterministically plans an execution run from user intent.
+    ///
+    /// Loads the stored task and registered project, then delegates all policy
+    /// decisions (profile resolution, stack validation, limit clamping,
+    /// permission envelope construction) to [`crate::build_execution_plan`].
+    pub async fn plan_execution(
+        &self,
+        task_id: TaskId,
+        intent: crate::ExecutionPlanIntent,
+        environment: &crate::ExecutionPlanEnvironment,
+    ) -> Result<crate::ExecutionPlan, crate::ExecutionPlanningError> {
+        let stored = get_stored_task(&self.store, task_id)
+            .await?
+            .ok_or(crate::ExecutionPlanningError::TaskNotFound { task_id })?;
+        let project = self
+            .relay
+            .resolve_project(stored.project_key.as_str())
+            .map_err(|_| crate::ExecutionPlanningError::ProjectNotRegistered {
+                project_key: stored.project_key.as_str().to_owned(),
+            })?;
+        let fallback_profile_id = self.runtime.identity().profile_id.clone();
+        crate::build_execution_plan(
+            &stored,
+            project,
+            intent,
+            &self.limits,
+            environment,
+            &fallback_profile_id,
+        )
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<CoreExecutionEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Resolve a provider permission request for an active task.
+    pub async fn resolve_permission(
+        &self,
+        task_id: TaskId,
+        request_id: String,
+        grant: relay_runtime::RuntimePermissionGrant,
+    ) -> Result<(), ExecutionSchedulerError> {
+        let sender = self.permission_channels.lock().await.get(&task_id).cloned();
+        let Some(sender) = sender else {
+            return Err(ExecutionSchedulerError::TaskNotFound { task_id });
+        };
+        if let Some(request) = self.pending_permissions.lock().await.get(&task_id)
+            && request.request_id != request_id
+        {
+            return Err(ExecutionSchedulerError::InvalidLimit {
+                name: "permission request id mismatch",
+            });
+        }
+        let envelope = self
+            .permission_envelopes
+            .lock()
+            .await
+            .get(&task_id)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(request) = self.pending_permissions.lock().await.get(&task_id)
+            && ((!envelope.workspace_write && request.requested.workspace_write)
+                || (!envelope.network && request.requested.network)
+                || request.requested.paths.iter().any(|path| {
+                    let inside_workspace = envelope
+                        .trusted_workspace
+                        .as_ref()
+                        .map(|cwd| path.starts_with(cwd))
+                        .unwrap_or(false);
+                    let inside_extra = envelope
+                        .additional_writable_roots
+                        .iter()
+                        .any(|root| path.starts_with(root));
+                    !inside_workspace && !inside_extra
+                }))
+        {
+            return Err(ExecutionSchedulerError::InvalidLimit {
+                name: "permission exceeds trusted execution envelope",
+            });
+        }
+        if let Some(request) = self.pending_permissions.lock().await.get(&task_id) {
+            let decision_name = match grant.decision {
+                relay_runtime::RuntimePermissionDecision::AllowOnce => "allow_once",
+                relay_runtime::RuntimePermissionDecision::AllowForRun => "allow_for_run",
+                relay_runtime::RuntimePermissionDecision::Deny => "deny",
+                relay_runtime::RuntimePermissionDecision::Cancel => "cancel",
+            };
+            let payload = serde_json::json!({
+                "request_id": request.request_id,
+                "kind": format!("{:?}", request.kind),
+                "decision": decision_name,
+                "requested": request.requested,
+            });
+            self.store
+                .append_event(
+                    Some(&task_id.to_string()),
+                    self.permission_execution_ids
+                        .lock()
+                        .await
+                        .get(&task_id)
+                        .map(ToString::to_string)
+                        .as_deref(),
+                    "permission_decision",
+                    Some(&payload.to_string()),
+                )
+                .await
+                .map_err(|error| {
+                    ExecutionSchedulerError::TaskPersistence(TaskPersistenceError::Store(error))
+                })?;
+        }
+        self.send(CoreExecutionEvent::SchedulerStatusChanged {
+            task_id,
+            status: SchedulerTaskStatus::Running,
+        });
+        sender
+            .send(RuntimeControl::PermissionDecision { request_id, grant })
+            .await
+            .map_err(|_| ExecutionSchedulerError::TaskNotFound { task_id })
     }
 
     pub async fn snapshot(&self) -> SchedulerSnapshot {
@@ -265,7 +423,22 @@ impl<R: Runtime> ExecutionScheduler<R> {
         }
     }
 
-    pub async fn submit(&self, task_id: TaskId) -> Result<(), ExecutionSchedulerError> {
+    pub async fn submit_with_policy(
+        &self,
+        task_id: TaskId,
+        policy: ExecutionRunPolicy,
+    ) -> Result<(), ExecutionSchedulerError> {
+        if policy.max_duration > self.limits.max_duration {
+            return Err(ExecutionSchedulerError::InvalidLimit {
+                name: "max_duration exceeds scheduler ceiling",
+            });
+        }
+        if policy.max_repair_attempts > self.limits.max_repair_attempts {
+            return Err(ExecutionSchedulerError::InvalidLimit {
+                name: "max_repair_attempts exceeds scheduler ceiling",
+            });
+        }
+
         let stored = get_stored_task(&self.store, task_id)
             .await?
             .ok_or(ExecutionSchedulerError::TaskNotFound { task_id })?;
@@ -281,6 +454,7 @@ impl<R: Runtime> ExecutionScheduler<R> {
             let queued = QueuedExecution {
                 task_id,
                 project_key: stored.project_key.clone(),
+                run_policy: policy,
             };
             inner.queue.push_back(queued.clone());
             queued
@@ -299,6 +473,25 @@ impl<R: Runtime> ExecutionScheduler<R> {
         }
         self.notify.notify_waiters();
         Ok(())
+    }
+
+    pub async fn submit(&self, task_id: TaskId) -> Result<(), ExecutionSchedulerError> {
+        let policy = ExecutionRunPolicy {
+            runtime_selection: RuntimeExecutionSelection {
+                profile_id: self.runtime.identity().profile_id,
+                model: RuntimeModelSelection::ProviderDefault,
+                reasoning_effort: RuntimeReasoningSelection::ProfileDefault,
+            },
+            permission_envelope: RuntimePermissionEnvelope {
+                trusted_workspace: None,
+                workspace_write: !self.runtime.identity().profile_id.ends_with("/review"),
+                network: false,
+                additional_writable_roots: Vec::new(),
+            },
+            max_duration: self.limits.max_duration,
+            max_repair_attempts: self.limits.max_repair_attempts,
+        };
+        self.submit_with_policy(task_id, policy).await
     }
 
     pub async fn cancel(&self, task_id: TaskId) -> Result<(), ExecutionSchedulerError> {
@@ -417,10 +610,26 @@ impl<R: Runtime> ExecutionScheduler<R> {
             let limits = self.limits.clone();
             let event_tx = self.event_tx.clone();
             let completion_tx = completion_tx.clone();
+            let permission_channels = self.permission_channels.clone();
+            let pending_permissions = self.pending_permissions.clone();
+            let permission_envelopes = self.permission_envelopes.clone();
+            let permission_execution_ids = self.permission_execution_ids.clone();
 
             tokio::spawn(async move {
-                let report =
-                    run_task(relay, store, runtime, limits, event_tx, queued.0, queued.1).await;
+                let report = run_task(
+                    relay,
+                    store,
+                    runtime,
+                    limits,
+                    event_tx,
+                    permission_channels,
+                    pending_permissions,
+                    permission_envelopes,
+                    permission_execution_ids,
+                    queued.0,
+                    queued.1,
+                )
+                .await;
                 let _ = completion_tx.send(report).await;
             });
         }
@@ -501,12 +710,17 @@ impl SchedulerInner {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_task<R: Runtime>(
     relay: Relay,
     store: SqliteStore,
     runtime: Arc<R>,
     limits: ExecutionLimits,
     event_tx: broadcast::Sender<CoreExecutionEvent>,
+    permission_channels: Arc<Mutex<HashMap<TaskId, mpsc::Sender<RuntimeControl>>>>,
+    pending_permissions: Arc<Mutex<HashMap<TaskId, relay_runtime::RuntimePermissionRequest>>>,
+    permission_envelopes: Arc<Mutex<HashMap<TaskId, RuntimePermissionEnvelope>>>,
+    permission_execution_ids: Arc<Mutex<HashMap<TaskId, ExecutionId>>>,
     queued: QueuedExecution,
     cancellation: CancellationToken,
 ) -> ExecutionReport {
@@ -553,15 +767,28 @@ async fn run_task<R: Runtime>(
     }
 
     let execution_id = ExecutionId::new();
-    let identity = runtime.identity();
+    permission_execution_ids
+        .lock()
+        .await
+        .insert(queued.task_id, execution_id);
     let repository_snapshot_json = repository_snapshot(&preflight);
+    let mut envelope = queued.run_policy.permission_envelope.clone();
+    envelope.trusted_workspace = Some(preflight.project.local_path().to_path_buf());
+    let runtime_meta = serde_json::json!({
+        "provider": queued.run_policy.profile_id().split('/').next().unwrap_or("codex"),
+        "profile": queued.run_policy.profile_id(),
+        "model": queued.run_policy.runtime_selection.model.as_option().unwrap_or("default"),
+        "reasoning_effort": queued.run_policy.runtime_selection.reasoning_effort.as_option().map(|e| format!("{e:?}")).unwrap_or_else(|| "default".to_owned()),
+        "permission_envelope": &envelope,
+    });
     let claim = store
         .claim_ready_task_for_execution(&NewExecutionRecord {
             id: execution_id.to_string(),
             task_id: queued.task_id.to_string(),
-            runtime_profile: identity.profile_id.clone(),
+            runtime_profile: queued.run_policy.profile_id().to_owned(),
             phase: "running".to_owned(),
             repository_snapshot_json: Some(repository_snapshot_json),
+            runtime_metadata_json: Some(runtime_meta.to_string()),
         })
         .await;
 
@@ -587,6 +814,11 @@ async fn run_task<R: Runtime>(
         };
     }
 
+    permission_envelopes
+        .lock()
+        .await
+        .insert(queued.task_id, envelope);
+
     send(
         &event_tx,
         CoreExecutionEvent::ExecutionStarted {
@@ -596,7 +828,7 @@ async fn run_task<R: Runtime>(
         },
     );
 
-    let deadline = Instant::now() + limits.max_duration;
+    let deadline = Instant::now() + queued.run_policy.max_duration;
     let mut task_state = TaskState::Running;
     let mut repair_attempts = 0_u32;
     let mut action = RuntimeAction::Implement;
@@ -654,7 +886,8 @@ async fn run_task<R: Runtime>(
             },
             trusted_working_dir: preflight.project.local_path().to_path_buf(),
             action: action.clone(),
-            profile_id: identity.profile_id.clone(),
+            profile_id: queued.run_policy.profile_id().to_owned(),
+            runtime_selection: queued.run_policy.runtime_selection.clone(),
         };
 
         let outcome = match tokio::time::timeout(
@@ -667,6 +900,10 @@ async fn run_task<R: Runtime>(
                 queued.task_id,
                 execution_id,
                 &mut output,
+                permission_channels.clone(),
+                pending_permissions.clone(),
+                permission_envelopes.clone(),
+                permission_execution_ids.clone(),
             ),
         )
         .await
@@ -762,7 +999,7 @@ async fn run_task<R: Runtime>(
                     );
                 }
 
-                if repair_attempts >= limits.max_repair_attempts {
+                if repair_attempts >= queued.run_policy.max_repair_attempts {
                     return finish(
                         &store,
                         &event_tx,
@@ -934,6 +1171,7 @@ async fn run_task<R: Runtime>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn collect_runtime_events<R: Runtime>(
     runtime: Arc<R>,
     request: RuntimeRequest,
@@ -942,18 +1180,34 @@ async fn collect_runtime_events<R: Runtime>(
     task_id: TaskId,
     execution_id: ExecutionId,
     output: &mut BoundedOutputBuffer,
+    permission_channels: Arc<Mutex<HashMap<TaskId, mpsc::Sender<RuntimeControl>>>>,
+    pending_permissions: Arc<Mutex<HashMap<TaskId, relay_runtime::RuntimePermissionRequest>>>,
+    permission_envelopes: Arc<Mutex<HashMap<TaskId, RuntimePermissionEnvelope>>>,
+    permission_execution_ids: Arc<Mutex<HashMap<TaskId, ExecutionId>>>,
 ) -> RuntimeOutcome {
     let session = match runtime.start(request, cancellation.clone()).await {
         Ok(session) => session,
         Err(error) => {
+            permission_envelopes.lock().await.remove(&task_id);
+            permission_execution_ids.lock().await.remove(&task_id);
             return RuntimeOutcome::new(RuntimeOutcomeKind::RuntimeFailure, error.to_string());
         }
     };
     let mut events = session.events;
+    let provider_control = session.control;
+    let (decision_tx, mut decision_rx) = mpsc::channel(4);
+    permission_channels
+        .lock()
+        .await
+        .insert(task_id, decision_tx);
 
     loop {
         tokio::select! {
             () = cancellation.cancelled() => {
+                permission_channels.lock().await.remove(&task_id);
+                pending_permissions.lock().await.remove(&task_id);
+                permission_envelopes.lock().await.remove(&task_id);
+                permission_execution_ids.lock().await.remove(&task_id);
                 return RuntimeOutcome::new(RuntimeOutcomeKind::Cancelled, "execution cancelled");
             }
             event = events.recv() => {
@@ -969,11 +1223,89 @@ async fn collect_runtime_events<R: Runtime>(
                             bytes: retained_bytes,
                         });
                     }
-                    Some(RuntimeEvent::Outcome(outcome)) => return outcome,
+                    Some(RuntimeEvent::Activity(activity)) => {
+                        send(event_tx, CoreExecutionEvent::RuntimeActivity {
+                            task_id,
+                            execution_id,
+                            activity,
+                        });
+                    }
+                    Some(RuntimeEvent::Outcome(outcome)) => {
+                        permission_channels.lock().await.remove(&task_id);
+                        pending_permissions.lock().await.remove(&task_id);
+                        permission_envelopes.lock().await.remove(&task_id);
+                        permission_execution_ids.lock().await.remove(&task_id);
+                        return outcome
+                    },
                     Some(RuntimeEvent::InvalidOutput { reason }) => {
+                        permission_channels.lock().await.remove(&task_id);
+                        pending_permissions.lock().await.remove(&task_id);
+                        permission_envelopes.lock().await.remove(&task_id);
+                        permission_execution_ids.lock().await.remove(&task_id);
                         return RuntimeOutcome::new(RuntimeOutcomeKind::InvalidOutput, reason);
                     }
+                    Some(RuntimeEvent::PermissionRequested(request)) => {
+                        pending_permissions.lock().await.insert(task_id, request.clone());
+                        send(event_tx, CoreExecutionEvent::PermissionRequested {
+                            task_id,
+                            execution_id,
+                            request: request.clone(),
+                        });
+                        let decision = tokio::select! {
+                            () = cancellation.cancelled() => {
+                                permission_channels.lock().await.remove(&task_id);
+                                pending_permissions.lock().await.remove(&task_id);
+                                permission_envelopes.lock().await.remove(&task_id);
+                                permission_execution_ids.lock().await.remove(&task_id);
+                                return RuntimeOutcome::new(RuntimeOutcomeKind::Cancelled, "execution cancelled while waiting for permission");
+                            }
+                            decision = tokio::time::timeout(std::time::Duration::from_secs(5 * 60), decision_rx.recv()) => {
+                                match decision {
+                                    Ok(Some(decision)) => decision,
+                                    Ok(None) => {
+                                        permission_channels.lock().await.remove(&task_id);
+                                        pending_permissions.lock().await.remove(&task_id);
+                                        permission_envelopes.lock().await.remove(&task_id);
+                                        permission_execution_ids.lock().await.remove(&task_id);
+                                        return RuntimeOutcome::new(RuntimeOutcomeKind::NeedsDecision, "permission decision channel closed");
+                                    }
+                                    Err(_) => {
+                                        permission_channels.lock().await.remove(&task_id);
+                                        pending_permissions.lock().await.remove(&task_id);
+                                        permission_envelopes.lock().await.remove(&task_id);
+                                        permission_execution_ids.lock().await.remove(&task_id);
+                                        return RuntimeOutcome::new(RuntimeOutcomeKind::NeedsDecision, "permission request expired without approval");
+                                    }
+                                }
+                            }
+                        };
+                        let Some(control) = provider_control.as_ref() else {
+                            permission_channels.lock().await.remove(&task_id);
+                            pending_permissions.lock().await.remove(&task_id);
+                            permission_envelopes.lock().await.remove(&task_id);
+                            permission_execution_ids.lock().await.remove(&task_id);
+                            return RuntimeOutcome::new(RuntimeOutcomeKind::NeedsDecision, format!("Permission requested ({:?}) but runtime has no live approval channel", request.kind));
+                        };
+                        if control.send(decision).await.is_err() {
+                            permission_channels.lock().await.remove(&task_id);
+                            pending_permissions.lock().await.remove(&task_id);
+                            permission_envelopes.lock().await.remove(&task_id);
+                            permission_execution_ids.lock().await.remove(&task_id);
+                            return RuntimeOutcome::new(RuntimeOutcomeKind::NeedsDecision, "provider could not receive permission decision");
+                        }
+                        send(
+                            event_tx,
+                            CoreExecutionEvent::SchedulerStatusChanged {
+                                task_id,
+                                status: SchedulerTaskStatus::Running,
+                            },
+                        );
+                    }
                     None => {
+                        permission_channels.lock().await.remove(&task_id);
+                        pending_permissions.lock().await.remove(&task_id);
+                        permission_envelopes.lock().await.remove(&task_id);
+                        permission_execution_ids.lock().await.remove(&task_id);
                         return RuntimeOutcome::new(
                             RuntimeOutcomeKind::RuntimeFailure,
                             "runtime event stream ended without an outcome",
@@ -2065,6 +2397,7 @@ mod tests {
                 streaming_output: true,
                 cancellation: true,
                 deterministic_outcome: true,
+                permission_support: relay_runtime::RuntimePermissionSupport::PreapprovedOnly,
             }
         }
 
@@ -2100,6 +2433,7 @@ mod tests {
                 Ok(RuntimeSession {
                     session_id: "controlled-session".to_owned(),
                     events: rx,
+                    control: None,
                 })
             })
         }

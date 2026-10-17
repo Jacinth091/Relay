@@ -1,25 +1,48 @@
-use std::{fmt, fs, path::Path};
+use std::{fmt, fs, io::Read, path::Path};
 
 use relay_protocol::{
     HandoffTask, ProtocolError, parse_handoff_task_json, parse_handoff_task_markdown,
     parse_handoff_task_text,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{ProjectKey, ProjectRegistryError, Relay};
 
+/// Maximum accepted local task input size, in bytes, for both files and pastes.
+pub const MAX_LOCAL_TASK_INPUT_BYTES: u64 = 512 * 1024;
+
 /// Relay-owned task identity, separate from all planner and transport IDs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TaskId(Uuid);
+
+/// Namespace used to derive a stable [`TaskId`] from a daemon command id.
+/// Fixed and arbitrary; only required to be stable across process restarts.
+const TASK_ID_COMMAND_NAMESPACE: Uuid = Uuid::from_bytes(*b"RelayTaskIdNsV2!");
 
 impl TaskId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
 
+    pub fn generate() -> Self {
+        Self::new()
+    }
+
     pub fn parse(input: impl AsRef<str>) -> Result<Self, uuid::Error> {
         Uuid::parse_str(input.as_ref()).map(Self)
+    }
+
+    /// Derives a deterministic task id from a daemon command id, so that
+    /// replaying the same `SubmitHandoff` command (same command id) after a
+    /// crash or duplicate request always resolves to the same task instead
+    /// of minting a fresh random id on every `apply_command` call.
+    pub fn deterministic_from_command_id(command_id: &str) -> Self {
+        Self(Uuid::new_v5(
+            &TASK_ID_COMMAND_NAMESPACE,
+            command_id.as_bytes(),
+        ))
     }
 }
 
@@ -35,11 +58,12 @@ impl fmt::Display for TaskId {
     }
 }
 
-/// How a task was submitted to Relay locally.
+/// How a task was submitted to Relay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmissionTransport {
     LocalFile,
     LocalPaste,
+    RelayMcp,
 }
 
 impl SubmissionTransport {
@@ -47,6 +71,16 @@ impl SubmissionTransport {
         match self {
             Self::LocalFile => "local-file",
             Self::LocalPaste => "local-paste",
+            Self::RelayMcp => "relay-mcp",
+        }
+    }
+
+    pub fn parse(input: &str) -> Option<Self> {
+        match input {
+            "local-file" => Some(Self::LocalFile),
+            "local-paste" => Some(Self::LocalPaste),
+            "relay-mcp" => Some(Self::RelayMcp),
+            _ => None,
         }
     }
 }
@@ -79,8 +113,15 @@ impl TaskImportCandidate {
 
     /// Consumes a validated candidate and assigns Relay-owned task identity.
     pub fn into_imported_task(self) -> ImportedTask {
+        self.into_imported_task_with_id(TaskId::new())
+    }
+
+    /// Consumes a validated candidate and assigns a caller-supplied task
+    /// identity, used by the daemon command path so that replaying the same
+    /// command id is idempotent instead of minting a new random task id.
+    pub fn into_imported_task_with_id(self, id: TaskId) -> ImportedTask {
         ImportedTask {
-            id: TaskId::new(),
+            id,
             handoff: self.handoff,
             project_key: self.project_key,
             project_name: self.project_name,
@@ -130,6 +171,19 @@ pub enum TaskIngressError {
         path: String,
         source: std::io::Error,
     },
+    #[error("local task file '{path}' is not valid UTF-8")]
+    FileNotUtf8 {
+        path: String,
+        source: std::string::FromUtf8Error,
+    },
+    #[error(
+        "local task input is {actual} bytes, exceeding the maximum of {limit} bytes; reject rather than truncate"
+    )]
+    InputTooLarge { limit: u64, actual: u64 },
+    #[error(
+        "handoff extensions are not accepted through MCP submission; resubmit without extensions"
+    )]
+    ExtensionsNotAllowed,
     #[error("{0}")]
     Protocol(#[from] ProtocolError),
     #[error("{0}")]
@@ -141,6 +195,7 @@ impl Relay {
         &self,
         input: &str,
     ) -> Result<TaskImportCandidate, TaskIngressError> {
+        ensure_input_within_size_limit(input.len(), MAX_LOCAL_TASK_INPUT_BYTES)?;
         let handoff = parse_handoff_task_text(input)?;
         self.task_import_candidate(handoff, SubmissionTransport::LocalPaste)
     }
@@ -151,16 +206,76 @@ impl Relay {
     ) -> Result<TaskImportCandidate, TaskIngressError> {
         let path = path.as_ref();
         ensure_supported_local_task_extension(path)?;
-        let input = fs::read_to_string(path).map_err(|source| TaskIngressError::FileRead {
-            path: path.display().to_string(),
-            source,
-        })?;
+        let input = read_local_task_file(path)?;
         let handoff = parse_file_content(path, &input)?;
         self.task_import_candidate(handoff, SubmissionTransport::LocalFile)
     }
 
+    /// Validates a machine-initiated MCP `submit_handoff` payload inline.
+    ///
+    /// Per ADR-0016 the preview/confirm collapse happens at this transport
+    /// boundary: validation runs exactly as local paste ingress does (same
+    /// protocol parser, size cap, and project registry resolution), but the
+    /// human review moves to the TUI before Run. Non-empty extensions are
+    /// rejected here so remote submitters cannot smuggle extra namespaces.
+    pub fn preview_mcp_submission(
+        &self,
+        input: &str,
+    ) -> Result<TaskImportCandidate, TaskIngressError> {
+        ensure_input_within_size_limit(input.len(), MAX_LOCAL_TASK_INPUT_BYTES)?;
+        let handoff = parse_handoff_task_json(input)?;
+        if !handoff.extensions.is_empty() {
+            return Err(TaskIngressError::ExtensionsNotAllowed);
+        }
+        self.task_import_candidate(handoff, SubmissionTransport::RelayMcp)
+    }
+
+    /// Reconstructs a task import candidate from already-serialized handoff
+    /// JSON and its original submission transport.
+    ///
+    /// Used by the daemon command path: by the time a `SubmitHandoff`
+    /// command reaches `apply_command`, the client has already parsed and
+    /// validated the handoff (as a local file, paste, or MCP submission) and
+    /// serializes the resulting [`HandoffTask`] to canonical JSON. The daemon
+    /// never re-reads a client-supplied file path from disk; it only
+    /// re-resolves the project registry entry against its own state, exactly
+    /// as the original preview did.
+    pub(crate) fn resolve_task_import_candidate(
+        &self,
+        handoff_json: &str,
+        submission_transport: SubmissionTransport,
+    ) -> Result<TaskImportCandidate, TaskIngressError> {
+        ensure_input_within_size_limit(handoff_json.len(), MAX_LOCAL_TASK_INPUT_BYTES)?;
+
+        let handoff = match submission_transport {
+            SubmissionTransport::RelayMcp => {
+                let handoff = parse_handoff_task_json(handoff_json)?;
+                if !handoff.extensions.is_empty() {
+                    return Err(TaskIngressError::ExtensionsNotAllowed);
+                }
+                handoff
+            }
+            SubmissionTransport::LocalFile | SubmissionTransport::LocalPaste => {
+                parse_handoff_task_text(handoff_json)?
+            }
+        };
+
+        self.task_import_candidate(handoff, submission_transport)
+    }
+
     pub fn confirm_task_import(&mut self, candidate: TaskImportCandidate) -> &ImportedTask {
         self.accept_imported_task(candidate.into_imported_task())
+    }
+
+    /// Records a candidate as reviewed under a caller-supplied task id, for
+    /// callers (the daemon command path) that already know the durable task
+    /// id independently and must not mint a second, different one locally.
+    pub fn accept_imported_task_with_id(
+        &mut self,
+        candidate: TaskImportCandidate,
+        id: TaskId,
+    ) -> &ImportedTask {
+        self.accept_imported_task(candidate.into_imported_task_with_id(id))
     }
 
     pub(crate) fn accept_imported_task(&mut self, imported: ImportedTask) -> &ImportedTask {
@@ -189,6 +304,38 @@ impl Relay {
             submission_transport,
         })
     }
+}
+
+fn ensure_input_within_size_limit(actual: usize, limit: u64) -> Result<(), TaskIngressError> {
+    let actual = actual as u64;
+    if actual > limit {
+        Err(TaskIngressError::InputTooLarge { limit, actual })
+    } else {
+        Ok(())
+    }
+}
+
+fn read_local_task_file(path: &Path) -> Result<String, TaskIngressError> {
+    let display = path.display().to_string();
+    let read_error = |source| TaskIngressError::FileRead {
+        path: display.clone(),
+        source,
+    };
+    let mut file = fs::File::open(path).map_err(read_error)?;
+    let metadata = file.metadata().map_err(read_error)?;
+    ensure_input_within_size_limit(metadata.len() as usize, MAX_LOCAL_TASK_INPUT_BYTES)?;
+
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(MAX_LOCAL_TASK_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(read_error)?;
+    ensure_input_within_size_limit(bytes.len(), MAX_LOCAL_TASK_INPUT_BYTES)?;
+
+    String::from_utf8(bytes).map_err(|source| TaskIngressError::FileNotUtf8 {
+        path: display,
+        source,
+    })
 }
 
 fn ensure_supported_local_task_extension(path: &Path) -> Result<(), TaskIngressError> {
@@ -287,7 +434,7 @@ mod tests {
     #[test]
     fn invalid_project_key_and_filesystem_project_strings_fail() {
         let relay = relay_with_project("relay");
-        for project in ["../relay", "C:/Users/PCC/Relay", "/tmp/relay"] {
+        for project in ["../relay", "C:/Users/example/Relay", "/tmp/relay"] {
             let json = TASK_JSON.replace(
                 "\"project\": \"Relay\"",
                 &format!("\"project\": \"{project}\""),
@@ -393,6 +540,109 @@ mod tests {
 
         assert_eq!(candidate.project_key().as_str(), "relay");
         assert!(relay.inspect_project_repository("relay").is_ok());
+    }
+
+    #[test]
+    fn oversized_paste_fails_closed_without_truncation() {
+        let relay = relay_with_project("relay");
+        let padding = "x".repeat(MAX_LOCAL_TASK_INPUT_BYTES as usize);
+        let json = TASK_JSON.replace("Do not mutate Git.", &padding);
+        assert!(json.len() as u64 > MAX_LOCAL_TASK_INPUT_BYTES);
+
+        let error = relay.preview_local_paste(&json).unwrap_err();
+
+        assert!(matches!(
+            error,
+            TaskIngressError::InputTooLarge { limit, actual }
+                if limit == MAX_LOCAL_TASK_INPUT_BYTES && actual == json.len() as u64
+        ));
+    }
+
+    #[test]
+    fn paste_exactly_at_size_limit_is_accepted() {
+        let relay = relay_with_project("relay");
+        let padding = " ".repeat((MAX_LOCAL_TASK_INPUT_BYTES as usize) - TASK_JSON.len());
+        let padded = format!("{padding}{TASK_JSON}");
+        assert_eq!(padded.len() as u64, MAX_LOCAL_TASK_INPUT_BYTES);
+
+        let candidate = relay.preview_local_paste(&padded).unwrap();
+
+        assert_eq!(candidate.project_key().as_str(), "relay");
+    }
+
+    #[test]
+    fn oversized_local_file_fails_closed() {
+        let relay = relay_with_project("relay");
+        let file = temp_path("oversized.relay.json");
+        fs::write(&file, vec![b' '; (MAX_LOCAL_TASK_INPUT_BYTES + 1) as usize]).unwrap();
+
+        let error = relay.preview_local_file(&file).unwrap_err();
+
+        assert!(matches!(
+            error,
+            TaskIngressError::InputTooLarge { limit, .. }
+                if limit == MAX_LOCAL_TASK_INPUT_BYTES
+        ));
+    }
+
+    #[test]
+    fn mcp_submission_accepts_canonical_payload_with_relay_mcp_provenance() {
+        let relay = relay_with_project("relay");
+
+        let candidate = relay.preview_mcp_submission(TASK_JSON).unwrap();
+
+        assert_eq!(candidate.project_key().as_str(), "relay");
+        assert_eq!(
+            candidate.submission_transport(),
+            SubmissionTransport::RelayMcp
+        );
+        assert_eq!(SubmissionTransport::RelayMcp.as_str(), "relay-mcp");
+    }
+
+    #[test]
+    fn mcp_submission_rejects_non_empty_extensions_at_the_boundary() {
+        let relay = relay_with_project("relay");
+        let json = TASK_JSON.replace(
+            "\"ambiguity_policy\": \"needs_clarification\"",
+            "\"extensions\": {\"vendor\": {\"x\": 1}}, \"ambiguity_policy\": \"needs_clarification\"",
+        );
+
+        let error = relay.preview_mcp_submission(&json).unwrap_err();
+
+        assert!(matches!(error, TaskIngressError::ExtensionsNotAllowed));
+    }
+
+    #[test]
+    fn empty_extensions_stay_valid_on_both_paths() {
+        let relay = relay_with_project("relay");
+        let json = TASK_JSON.replace(
+            "\"ambiguity_policy\": \"needs_clarification\"",
+            "\"extensions\": {}, \"ambiguity_policy\": \"needs_clarification\"",
+        );
+
+        assert!(relay.preview_local_paste(&json).is_ok());
+        assert!(relay.preview_mcp_submission(&json).is_ok());
+    }
+
+    #[test]
+    fn mcp_submission_rejects_markdown_framing() {
+        let relay = relay_with_project("relay");
+        let markdown = format!(
+            "<!-- relay:task:start -->\n```json\n{TASK_JSON}\n```\n<!-- relay:task:end -->"
+        );
+
+        assert!(relay.preview_mcp_submission(&markdown).is_err());
+    }
+
+    #[test]
+    fn mcp_submission_rejects_oversized_payload() {
+        let relay = relay_with_project("relay");
+        let padding = "x".repeat(MAX_LOCAL_TASK_INPUT_BYTES as usize);
+        let json = TASK_JSON.replace("Do not mutate Git.", &padding);
+
+        let error = relay.preview_mcp_submission(&json).unwrap_err();
+
+        assert!(matches!(error, TaskIngressError::InputTooLarge { .. }));
     }
 
     fn relay_with_project(key: &str) -> Relay {

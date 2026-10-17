@@ -116,6 +116,54 @@ authenticated by you.
 
 ---
 
+## Install (Windows, one line)
+
+> **Availability:** this installer works once the repository is public and a
+> non-prerelease release is listed on the
+> [Releases page](https://github.com/Jacinth091/Relay/releases). Until then, use
+> the manual download, `cargo install`, or build from source below; the commands
+> in this section will not resolve yet.
+
+```powershell
+irm https://raw.githubusercontent.com/Jacinth091/Relay/main/install.ps1 | iex
+```
+
+This installs the latest stable release to `%LOCALAPPDATA%\Programs\Relay`,
+verifies its SHA-256 checksum before installing anything, and adds that folder to
+your **user** `PATH`. Open a new terminal and run `relay`.
+
+- **Upgrade:** run the same command again.
+- **Uninstall:** removes the program and its `PATH` entry. Your data in
+  `%APPDATA%\Relay` is kept.
+
+  ```powershell
+  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Jacinth091/Relay/main/install.ps1))) -Uninstall
+  ```
+
+- **Options:** `irm ... | iex` cannot pass parameters, so use the scriptblock form
+  for them: `-IncludePrerelease` (allows `rc` builds), `-Version v0.1.0` (pins one
+  tag), `-InstallDir <path>`.
+
+  ```powershell
+  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Jacinth091/Relay/main/install.ps1))) -IncludePrerelease
+  ```
+
+- **Inspect first (recommended if you do not know the script):** download it, read
+  it, then run it.
+
+  ```powershell
+  irm https://raw.githubusercontent.com/Jacinth091/Relay/main/install.ps1 -OutFile install.ps1
+  notepad .\install.ps1
+  .\install.ps1
+  ```
+
+The installer does not install a provider CLI (for example Codex); see
+[What the package does not include](#what-the-package-does-not-include). It is
+Windows x86_64 only. A private repository needs a `GITHUB_TOKEN` environment
+variable with read access.
+
+---
+
 ## Download a release (Windows x86_64)
 
 > **A release exists only if one is listed on the

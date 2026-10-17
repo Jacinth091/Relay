@@ -1,21 +1,12 @@
 # Installation
 
 > [!NOTE]
-> Relay is a source-buildable experimental prototype. **No release is published
-> yet, so the one-line installer below cannot resolve a package yet.** A release package is produced by
-> [`.github/workflows/release.yml`](../.github/workflows/release.yml) when the
-> maintainer pushes a version tag (`v*`), so whether a download exists is a fact
-> about the
-> [Releases page](https://github.com/Jacinth091/Relay/releases) — check it there,
-> and expect it to be empty until the first version tag is pushed. Until a release
-> is listed, build from source (below) or
+> Relay is an experimental prototype. The current release is **v0.1.0**, listed
+> on the [Releases page](https://github.com/Jacinth091/Relay/releases). You can
+> also build from source (below) or run
 > `cargo install --git https://github.com/Jacinth091/Relay --locked relay-tui`.
 
-## One-line installer (Windows, after a release is published)
-
-Works once the repository is public and a non-prerelease release is listed on the
-Releases page. Until then it fails to find a release; use the other paths on this
-page.
+## One-line installer (Windows)
 
 ```powershell
 irm https://raw.githubusercontent.com/Jacinth091/Relay/main/install.ps1 | iex
@@ -52,7 +43,7 @@ A coding-agent CLI, API key, hosted service, or GitHub mailbox is **not**
 required to build, test, or start the TUI. Executing a real provider run
 additionally requires that provider's CLI, installed and authenticated by you.
 
-## Prebuilt releases (only when one is listed)
+## Prebuilt releases
 
 The release workflow
 ([`.github/workflows/release.yml`](../.github/workflows/release.yml)) builds and
@@ -68,17 +59,16 @@ Windows x86_64 is the only platform built today; there is no Linux or macOS
 package, no installer, and no package-manager entry. A tag containing `-` (for
 example `v0.1.0-rc.1`) is published as a **prerelease**.
 
-If the Releases page lists a release, download the zip and its `.sha256` file,
-verify the checksum, unzip it and run `relay.exe` from Windows Terminal or
-PowerShell. The full walkthrough — checksum verification, the SmartScreen prompt
+Download the zip and its `.sha256` file from the Releases page (v0.1.0 is the
+latest non-prerelease), verify the checksum, unzip it and run `relay.exe` from
+Windows Terminal or PowerShell. The full walkthrough — checksum verification, the SmartScreen prompt
 for an unsigned binary, and adding the folder to `PATH` — is in
 [README.md](../README.md#download-a-release-windows-x86_64). Running real work
 still requires your provider's CLI (for example Codex) installed and
 authenticated separately.
 
-> **No prebuilt release exists yet.** None of the asset names above can be
-> assumed to resolve until the Releases page shows one. Do not document an
-> installer command as working until it is actually published and tested.
+> Do not document an installer or asset name as working unless it is actually
+> published on the Releases page and tested.
 
 ## Goal
 

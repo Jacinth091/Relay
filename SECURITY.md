@@ -25,12 +25,8 @@ private repository content, or non-public data.
 Preferred channel: GitHub **private vulnerability reporting** for this
 repository (the repository's **Security** tab, then **Report a vulnerability**).
 
-> Maintainer note: GitHub private vulnerability reporting is only available for
-> public repositories, so it can only be enabled *after* the repository is made
-> public. Enable it immediately after publication and confirm this document
-> matches the enabled reporting path. Until then, and as a fallback if the
-> button is unavailable, use a private channel you already share with the
-> maintainer rather than posting details publicly.
+If that button is unavailable, use a private channel you already share with the
+maintainer rather than posting details publicly.
 
 There is no obligation to publish a personal address, and no guaranteed fix,
 disclosure, or response timeline.

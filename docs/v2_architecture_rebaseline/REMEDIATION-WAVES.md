@@ -214,8 +214,9 @@ The governed re-review of the R18 head (`d980cfe`) confirmed the R18 corrections
 (R18-01 and R18-02 **CLOSED**) but returned **BLOCK / RETURN TO DEV**: three
 further authority/lifecycle paths contradicted the single-writer and
 truthful-startup contract. R19 lands on `fix/v2-pr16-r19-authority` off
-`staging` (fix commit `ddafeb7`), with no R12-02 / Wave B work mixed in. All
-three were reproduced in source before any change.
+`staging` (fix commit `1e66e87`, merged via PR #24 as `4ef5070`; rewritten
+before merge from `ddafeb7` with an identical tree), with no R12-02 / Wave B
+work mixed in. All three were reproduced in source before any change.
 
 - **FLOW-19-01 (effect-worker writes — an adjacent, reachable ledger)** — the
   daemon's effect worker mutated the same canonical `pending_effects` /

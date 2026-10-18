@@ -46,7 +46,7 @@ use relay_runtime::{
     EffectKey, LaunchSpecification, RuntimeBackplane, RuntimeProvisionRequest, SanitizedEnvironment,
 };
 use relay_runtime_fake::{FakeBackplane, FakeProcessBehavior};
-use relay_store::DaemonFence;
+use relay_store::{DaemonFence, NewTaskRecord};
 
 const IMPLEMENTER: &str = "relay-implementer";
 const VERIFIER: &str = "relay-verifier";
@@ -205,6 +205,39 @@ async fn lease_fence(store: &SqliteStore, lease_id: &str, pid: i64) -> DaemonFen
         holder_instance: lease.holder_instance,
         fencing_token: lease.fencing_token,
     }
+}
+
+/// Seeds the durable task row a Run path needs.
+///
+/// Production persists the task when the handoff is imported; the direct
+/// orchestrator fixtures below build the task in memory, so they must write the
+/// parent row themselves. `workflow_runs.task_id` references `tasks(id)`, so the
+/// row must use the task's own id.
+async fn persist_task_row(store: &SqliteStore, task: &StoredTask, fence: &DaemonFence) {
+    let record = NewTaskRecord {
+        id: task.id.to_string(),
+        project_key: task.project_key.as_str().to_owned(),
+        title: task.handoff.title.clone(),
+        requested_stack: task.handoff.stack.clone(),
+        submission_transport: task.submission_transport.as_str().to_owned(),
+        source_kind: task
+            .handoff
+            .source
+            .as_ref()
+            .map(|source| source.kind.clone()),
+        source_provider: task
+            .handoff
+            .source
+            .as_ref()
+            .map(|source| source.provider.clone()),
+        state: task.state.as_str().to_owned(),
+        protocol_version: i64::from(task.handoff.protocol_version),
+        handoff_json: serde_json::to_string(&task.handoff).unwrap(),
+    };
+    store
+        .insert_task_if_absent_fenced(&record, fence)
+        .await
+        .unwrap();
 }
 
 /// Submits a daemon command and returns the raw response.
@@ -557,6 +590,7 @@ async fn orchestrator_fixture(
     let fence = lease_fence(&store, &format!("lease-{name}"), 7001).await;
 
     let task = sample_task();
+    persist_task_row(&store, &task, &fence).await;
     let intent = adapt_v1_handoff_to_approved_intent(&task, "operator-alice").unwrap();
     let (_grant, workflow_run, _snapshot) =
         create_v1_compatibility_run(&task, &intent, budget(), "operator-alice").unwrap();
@@ -693,6 +727,7 @@ async fn restart_reconciliation_uses_the_recorded_runtime_handle() {
     let fence = lease_fence(&store, "lease-waveb-restart", 7002).await;
 
     let task = sample_task();
+    persist_task_row(&store, &task, &fence).await;
     let intent = adapt_v1_handoff_to_approved_intent(&task, "operator-alice").unwrap();
     let (_grant, workflow_run, _snapshot) =
         create_v1_compatibility_run(&task, &intent, budget(), "operator-alice").unwrap();

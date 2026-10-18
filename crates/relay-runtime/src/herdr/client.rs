@@ -21,6 +21,10 @@ use thiserror::Error;
 pub enum HerdrClientError {
     #[error("transport error: {0}")]
     Transport(String),
+    #[error("Herdr executable not found: {0}")]
+    ExecutableNotFound(String),
+    #[error("Herdr command error ({code}): {message}")]
+    CommandError { code: String, message: String },
     #[error(
         "incompatible protocol version: server reported {server_version}, expected minimum {expected_min}"
     )]

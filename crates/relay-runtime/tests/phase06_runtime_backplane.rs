@@ -331,6 +331,19 @@ async fn test_local_process_backplane_child_sees_only_sanitized_environment() {
         stdout.contains("PATH="),
         "allow-listed PATH should be inherited: {stdout}"
     );
+    #[cfg(windows)]
+    {
+        let expected_system_root = format!(
+            "SystemRoot={}",
+            std::env::var("SystemRoot").expect("Windows SystemRoot should be set")
+        );
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case(&expected_system_root)),
+            "allow-listed SystemRoot should be inherited: {stdout}"
+        );
+    }
 
     let _ = backplane.dispose(&handle).await;
 }
@@ -366,7 +379,7 @@ async fn test_local_process_backplane_dispose_kills_grandchild() {
 
     // Wait for the child to publish its grandchild's PID.
     let mut grandchild_pid = None;
-    for _ in 0..100 {
+    for _ in 0..600 {
         if let Ok(text) = fs::read_to_string(&pid_file) {
             if let Ok(pid) = text.trim().parse::<u32>() {
                 grandchild_pid = Some(pid);
@@ -375,7 +388,21 @@ async fn test_local_process_backplane_dispose_kills_grandchild() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    let grandchild_pid = grandchild_pid.expect("grandchild PID was never published");
+    let grandchild_pid = if let Some(pid) = grandchild_pid {
+        pid
+    } else {
+        match backplane.observe(&handle).await {
+            Ok(observation) => panic!(
+                "grandchild PID was never published; child status: {:?}; stdout: {}; stderr: {}",
+                observation.status,
+                String::from_utf8_lossy(&observation.stdout_chunk),
+                String::from_utf8_lossy(&observation.stderr_chunk)
+            ),
+            Err(error) => {
+                panic!("grandchild PID was never published; observing child failed: {error}")
+            }
+        }
+    };
 
     assert!(
         process_is_alive(grandchild_pid).await,

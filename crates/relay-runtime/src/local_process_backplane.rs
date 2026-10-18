@@ -25,13 +25,14 @@ use crate::process_tree::{
     ProcessIdentity, process_identity, terminate_pid_tree, terminate_process_tree,
 };
 
-/// OS-provided environment variables that are copied from the parent process.
+/// Standard non-secret OS plumbing inherited by local provider processes.
 ///
-/// The child environment starts cleared; these names alone are inherited
-/// because a process cannot start without them (Windows in particular needs
-/// `SystemRoot`, `windir` and `PATH`). Every other parent variable is dropped.
-/// A name present in the request's sanitized vars overrides the inherited value.
-const PARENT_ENV_ALLOW_LIST: [&str; 14] = [
+/// The child environment starts cleared so arbitrary parent variables cannot
+/// leak. This list preserves OS paths, shell and module lookup, and machine and
+/// user identity values needed by Windows, PowerShell, and common local CLIs to
+/// start. Every other parent variable is dropped. Request-sanitized variables
+/// override inherited values.
+const PARENT_ENV_ALLOW_LIST: [&str; 34] = [
     "SystemRoot",
     "SYSTEMDRIVE",
     "windir",
@@ -46,6 +47,26 @@ const PARENT_ENV_ALLOW_LIST: [&str; 14] = [
     "HOME",
     "USER",
     "LANG",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "ProgramData",
+    "CommonProgramFiles",
+    "CommonProgramFiles(x86)",
+    "CommonProgramW6432",
+    "PSModulePath",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "NUMBER_OF_PROCESSORS",
+    "OS",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "USERNAME",
+    "USERDOMAIN",
+    "COMPUTERNAME",
+    "PUBLIC",
+    "ALLUSERSPROFILE",
+    "SystemDrive",
 ];
 
 fn now_timestamp() -> String {

@@ -218,7 +218,7 @@ fn build_launch_produces_explicit_executable_and_args_no_shell_text() {
 }
 
 #[test]
-fn mock_adapter_interprets_waiting_for_user_marker() {
+fn mock_adapter_interprets_waiting_for_user_marker_and_rejects_bare_exit_zero() {
     let adapter = MockProviderAdapter::new("mock", implementer_caps());
     let obs = RuntimeObservation {
         handle_id: "handle-2".to_owned(),
@@ -232,15 +232,21 @@ fn mock_adapter_interprets_waiting_for_user_marker() {
         ProviderReadiness::WaitingForUser
     );
 
-    let obs_success = RuntimeObservation {
+    // Exit 0 alone is not a role result: with no typed envelope on stdout this
+    // is a provider error, never `ResultPublished` (R12-11).
+    let obs_exit_zero = RuntimeObservation {
         handle_id: "handle-2".to_owned(),
         status: ProcessStatus::ExitedSuccess { exit_code: 0 },
         stdout_chunk: vec![],
         stderr_chunk: vec![],
         total_bytes_captured: 0,
     };
-    assert_eq!(
-        adapter.interpret_observation(&obs_success),
-        ProviderReadiness::ResultPublished
+    assert!(
+        matches!(
+            adapter.interpret_observation(&obs_exit_zero),
+            ProviderReadiness::ProviderError { .. }
+        ),
+        "a provider process that exited 0 without publishing a typed result \
+         must not be reported as result-published"
     );
 }

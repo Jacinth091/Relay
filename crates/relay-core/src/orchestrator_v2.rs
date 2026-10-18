@@ -25,10 +25,9 @@ use std::{collections::HashSet, path::Path, sync::Arc};
 
 use relay_runtime::{
     EffectKey, LaunchSpecification, ProcessStatus, ReconcileOutcome, RuntimeBackplane,
-    RuntimeHandle, RuntimeObservation, RuntimeProvisionRequest, SanitizedEnvironment,
+    RuntimeHandle, RuntimeProvisionRequest, SanitizedEnvironment,
 };
 use relay_store::{DaemonFence, StoreError};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
@@ -89,86 +88,13 @@ impl OrchestratorError {
     }
 }
 
-/// The typed result a role process must publish on stdout for its attempt to
-/// be accepted. Process exit success alone is never sufficient: exit status
-/// says a process ended, not that the role produced anything usable.
-///
-/// Wire form is one JSON object on its own line of stdout:
-///
-/// ```text
-/// {"role_result":"implemented","detail":"..."}
-/// {"role_result":"verification_passed"}
-/// {"role_result":"verification_failed","reason":"..."}
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "role_result", rename_all = "snake_case")]
-pub enum RoleResultPayload {
-    Implemented { detail: String },
-    VerificationPassed,
-    VerificationFailed { reason: String },
-}
-
-impl RoleResultPayload {
-    /// Stable name used in diagnostics and in "wrong role" rejections.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Implemented { .. } => "implemented",
-            Self::VerificationPassed => "verification_passed",
-            Self::VerificationFailed { .. } => "verification_failed",
-        }
-    }
-}
-
-/// Why an observation could not be accepted as a typed role result.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResultDefect {
-    /// The process published no recognizable result object at all.
-    Missing,
-    /// A result object was present but violated the contract, or belonged to a
-    /// different role than the one that produced it.
-    Malformed(String),
-}
-
-/// A role result as published, kept alongside the exact bytes the process
-/// wrote so the resulting artifact stores the observation rather than a
-/// summary the orchestrator invented.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublishedRoleResult {
-    pub payload: RoleResultPayload,
-    pub raw: String,
-}
-
-/// Extracts the typed role result a process published on stdout.
-pub fn observed_role_result(
-    observation: &RuntimeObservation,
-) -> Result<PublishedRoleResult, ResultDefect> {
-    let stdout = String::from_utf8_lossy(&observation.stdout_chunk);
-
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if value.get("role_result").is_none() {
-            continue;
-        }
-
-        return match serde_json::from_value::<RoleResultPayload>(value) {
-            Ok(payload) => Ok(PublishedRoleResult {
-                payload,
-                raw: line.to_owned(),
-            }),
-            Err(error) => Err(ResultDefect::Malformed(format!(
-                "result object does not satisfy the role result contract: {error}"
-            ))),
-        };
-    }
-
-    Err(ResultDefect::Missing)
-}
+// The typed role-result contract lives in the runtime layer (see
+// `relay_runtime::role_result`), so provider adapters and this orchestrator
+// share exactly one parser. It is re-exported here to preserve the historical
+// `relay_core::orchestrator_v2::*` public paths.
+pub use relay_runtime::{
+    PublishedRoleResult, ResultDefect, RoleResultPayload, observed_role_result,
+};
 
 /// Inputs shared by every role phase of one workflow run.
 #[derive(Clone, Copy)]

@@ -331,6 +331,7 @@ pub mod local_process_backplane;
 mod profile;
 mod provider;
 mod resolver;
+mod role_result;
 mod router;
 pub mod sanitizer;
 
@@ -342,5 +343,6 @@ pub use local_process_backplane::*;
 pub use profile::*;
 pub use provider::*;
 pub use resolver::*;
+pub use role_result::*;
 pub use router::*;
 pub use sanitizer::*;

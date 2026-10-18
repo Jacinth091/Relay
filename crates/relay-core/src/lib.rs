@@ -116,7 +116,10 @@ pub use legacy_adapter::{
     LegacyAdapterError, adapt_v1_handoff_to_approved_intent, create_v1_compatibility_run,
     v1_compatibility_workflow_definition,
 };
-pub use orchestrator_v2::{OrchestratorError, OrchestratorV2, PhaseContext};
+pub use orchestrator_v2::{
+    OrchestratorError, OrchestratorV2, PhaseContext, PublishedRoleResult, ResultDefect,
+    RoleResultPayload, observed_role_result,
+};
 pub use policy::{
     Capability, EnforcementClass, PolicyCompiler, PolicyDecision, PolicyDisposition, PolicyLayer,
     built_in_safety_floor,

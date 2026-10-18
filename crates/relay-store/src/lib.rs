@@ -180,6 +180,109 @@ pub struct ResourceLeaseRecord {
     pub state: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewWorkflowRunRecord {
+    pub id: String,
+    pub task_id: String,
+    pub execution_grant_id: String,
+    pub workflow_definition_id: String,
+    pub state: String,
+    pub config_snapshot_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRunRecord {
+    pub id: String,
+    pub task_id: String,
+    pub execution_grant_id: String,
+    pub workflow_definition_id: String,
+    pub state: String,
+    pub config_snapshot_id: String,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    /// The approved intent this run executes, as JSON. Empty only for rows that
+    /// predate authority capture (migration 0012).
+    pub approved_intent_json: String,
+    /// The execution grant derived from `approved_intent_json`, as JSON.
+    pub execution_grant_json: String,
+    /// The frozen configuration snapshot the run was approved under, as JSON.
+    pub config_snapshot_json: String,
+}
+
+/// Everything one atomic Run approval writes: the workflow run (including the
+/// authority it executes under), the task's `ready -> running` transition, and
+/// the single `workflow_run_started` event.
+///
+/// These belong to one transaction because they are one fact. Split into
+/// separate writes, a crash between them leaves a run whose task is still
+/// `ready` (or a task marked `running` with no run), and a replay of the same
+/// command cannot tell whether it is fixing that state or duplicating it.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkflowRunStart<'a> {
+    pub run: &'a NewWorkflowRunRecord,
+    pub approved_intent_json: &'a str,
+    pub execution_grant_json: &'a str,
+    pub config_snapshot_json: &'a str,
+    pub task_expected_state: &'a str,
+    pub task_new_state: &'a str,
+    pub event_kind: &'a str,
+    pub event_json: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewRoleInstanceRecord {
+    pub id: String,
+    pub workflow_run_id: String,
+    pub role_definition_id: String,
+    pub generation: i64,
+    pub state: String,
+    pub parent_role_instance_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleInstanceRecord {
+    pub id: String,
+    pub workflow_run_id: String,
+    pub role_definition_id: String,
+    pub generation: i64,
+    pub state: String,
+    pub parent_role_instance_id: Option<String>,
+    pub accepted_result_artifact: Option<String>,
+    pub attempts_count: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewRoleAttemptRecord {
+    pub id: String,
+    pub role_instance_id: String,
+    pub attempt_no: i64,
+    pub execution_target_json: String,
+    pub state: String,
+    pub lease_id: Option<String>,
+    pub fencing_token: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleAttemptRecord {
+    pub id: String,
+    pub role_instance_id: String,
+    pub attempt_no: i64,
+    pub execution_target_json: String,
+    pub state: String,
+    pub lease_id: Option<String>,
+    pub fencing_token: Option<i64>,
+    pub runtime_outcome: Option<String>,
+    pub result_artifact_id: Option<String>,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub runtime_handle_id: Option<String>,
+    pub runtime_backplane_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
@@ -424,6 +527,47 @@ impl SqliteStore {
             self.append_event_once(task_id, execution_id, event_kind, event_json)
         })
         .await
+    }
+
+    /// Fenced variant of [`SqliteStore::append_event`] used by the daemon-owned
+    /// v2 workflow driver, whose writes are not command-handler writes.
+    ///
+    /// The authority assertion shares the event's transaction, so a stale
+    /// daemon cannot append a workflow event after a successor took the lease.
+    pub async fn append_event_fenced(
+        &self,
+        task_id: Option<&str>,
+        execution_id: Option<&str>,
+        event_kind: &str,
+        event_json: Option<&str>,
+        fence: &DaemonFence,
+    ) -> Result<(), StoreError> {
+        retry_on_transient_lock(|| {
+            self.append_event_fenced_once(task_id, execution_id, event_kind, event_json, fence)
+        })
+        .await
+    }
+
+    async fn append_event_fenced_once(
+        &self,
+        task_id: Option<&str>,
+        execution_id: Option<&str>,
+        event_kind: &str,
+        event_json: Option<&str>,
+        fence: &DaemonFence,
+    ) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        assert_daemon_fence(&mut *transaction, fence).await?;
+        insert_event(
+            &mut transaction,
+            task_id,
+            execution_id,
+            event_kind,
+            event_json,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     async fn append_event_once(
@@ -2323,6 +2467,791 @@ impl SqliteStore {
         row.map(row_to_resource_lease_record).transpose()
     }
 
+    // -----------------------------------------------------------------------
+    // Wave B / R12-02: durable v2 workflow runs, role instances and attempts.
+    //
+    // Every write has a `*_fenced` variant that calls `assert_daemon_fence` as
+    // the first statement of its own transaction, so a write admitted before
+    // authority was lost cannot land after a successor took the daemon lease.
+    // The unfenced variants are authority-unchecked; they exist only for
+    // store-level test seeding and must not be used by the daemon-owned Run
+    // path (the same convention as the unfenced command-ledger variants).
+    // -----------------------------------------------------------------------
+
+    /// Authority-unchecked insert of a workflow run. Returns the existing row
+    /// unchanged on a replay.
+    pub async fn insert_workflow_run_if_absent(
+        &self,
+        record: &NewWorkflowRunRecord,
+    ) -> Result<WorkflowRunRecord, StoreError> {
+        retry_on_transient_lock(|| self.insert_workflow_run_if_absent_once(record, None)).await
+    }
+
+    /// Fenced variant used by the daemon-owned Run path.
+    pub async fn insert_workflow_run_if_absent_fenced(
+        &self,
+        record: &NewWorkflowRunRecord,
+        fence: &DaemonFence,
+    ) -> Result<WorkflowRunRecord, StoreError> {
+        retry_on_transient_lock(|| self.insert_workflow_run_if_absent_once(record, Some(fence)))
+            .await
+    }
+
+    async fn insert_workflow_run_if_absent_once(
+        &self,
+        record: &NewWorkflowRunRecord,
+        fence: Option<&DaemonFence>,
+    ) -> Result<WorkflowRunRecord, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        if let Some(fence) = fence {
+            assert_daemon_fence(&mut *transaction, fence).await?;
+        }
+
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO workflow_runs (
+                id, task_id, execution_grant_id, workflow_definition_id, state, config_snapshot_id
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+        )
+        .bind(&record.id)
+        .bind(&record.task_id)
+        .bind(&record.execution_grant_id)
+        .bind(&record.workflow_definition_id)
+        .bind(&record.state)
+        .bind(&record.config_snapshot_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        transaction.commit().await?;
+
+        self.get_workflow_run(&record.id)
+            .await?
+            .ok_or_else(|| StoreError::ExecutionNotFound {
+                id: record.id.clone(),
+            })
+    }
+
+    pub async fn get_workflow_run(
+        &self,
+        id: &str,
+    ) -> Result<Option<WorkflowRunRecord>, StoreError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, task_id, execution_grant_id, workflow_definition_id, state,
+                   config_snapshot_id, started_at, completed_at,
+                   approved_intent_json, execution_grant_json, config_snapshot_json
+            FROM workflow_runs
+            WHERE id = ?1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(row_to_workflow_run_record).transpose()
+    }
+
+    /// Start of a Run approval: insert the run with its authority, transition
+    /// the task `ready -> running`, and append the single start event, all in
+    /// one fenced transaction.
+    ///
+    /// Convergence: on a replay the run already exists (`first_start == false`)
+    /// and the task is already `running`, so the transition matches its desired
+    /// end state, no second event is appended, and the committed run is
+    /// returned. Convergence is tolerated **only** for that replay. A call that
+    /// newly inserted the run (`first_start == true`) whose transition affected
+    /// zero rows is not convergence: it is a second Run approval for a task that
+    /// is no longer `ready`, and it is refused with [`StoreError::StateConflict`]
+    /// carrying the actual state. The transaction then drops uncommitted, so the
+    /// inserted run row rolls back.
+    pub async fn start_workflow_run_fenced(
+        &self,
+        start: &WorkflowRunStart<'_>,
+        fence: &DaemonFence,
+    ) -> Result<WorkflowRunRecord, StoreError> {
+        retry_on_transient_lock(|| self.start_workflow_run_once(start, fence)).await
+    }
+
+    async fn start_workflow_run_once(
+        &self,
+        start: &WorkflowRunStart<'_>,
+        fence: &DaemonFence,
+    ) -> Result<WorkflowRunRecord, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        assert_daemon_fence(&mut *transaction, fence).await?;
+
+        let inserted = sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO workflow_runs (
+                id, task_id, execution_grant_id, workflow_definition_id, state,
+                config_snapshot_id, approved_intent_json, execution_grant_json,
+                config_snapshot_json
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+        )
+        .bind(&start.run.id)
+        .bind(&start.run.task_id)
+        .bind(&start.run.execution_grant_id)
+        .bind(&start.run.workflow_definition_id)
+        .bind(&start.run.state)
+        .bind(&start.run.config_snapshot_id)
+        .bind(start.approved_intent_json)
+        .bind(start.execution_grant_json)
+        .bind(start.config_snapshot_json)
+        .execute(&mut *transaction)
+        .await?;
+
+        let first_start = inserted.rows_affected() == 1;
+
+        let transitioned = sqlx::query(
+            r#"
+            UPDATE tasks
+            SET state = ?1,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?2
+              AND state = ?3
+            "#,
+        )
+        .bind(start.task_new_state)
+        .bind(&start.run.task_id)
+        .bind(start.task_expected_state)
+        .execute(&mut *transaction)
+        .await?;
+
+        if transitioned.rows_affected() == 0 {
+            let actual_state =
+                sqlx::query_scalar::<_, String>("SELECT state FROM tasks WHERE id = ?1")
+                    .bind(&start.run.task_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+
+            match actual_state {
+                // Already converged only for a replay of a committed approval:
+                // this call did not create the run and the task is already in
+                // the state the approval wants.
+                Some(actual_state) if !first_start && actual_state == start.task_new_state => {}
+                Some(actual_state) => {
+                    return Err(StoreError::StateConflict {
+                        id: start.run.task_id.clone(),
+                        expected_state: start.task_expected_state.to_owned(),
+                        actual_state,
+                    });
+                }
+                None => {
+                    return Err(StoreError::TaskNotFound {
+                        id: start.run.task_id.clone(),
+                    });
+                }
+            }
+        }
+
+        // Exactly one start event per run: only the call that created the run
+        // appends it, and that call's insert, transition and event share this
+        // transaction.
+        //
+        // `execution_id` stays NULL. That column is a foreign key into the v1
+        // `executions` table and a workflow run id is never a v1 execution id,
+        // so writing it there violates the constraint. The event JSON carries
+        // `workflow_run_id`, which is the v2 identity a reader needs.
+        if first_start {
+            insert_event(
+                &mut transaction,
+                Some(&start.run.task_id),
+                None,
+                start.event_kind,
+                start.event_json,
+            )
+            .await?;
+        }
+
+        transaction.commit().await?;
+
+        self.get_workflow_run(&start.run.id)
+            .await?
+            .ok_or_else(|| StoreError::ExecutionNotFound {
+                id: start.run.id.clone(),
+            })
+    }
+
+    /// Authority-unchecked workflow-run state transition (store tests only).
+    pub async fn update_workflow_run_state(
+        &self,
+        id: &str,
+        state: &str,
+    ) -> Result<WorkflowRunRecord, StoreError> {
+        retry_on_transient_lock(|| self.update_workflow_run_state_once(id, state, None)).await
+    }
+
+    /// Fenced variant used by the daemon-owned Run path.
+    pub async fn update_workflow_run_state_fenced(
+        &self,
+        id: &str,
+        state: &str,
+        fence: &DaemonFence,
+    ) -> Result<WorkflowRunRecord, StoreError> {
+        retry_on_transient_lock(|| self.update_workflow_run_state_once(id, state, Some(fence)))
+            .await
+    }
+
+    async fn update_workflow_run_state_once(
+        &self,
+        id: &str,
+        state: &str,
+        fence: Option<&DaemonFence>,
+    ) -> Result<WorkflowRunRecord, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        if let Some(fence) = fence {
+            assert_daemon_fence(&mut *transaction, fence).await?;
+        }
+
+        let result = sqlx::query(
+            r#"
+            UPDATE workflow_runs
+            SET state = ?1,
+                completed_at = CASE
+                    WHEN ?1 IN ('completed', 'failed', 'cancelled') THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ELSE completed_at
+                END
+            WHERE id = ?2
+            "#,
+        )
+        .bind(state)
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(StoreError::ExecutionNotFound { id: id.to_owned() });
+        }
+
+        transaction.commit().await?;
+
+        self.get_workflow_run(id)
+            .await?
+            .ok_or_else(|| StoreError::ExecutionNotFound { id: id.to_owned() })
+    }
+
+    /// Authority-unchecked insert of a role instance. Returns the existing row
+    /// unchanged on a replay.
+    pub async fn insert_role_instance_if_absent(
+        &self,
+        record: &NewRoleInstanceRecord,
+    ) -> Result<RoleInstanceRecord, StoreError> {
+        retry_on_transient_lock(|| self.insert_role_instance_if_absent_once(record, None)).await
+    }
+
+    /// Fenced variant used by the daemon-owned Run path.
+    pub async fn insert_role_instance_if_absent_fenced(
+        &self,
+        record: &NewRoleInstanceRecord,
+        fence: &DaemonFence,
+    ) -> Result<RoleInstanceRecord, StoreError> {
+        retry_on_transient_lock(|| self.insert_role_instance_if_absent_once(record, Some(fence)))
+            .await
+    }
+
+    async fn insert_role_instance_if_absent_once(
+        &self,
+        record: &NewRoleInstanceRecord,
+        fence: Option<&DaemonFence>,
+    ) -> Result<RoleInstanceRecord, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        if let Some(fence) = fence {
+            assert_daemon_fence(&mut *transaction, fence).await?;
+        }
+
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO role_instances (
+                id, workflow_run_id, role_definition_id, generation, state, parent_role_instance_id
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+        )
+        .bind(&record.id)
+        .bind(&record.workflow_run_id)
+        .bind(&record.role_definition_id)
+        .bind(record.generation)
+        .bind(&record.state)
+        .bind(record.parent_role_instance_id.as_deref())
+        .execute(&mut *transaction)
+        .await?;
+
+        transaction.commit().await?;
+
+        self.get_role_instance(&record.id)
+            .await?
+            .ok_or_else(|| StoreError::ExecutionNotFound {
+                id: record.id.clone(),
+            })
+    }
+
+    pub async fn get_role_instance(
+        &self,
+        id: &str,
+    ) -> Result<Option<RoleInstanceRecord>, StoreError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, workflow_run_id, role_definition_id, generation, state,
+                   parent_role_instance_id, accepted_result_artifact, attempts_count,
+                   created_at, updated_at
+            FROM role_instances
+            WHERE id = ?1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(row_to_role_instance_record).transpose()
+    }
+
+    /// Authority-unchecked role-instance update (store tests only).
+    pub async fn update_role_instance(
+        &self,
+        id: &str,
+        state: &str,
+        accepted_result_artifact: Option<&str>,
+        attempts_count: i64,
+    ) -> Result<RoleInstanceRecord, StoreError> {
+        retry_on_transient_lock(|| {
+            self.update_role_instance_once(
+                id,
+                state,
+                accepted_result_artifact,
+                attempts_count,
+                None,
+            )
+        })
+        .await
+    }
+
+    /// Fenced variant used by the daemon-owned Run path.
+    pub async fn update_role_instance_fenced(
+        &self,
+        id: &str,
+        state: &str,
+        accepted_result_artifact: Option<&str>,
+        attempts_count: i64,
+        fence: &DaemonFence,
+    ) -> Result<RoleInstanceRecord, StoreError> {
+        retry_on_transient_lock(|| {
+            self.update_role_instance_once(
+                id,
+                state,
+                accepted_result_artifact,
+                attempts_count,
+                Some(fence),
+            )
+        })
+        .await
+    }
+
+    async fn update_role_instance_once(
+        &self,
+        id: &str,
+        state: &str,
+        accepted_result_artifact: Option<&str>,
+        attempts_count: i64,
+        fence: Option<&DaemonFence>,
+    ) -> Result<RoleInstanceRecord, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        if let Some(fence) = fence {
+            assert_daemon_fence(&mut *transaction, fence).await?;
+        }
+
+        let result = sqlx::query(
+            r#"
+            UPDATE role_instances
+            SET state = ?1,
+                accepted_result_artifact = COALESCE(?2, accepted_result_artifact),
+                attempts_count = ?3,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?4
+            "#,
+        )
+        .bind(state)
+        .bind(accepted_result_artifact)
+        .bind(attempts_count)
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(StoreError::ExecutionNotFound { id: id.to_owned() });
+        }
+
+        transaction.commit().await?;
+
+        self.get_role_instance(id)
+            .await?
+            .ok_or_else(|| StoreError::ExecutionNotFound { id: id.to_owned() })
+    }
+
+    /// Authority-unchecked insert of a role attempt. Returns the existing row
+    /// unchanged on a replay.
+    pub async fn insert_role_attempt_if_absent(
+        &self,
+        record: &NewRoleAttemptRecord,
+    ) -> Result<RoleAttemptRecord, StoreError> {
+        retry_on_transient_lock(|| self.insert_role_attempt_if_absent_once(record, None)).await
+    }
+
+    /// Fenced variant used by the daemon-owned Run path.
+    pub async fn insert_role_attempt_if_absent_fenced(
+        &self,
+        record: &NewRoleAttemptRecord,
+        fence: &DaemonFence,
+    ) -> Result<RoleAttemptRecord, StoreError> {
+        retry_on_transient_lock(|| self.insert_role_attempt_if_absent_once(record, Some(fence)))
+            .await
+    }
+
+    async fn insert_role_attempt_if_absent_once(
+        &self,
+        record: &NewRoleAttemptRecord,
+        fence: Option<&DaemonFence>,
+    ) -> Result<RoleAttemptRecord, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        if let Some(fence) = fence {
+            assert_daemon_fence(&mut *transaction, fence).await?;
+        }
+
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO role_attempts (
+                id, role_instance_id, attempt_no, execution_target_json, state,
+                lease_id, fencing_token, started_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            "#,
+        )
+        .bind(&record.id)
+        .bind(&record.role_instance_id)
+        .bind(record.attempt_no)
+        .bind(&record.execution_target_json)
+        .bind(&record.state)
+        .bind(record.lease_id.as_deref())
+        .bind(record.fencing_token)
+        .execute(&mut *transaction)
+        .await?;
+
+        transaction.commit().await?;
+
+        self.get_role_attempt(&record.id)
+            .await?
+            .ok_or_else(|| StoreError::ExecutionNotFound {
+                id: record.id.clone(),
+            })
+    }
+
+    pub async fn get_role_attempt(
+        &self,
+        id: &str,
+    ) -> Result<Option<RoleAttemptRecord>, StoreError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, role_instance_id, attempt_no, execution_target_json, state,
+                   lease_id, fencing_token, runtime_outcome, result_artifact_id,
+                   started_at, ended_at, runtime_handle_id, runtime_backplane_id,
+                   created_at, updated_at
+            FROM role_attempts
+            WHERE id = ?1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(row_to_role_attempt_record).transpose()
+    }
+
+    /// Records the write lease and fencing token an attempt was admitted
+    /// under, so the durable attempt shows which lease generation it ran with.
+    ///
+    /// Authority-unchecked (store tests only); the daemon path uses
+    /// [`SqliteStore::set_role_attempt_lease_fenced`].
+    pub async fn set_role_attempt_lease(
+        &self,
+        id: &str,
+        lease_id: &str,
+        fencing_token: i64,
+    ) -> Result<(), StoreError> {
+        retry_on_transient_lock(|| {
+            self.set_role_attempt_lease_once(id, lease_id, fencing_token, None)
+        })
+        .await
+    }
+
+    /// Fenced variant used by the daemon-owned Run path.
+    pub async fn set_role_attempt_lease_fenced(
+        &self,
+        id: &str,
+        lease_id: &str,
+        fencing_token: i64,
+        fence: &DaemonFence,
+    ) -> Result<(), StoreError> {
+        retry_on_transient_lock(|| {
+            self.set_role_attempt_lease_once(id, lease_id, fencing_token, Some(fence))
+        })
+        .await
+    }
+
+    async fn set_role_attempt_lease_once(
+        &self,
+        id: &str,
+        lease_id: &str,
+        fencing_token: i64,
+        fence: Option<&DaemonFence>,
+    ) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        if let Some(fence) = fence {
+            assert_daemon_fence(&mut *transaction, fence).await?;
+        }
+
+        let result = sqlx::query(
+            r#"
+            UPDATE role_attempts
+            SET lease_id = ?1,
+                fencing_token = ?2,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?3
+            "#,
+        )
+        .bind(lease_id)
+        .bind(fencing_token)
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(StoreError::ExecutionNotFound { id: id.to_owned() });
+        }
+
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Records the backplane handle a role attempt was launched as.
+    ///
+    /// A restarted daemon uses this to ask the owning backplane about the
+    /// process it actually launched, instead of guessing a handle identity.
+    ///
+    /// Authority-unchecked (store tests only); the daemon path uses
+    /// [`SqliteStore::set_role_attempt_runtime_handle_fenced`].
+    pub async fn set_role_attempt_runtime_handle(
+        &self,
+        id: &str,
+        handle_id: &str,
+        backplane_id: &str,
+    ) -> Result<(), StoreError> {
+        retry_on_transient_lock(|| {
+            self.set_role_attempt_runtime_handle_once(id, handle_id, backplane_id, None)
+        })
+        .await
+    }
+
+    /// Fenced variant used by the daemon-owned Run path.
+    pub async fn set_role_attempt_runtime_handle_fenced(
+        &self,
+        id: &str,
+        handle_id: &str,
+        backplane_id: &str,
+        fence: &DaemonFence,
+    ) -> Result<(), StoreError> {
+        retry_on_transient_lock(|| {
+            self.set_role_attempt_runtime_handle_once(id, handle_id, backplane_id, Some(fence))
+        })
+        .await
+    }
+
+    async fn set_role_attempt_runtime_handle_once(
+        &self,
+        id: &str,
+        handle_id: &str,
+        backplane_id: &str,
+        fence: Option<&DaemonFence>,
+    ) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        if let Some(fence) = fence {
+            assert_daemon_fence(&mut *transaction, fence).await?;
+        }
+
+        let result = sqlx::query(
+            r#"
+            UPDATE role_attempts
+            SET runtime_handle_id = ?1,
+                runtime_backplane_id = ?2,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?3
+            "#,
+        )
+        .bind(handle_id)
+        .bind(backplane_id)
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(StoreError::ExecutionNotFound { id: id.to_owned() });
+        }
+
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Authority-unchecked role-attempt update (store tests only).
+    pub async fn update_role_attempt(
+        &self,
+        id: &str,
+        state: &str,
+        runtime_outcome: Option<&str>,
+        result_artifact_id: Option<&str>,
+    ) -> Result<RoleAttemptRecord, StoreError> {
+        retry_on_transient_lock(|| {
+            self.update_role_attempt_once(id, state, runtime_outcome, result_artifact_id, None)
+        })
+        .await
+    }
+
+    /// Fenced variant used by the daemon-owned Run path.
+    pub async fn update_role_attempt_fenced(
+        &self,
+        id: &str,
+        state: &str,
+        runtime_outcome: Option<&str>,
+        result_artifact_id: Option<&str>,
+        fence: &DaemonFence,
+    ) -> Result<RoleAttemptRecord, StoreError> {
+        retry_on_transient_lock(|| {
+            self.update_role_attempt_once(
+                id,
+                state,
+                runtime_outcome,
+                result_artifact_id,
+                Some(fence),
+            )
+        })
+        .await
+    }
+
+    async fn update_role_attempt_once(
+        &self,
+        id: &str,
+        state: &str,
+        runtime_outcome: Option<&str>,
+        result_artifact_id: Option<&str>,
+        fence: Option<&DaemonFence>,
+    ) -> Result<RoleAttemptRecord, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        if let Some(fence) = fence {
+            assert_daemon_fence(&mut *transaction, fence).await?;
+        }
+
+        let result = sqlx::query(
+            r#"
+            UPDATE role_attempts
+            SET state = ?1,
+                runtime_outcome = COALESCE(?2, runtime_outcome),
+                result_artifact_id = COALESCE(?3, result_artifact_id),
+                ended_at = CASE
+                    WHEN ?1 IN ('completed', 'failed', 'cancelled', 'lost') THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ELSE ended_at
+                END,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?4
+            "#,
+        )
+        .bind(state)
+        .bind(runtime_outcome)
+        .bind(result_artifact_id)
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(StoreError::ExecutionNotFound { id: id.to_owned() });
+        }
+
+        transaction.commit().await?;
+
+        self.get_role_attempt(id)
+            .await?
+            .ok_or_else(|| StoreError::ExecutionNotFound { id: id.to_owned() })
+    }
+
+    pub async fn list_active_workflow_runs(&self) -> Result<Vec<WorkflowRunRecord>, StoreError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, task_id, execution_grant_id, workflow_definition_id, state,
+                   config_snapshot_id, started_at, completed_at,
+                   approved_intent_json, execution_grant_json, config_snapshot_json
+            FROM workflow_runs
+            WHERE state IN ('pending', 'running')
+            ORDER BY started_at ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_workflow_run_record).collect()
+    }
+
+    pub async fn list_role_instances_for_run(
+        &self,
+        workflow_run_id: &str,
+    ) -> Result<Vec<RoleInstanceRecord>, StoreError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, workflow_run_id, role_definition_id, generation, state,
+                   parent_role_instance_id, accepted_result_artifact, attempts_count,
+                   created_at, updated_at
+            FROM role_instances
+            WHERE workflow_run_id = ?1
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(workflow_run_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_role_instance_record).collect()
+    }
+
+    pub async fn list_role_attempts_for_instance(
+        &self,
+        role_instance_id: &str,
+    ) -> Result<Vec<RoleAttemptRecord>, StoreError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, role_instance_id, attempt_no, execution_target_json, state,
+                   lease_id, fencing_token, runtime_outcome, result_artifact_id,
+                   started_at, ended_at, runtime_handle_id, runtime_backplane_id,
+                   created_at, updated_at
+            FROM role_attempts
+            WHERE role_instance_id = ?1
+            ORDER BY attempt_no ASC
+            "#,
+        )
+        .bind(role_instance_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_role_attempt_record).collect()
+    }
+
     #[cfg(test)]
     async fn task_event_count(&self, id: &str) -> Result<i64, StoreError> {
         let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events WHERE task_id = ?1")
@@ -2658,6 +3587,63 @@ fn row_to_resource_lease_record(
         acquired_at: row.try_get("acquired_at")?,
         expires_at: row.try_get("expires_at")?,
         state: row.try_get("state")?,
+    })
+}
+
+fn row_to_workflow_run_record(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<WorkflowRunRecord, StoreError> {
+    Ok(WorkflowRunRecord {
+        id: row.try_get("id")?,
+        task_id: row.try_get("task_id")?,
+        execution_grant_id: row.try_get("execution_grant_id")?,
+        workflow_definition_id: row.try_get("workflow_definition_id")?,
+        state: row.try_get("state")?,
+        config_snapshot_id: row.try_get("config_snapshot_id")?,
+        started_at: row.try_get("started_at")?,
+        completed_at: row.try_get("completed_at")?,
+        approved_intent_json: row.try_get("approved_intent_json")?,
+        execution_grant_json: row.try_get("execution_grant_json")?,
+        config_snapshot_json: row.try_get("config_snapshot_json")?,
+    })
+}
+
+fn row_to_role_instance_record(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<RoleInstanceRecord, StoreError> {
+    Ok(RoleInstanceRecord {
+        id: row.try_get("id")?,
+        workflow_run_id: row.try_get("workflow_run_id")?,
+        role_definition_id: row.try_get("role_definition_id")?,
+        generation: row.try_get("generation")?,
+        state: row.try_get("state")?,
+        parent_role_instance_id: row.try_get("parent_role_instance_id")?,
+        accepted_result_artifact: row.try_get("accepted_result_artifact")?,
+        attempts_count: row.try_get("attempts_count")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn row_to_role_attempt_record(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<RoleAttemptRecord, StoreError> {
+    Ok(RoleAttemptRecord {
+        id: row.try_get("id")?,
+        role_instance_id: row.try_get("role_instance_id")?,
+        attempt_no: row.try_get("attempt_no")?,
+        execution_target_json: row.try_get("execution_target_json")?,
+        state: row.try_get("state")?,
+        lease_id: row.try_get("lease_id")?,
+        fencing_token: row.try_get("fencing_token")?,
+        runtime_outcome: row.try_get("runtime_outcome")?,
+        result_artifact_id: row.try_get("result_artifact_id")?,
+        started_at: row.try_get("started_at")?,
+        ended_at: row.try_get("ended_at")?,
+        runtime_handle_id: row.try_get("runtime_handle_id")?,
+        runtime_backplane_id: row.try_get("runtime_backplane_id")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
     })
 }
 
@@ -4132,6 +5118,621 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(superseded.state, "expired");
+    }
+
+    /// R12-02 part 1: the v2 orchestration tables (migration 0010) and the role
+    /// attempt runtime-handle columns (migration 0011) must apply on a fresh
+    /// database whose schema already stops at 0009.
+    #[tokio::test]
+    async fn v2_workflow_migrations_apply_after_0009() {
+        use sqlx::Row;
+
+        let store = SqliteStore::in_memory().await.unwrap();
+
+        for table in ["workflow_runs", "role_instances", "role_attempts"] {
+            let count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            )
+            .bind(table)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+            assert_eq!(count, 1, "expected table {table} to exist after migrations");
+        }
+
+        let rows = sqlx::query("PRAGMA table_info(role_attempts)")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        let columns = rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("name").unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            columns.iter().any(|name| name == "runtime_handle_id"),
+            "role_attempts must carry runtime_handle_id after migration 0011"
+        );
+        assert!(
+            columns.iter().any(|name| name == "runtime_backplane_id"),
+            "role_attempts must carry runtime_backplane_id after migration 0011"
+        );
+
+        let run_rows = sqlx::query("PRAGMA table_info(workflow_runs)")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        let run_columns = run_rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("name").unwrap())
+            .collect::<Vec<_>>();
+        for column in [
+            "approved_intent_json",
+            "execution_grant_json",
+            "config_snapshot_json",
+        ] {
+            assert!(
+                run_columns.iter().any(|name| name == column),
+                "workflow_runs must carry {column} after migration 0012"
+            );
+        }
+    }
+
+    /// R12-02 part 1: insert-if-absent is idempotent for workflow runs, role
+    /// instances and role attempts, returning the existing row unchanged.
+    #[tokio::test]
+    async fn workflow_records_insert_if_absent_is_idempotent() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store
+            .insert_task(&task_record("task-wf", "workflow"))
+            .await
+            .unwrap();
+
+        let run = workflow_run_record("run-1", "task-wf");
+        let first = store.insert_workflow_run_if_absent(&run).await.unwrap();
+        let second = store.insert_workflow_run_if_absent(&run).await.unwrap();
+        assert_eq!(
+            first, second,
+            "a replayed run insert must return the existing row"
+        );
+        assert_eq!(store.list_active_workflow_runs().await.unwrap().len(), 1);
+
+        let instance = role_instance_record("inst-1", "run-1");
+        let first_instance = store
+            .insert_role_instance_if_absent(&instance)
+            .await
+            .unwrap();
+        let second_instance = store
+            .insert_role_instance_if_absent(&instance)
+            .await
+            .unwrap();
+        assert_eq!(
+            first_instance, second_instance,
+            "a replayed role instance insert must return the existing row"
+        );
+        assert_eq!(
+            store
+                .list_role_instances_for_run("run-1")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let attempt = role_attempt_record("attempt-1", "inst-1");
+        let first_attempt = store.insert_role_attempt_if_absent(&attempt).await.unwrap();
+        let second_attempt = store.insert_role_attempt_if_absent(&attempt).await.unwrap();
+        assert_eq!(
+            first_attempt, second_attempt,
+            "a replayed role attempt insert must return the existing row"
+        );
+        assert_eq!(
+            store
+                .list_role_attempts_for_instance("inst-1")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// R12-02 part 1: every v2 write is fenced on the daemon lease, so a stale
+    /// daemon cannot land a workflow/role write after a successor took over.
+    #[tokio::test]
+    async fn v2_workflow_writes_are_refused_after_a_successor_takes_the_daemon_lease() {
+        let store = SqliteStore::in_memory().await.unwrap();
+
+        let lease = store
+            .acquire_or_renew_daemon_lease(
+                "daemon-r12",
+                4001,
+                "host-a",
+                "inst-4001",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        let fence = DaemonFence {
+            lease_id: "daemon-r12".to_owned(),
+            holder_pid: lease.holder_pid,
+            holder_instance: lease.holder_instance.clone(),
+            fencing_token: lease.fencing_token,
+        };
+
+        // Seed the referenced rows while this process still holds the lease.
+        store
+            .insert_task(&task_record("task-r12", "r12"))
+            .await
+            .unwrap();
+        store
+            .insert_workflow_run_if_absent_fenced(
+                &workflow_run_record("run-r12", "task-r12"),
+                &fence,
+            )
+            .await
+            .unwrap();
+        store
+            .insert_role_instance_if_absent_fenced(
+                &role_instance_record("inst-r12", "run-r12"),
+                &fence,
+            )
+            .await
+            .unwrap();
+        store
+            .insert_role_attempt_if_absent_fenced(
+                &role_attempt_record("attempt-r12", "inst-r12"),
+                &fence,
+            )
+            .await
+            .unwrap();
+
+        // A successor takes the lease (stale takeover), changing the holder and
+        // incrementing the fencing token.
+        let successor = store
+            .acquire_or_renew_daemon_lease(
+                "daemon-r12",
+                4002,
+                "host-b",
+                "inst-4002",
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        assert_eq!(successor.fencing_token, lease.fencing_token + 1);
+
+        // Every v2 write a stale daemon could still attempt is now refused.
+        let new_run = workflow_run_record("run-late", "task-r12");
+        let new_instance = role_instance_record("inst-late", "run-r12");
+        let new_attempt = role_attempt_record("attempt-late", "inst-r12");
+        let refusals = [
+            store
+                .insert_workflow_run_if_absent_fenced(&new_run, &fence)
+                .await
+                .map(|_| ()),
+            store
+                .update_workflow_run_state_fenced("run-r12", "running", &fence)
+                .await
+                .map(|_| ()),
+            store
+                .insert_role_instance_if_absent_fenced(&new_instance, &fence)
+                .await
+                .map(|_| ()),
+            store
+                .update_role_instance_fenced("inst-r12", "active", None, 1, &fence)
+                .await
+                .map(|_| ()),
+            store
+                .insert_role_attempt_if_absent_fenced(&new_attempt, &fence)
+                .await
+                .map(|_| ()),
+            store
+                .set_role_attempt_lease_fenced("attempt-r12", "lease-late", 1, &fence)
+                .await,
+            store
+                .set_role_attempt_runtime_handle_fenced(
+                    "attempt-r12",
+                    "handle-late",
+                    "backplane-late",
+                    &fence,
+                )
+                .await,
+            store
+                .update_role_attempt_fenced("attempt-r12", "running", None, None, &fence)
+                .await
+                .map(|_| ()),
+        ];
+        for refusal in refusals {
+            assert!(
+                matches!(refusal, Err(StoreError::DaemonAuthorityLost { .. })),
+                "a stale v2 write must be refused, got {refusal:?}"
+            );
+        }
+
+        // The durable state is unchanged: no late rows were created and nothing
+        // regressed.
+        assert!(store.get_workflow_run("run-late").await.unwrap().is_none());
+        assert!(
+            store
+                .get_role_instance("inst-late")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_role_attempt("attempt-late")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_workflow_run("run-r12")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "pending"
+        );
+        assert_eq!(
+            store
+                .get_role_instance("inst-r12")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "created"
+        );
+        assert_eq!(
+            store
+                .get_role_attempt("attempt-r12")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "queued"
+        );
+    }
+
+    /// R12-02 part 2: approving a Run is one durable fact. The run (with the
+    /// approved intent, grant and snapshot it executes under), the task's
+    /// transition and the single start event commit together, and a replay
+    /// converges instead of duplicating any of them.
+    #[tokio::test]
+    async fn start_workflow_run_is_atomic_and_its_replay_converges() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let lease = store
+            .acquire_or_renew_daemon_lease(
+                "daemon-start",
+                5001,
+                "host-a",
+                "inst-5001",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        let fence = DaemonFence {
+            lease_id: "daemon-start".to_owned(),
+            holder_pid: lease.holder_pid,
+            holder_instance: lease.holder_instance.clone(),
+            fencing_token: lease.fencing_token,
+        };
+
+        store
+            .insert_task(&task_record("task-start", "start"))
+            .await
+            .unwrap();
+
+        let intent_json = r#"{"id":"intent-1","generation":1}"#;
+        let grant_json = r#"{"id":"grant-1"}"#;
+        let snapshot_json = r#"{"id":"snapshot-1","workflow_version":1}"#;
+        let event_json = r#"{"task_id":"task-start","workflow_run_id":"run-start"}"#;
+
+        let mut run_record = workflow_run_record("run-start", "task-start");
+        run_record.state = "running".to_owned();
+        let start = WorkflowRunStart {
+            run: &run_record,
+            approved_intent_json: intent_json,
+            execution_grant_json: grant_json,
+            config_snapshot_json: snapshot_json,
+            task_expected_state: "ready",
+            task_new_state: "running",
+            event_kind: "workflow_run_started",
+            event_json: Some(event_json),
+        };
+
+        let run = store
+            .start_workflow_run_fenced(&start, &fence)
+            .await
+            .unwrap();
+        assert_eq!(run.state, "running");
+        assert_eq!(run.approved_intent_json, intent_json);
+        assert_eq!(run.execution_grant_json, grant_json);
+        assert_eq!(run.config_snapshot_json, snapshot_json);
+        assert_eq!(
+            store.get_workflow_run("run-start").await.unwrap().unwrap(),
+            run,
+            "the stored authority must round-trip through the read path"
+        );
+        assert_eq!(
+            store.get_task("task-start").await.unwrap().unwrap().state,
+            "running"
+        );
+
+        // Replay of the same approval converges: same run, task already running,
+        // and no second start event.
+        let replay = store
+            .start_workflow_run_fenced(&start, &fence)
+            .await
+            .unwrap();
+        assert_eq!(replay, run);
+
+        let events = store.get_events_after(0, 100).await.unwrap();
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_kind == "workflow_run_started")
+            .collect();
+        assert_eq!(
+            starts.len(),
+            1,
+            "a replayed approval must not append a second start event, got {events:?}"
+        );
+        assert_eq!(starts[0].task_id.as_deref(), Some("task-start"));
+        assert!(
+            starts[0].execution_id.is_none(),
+            "a workflow run id is not a v1 execution id and must never be stored as execution_id"
+        );
+        let start_json = starts[0].event_json.as_deref().unwrap_or_default();
+        assert!(
+            start_json.contains(r#""workflow_run_id":"run-start""#),
+            "the start event JSON must carry the workflow run id, got {start_json}"
+        );
+
+        // A task in any other state is a genuine conflict, and the run row that
+        // would have accompanied it is rolled back with the refusal.
+        store
+            .insert_task(&task_record("task-done", "done"))
+            .await
+            .unwrap();
+        store
+            .update_task_state("task-done", "ready", "done")
+            .await
+            .unwrap();
+        let mut late_record = workflow_run_record("run-late-start", "task-done");
+        late_record.state = "running".to_owned();
+        let late = WorkflowRunStart {
+            run: &late_record,
+            approved_intent_json: intent_json,
+            execution_grant_json: grant_json,
+            config_snapshot_json: snapshot_json,
+            task_expected_state: "ready",
+            task_new_state: "running",
+            event_kind: "workflow_run_started",
+            event_json: None,
+        };
+        let refused = store.start_workflow_run_fenced(&late, &fence).await;
+        assert!(
+            matches!(refused, Err(StoreError::StateConflict { .. })),
+            "a Task that is not ready must refuse the approval, got {refused:?}"
+        );
+        assert!(
+            store
+                .get_workflow_run("run-late-start")
+                .await
+                .unwrap()
+                .is_none(),
+            "the run insert must roll back with the refused transition"
+        );
+    }
+
+    /// R12-02 (T05): two Run approvals for one task never create two runs, even
+    /// when they race. A second approval carries its own run id, so it is not a
+    /// replay: the task is already `running`, the transition affects no row, and
+    /// the approval is refused. The run row it would have created rolls back with
+    /// the refusal, so one task still maps to exactly one run and one start
+    /// event. Only the original approval's replay converges.
+    #[tokio::test]
+    async fn a_second_run_approval_for_a_running_task_is_refused() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let lease = store
+            .acquire_or_renew_daemon_lease(
+                "daemon-dup",
+                5002,
+                "host-a",
+                "inst-5002",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        let fence = DaemonFence {
+            lease_id: "daemon-dup".to_owned(),
+            holder_pid: lease.holder_pid,
+            holder_instance: lease.holder_instance.clone(),
+            fencing_token: lease.fencing_token,
+        };
+
+        store
+            .insert_task(&task_record("task-dup", "dup"))
+            .await
+            .unwrap();
+
+        let intent_json = r#"{"id":"intent-dup","generation":1}"#;
+        let grant_json = r#"{"id":"grant-dup"}"#;
+        let snapshot_json = r#"{"id":"snapshot-dup","workflow_version":1}"#;
+
+        let mut run_a = workflow_run_record("run-dup-a", "task-dup");
+        run_a.state = "running".to_owned();
+        let start_a = WorkflowRunStart {
+            run: &run_a,
+            approved_intent_json: intent_json,
+            execution_grant_json: grant_json,
+            config_snapshot_json: snapshot_json,
+            task_expected_state: "ready",
+            task_new_state: "running",
+            event_kind: "workflow_run_started",
+            event_json: Some(r#"{"task_id":"task-dup","workflow_run_id":"run-dup-a"}"#),
+        };
+        let first = store
+            .start_workflow_run_fenced(&start_a, &fence)
+            .await
+            .unwrap();
+        assert_eq!(first.id, "run-dup-a");
+
+        // A *second* approval under a different run id. The task is already
+        // running, so the compare-and-set affects no row and this is not the
+        // replay case.
+        let mut run_b = workflow_run_record("run-dup-b", "task-dup");
+        run_b.state = "running".to_owned();
+        let start_b = WorkflowRunStart {
+            run: &run_b,
+            approved_intent_json: intent_json,
+            execution_grant_json: grant_json,
+            config_snapshot_json: snapshot_json,
+            task_expected_state: "ready",
+            task_new_state: "running",
+            event_kind: "workflow_run_started",
+            event_json: Some(r#"{"task_id":"task-dup","workflow_run_id":"run-dup-b"}"#),
+        };
+        let refused = store.start_workflow_run_fenced(&start_b, &fence).await;
+        match refused {
+            Err(StoreError::StateConflict {
+                ref id,
+                ref actual_state,
+                ..
+            }) => {
+                assert_eq!(id, "task-dup");
+                assert_eq!(
+                    actual_state, "running",
+                    "the refusal must report the state that blocked the approval"
+                );
+            }
+            other => panic!("a second Run approval must be refused, got {other:?}"),
+        }
+
+        // The refused approval left nothing behind: its run row rolled back with
+        // the refusal, and no second start event was appended.
+        assert!(
+            store.get_workflow_run("run-dup-b").await.unwrap().is_none(),
+            "the refused approval's run row must roll back"
+        );
+        let active = store.list_active_workflow_runs().await.unwrap();
+        assert_eq!(
+            active.len(),
+            1,
+            "one task must map to exactly one active run, got {active:?}"
+        );
+        assert_eq!(active[0].id, "run-dup-a");
+        let events = store.get_events_after(0, 100).await.unwrap();
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_kind == "workflow_run_started")
+            .collect();
+        assert_eq!(
+            starts.len(),
+            1,
+            "a refused approval must not append a start event, got {events:?}"
+        );
+        assert_eq!(
+            store.get_task("task-dup").await.unwrap().unwrap().state,
+            "running"
+        );
+
+        // The original approval is still a convergent replay: same run, no new
+        // event.
+        let replay = store
+            .start_workflow_run_fenced(&start_a, &fence)
+            .await
+            .unwrap();
+        assert_eq!(replay, first);
+        let events = store.get_events_after(0, 100).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_kind == "workflow_run_started")
+                .count(),
+            1,
+            "replaying the original approval must stay converged"
+        );
+    }
+
+    /// R12-02 part 1: a role attempt round-trips the lease generation and the
+    /// backplane runtime handle a restarted daemon must reconcile against.
+    #[tokio::test]
+    async fn a_role_attempt_round_trips_its_runtime_handle_and_lease() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store
+            .insert_task(&task_record("task-rt", "rt"))
+            .await
+            .unwrap();
+        store
+            .insert_workflow_run_if_absent(&workflow_run_record("run-rt", "task-rt"))
+            .await
+            .unwrap();
+        store
+            .insert_role_instance_if_absent(&role_instance_record("inst-rt", "run-rt"))
+            .await
+            .unwrap();
+        store
+            .insert_role_attempt_if_absent(&role_attempt_record("attempt-rt", "inst-rt"))
+            .await
+            .unwrap();
+
+        store
+            .set_role_attempt_lease("attempt-rt", "lease-rt", 7)
+            .await
+            .unwrap();
+        store
+            .set_role_attempt_runtime_handle("attempt-rt", "handle-42", "herdr-backplane")
+            .await
+            .unwrap();
+
+        let stored = store.get_role_attempt("attempt-rt").await.unwrap().unwrap();
+        assert_eq!(stored.lease_id.as_deref(), Some("lease-rt"));
+        assert_eq!(stored.fencing_token, Some(7));
+        assert_eq!(stored.runtime_handle_id.as_deref(), Some("handle-42"));
+        assert_eq!(
+            stored.runtime_backplane_id.as_deref(),
+            Some("herdr-backplane")
+        );
+        assert!(
+            stored.started_at.is_some(),
+            "an inserted role attempt records its start time"
+        );
+    }
+
+    fn workflow_run_record(id: &str, task_id: &str) -> NewWorkflowRunRecord {
+        NewWorkflowRunRecord {
+            id: id.to_owned(),
+            task_id: task_id.to_owned(),
+            execution_grant_id: "grant-1".to_owned(),
+            workflow_definition_id: "wf-def-1".to_owned(),
+            state: "pending".to_owned(),
+            config_snapshot_id: "snapshot-1".to_owned(),
+        }
+    }
+
+    fn role_instance_record(id: &str, workflow_run_id: &str) -> NewRoleInstanceRecord {
+        NewRoleInstanceRecord {
+            id: id.to_owned(),
+            workflow_run_id: workflow_run_id.to_owned(),
+            role_definition_id: "implementer".to_owned(),
+            generation: 1,
+            state: "created".to_owned(),
+            parent_role_instance_id: None,
+        }
+    }
+
+    fn role_attempt_record(id: &str, role_instance_id: &str) -> NewRoleAttemptRecord {
+        NewRoleAttemptRecord {
+            id: id.to_owned(),
+            role_instance_id: role_instance_id.to_owned(),
+            attempt_no: 1,
+            execution_target_json:
+                r#"{"provider_id":"fake","runtime_profile_id":"fake/default","provider_adapter_version":"1"}"#
+                    .to_owned(),
+            state: "queued".to_owned(),
+            lease_id: None,
+            fencing_token: None,
+        }
     }
 
     fn task_record(id: &str, title: &str) -> NewTaskRecord {

@@ -154,6 +154,22 @@ impl SchedulerV2 {
         project_state.queue.push_back(item);
     }
 
+    /// Removes a queued (not yet admitted) work item, e.g. when its attempt is
+    /// abandoned, so it can never be admitted later for a dead attempt.
+    /// Returns whether anything was removed.
+    pub fn withdraw_queued(&self, role_attempt_id: &RoleAttemptId) -> bool {
+        let mut queues = self.project_queues.lock().unwrap();
+        let mut removed = false;
+        for state in queues.values_mut() {
+            let before = state.queue.len();
+            state
+                .queue
+                .retain(|item| &item.role_attempt_id != role_attempt_id);
+            removed |= state.queue.len() != before;
+        }
+        removed
+    }
+
     /// Advances the deterministic scheduler tick and schedules eligible tasks.
     /// Uses an aging algorithm so older tasks in busy projects don't starve.
     pub async fn schedule_next(&self, store: &SqliteStore) -> Vec<ActiveExecutionSlot> {

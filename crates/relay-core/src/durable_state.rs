@@ -2,14 +2,19 @@ use std::fmt;
 
 use relay_protocol::{HandoffTask, parse_handoff_task_json};
 use relay_store::{
-    NewResourceLeaseRecord, NewTaskRecord, ResourceLeaseRecord, StoreError, TaskRecord,
+    DaemonFence, NewResourceLeaseRecord, NewRoleAttemptRecord, NewRoleInstanceRecord,
+    NewTaskRecord, NewWorkflowRunRecord, ResourceLeaseRecord, RoleAttemptRecord,
+    RoleInstanceRecord, StoreError, TaskRecord, WorkflowRunRecord,
 };
 pub use relay_store::{SqliteStore, default_database_path};
 use thiserror::Error;
 
 use crate::{
-    CheckoutId, ImportedTask, Lease, LeaseHolder, LeaseId, LeaseKind, LeaseResource, LeaseState,
-    ProjectKey, Relay, SubmissionTransport, TaskId, TaskImportCandidate, WorkflowRunId,
+    CheckoutId, ConfigSnapshotId, ExecutionGrantId, ExecutionTarget, ImportedTask, Lease,
+    LeaseHolder, LeaseId, LeaseKind, LeaseResource, LeaseState, ProjectKey, Relay, RoleAttempt,
+    RoleAttemptId, RoleAttemptState, RoleDefinitionId, RoleInstance, RoleInstanceId,
+    RoleInstanceState, SubmissionTransport, TaskId, TaskImportCandidate, WorkflowDefinitionId,
+    WorkflowRun, WorkflowRunId, WorkflowRunState,
 };
 
 /// Durable Relay task state stored locally.
@@ -275,6 +280,8 @@ pub enum TaskPersistenceError {
     UnknownLeaseKind { lease_kind: String },
     #[error("unknown stored lease state '{state}'")]
     UnknownLeaseState { state: String },
+    #[error("corrupt stored record {id}: {reason}")]
+    CorruptTaskRecord { id: String, reason: String },
 }
 
 pub fn record_to_lease(record: ResourceLeaseRecord) -> Result<Lease, TaskPersistenceError> {
@@ -390,6 +397,367 @@ pub async fn release_durable_lease(
         .release_resource_lease(&lease_id.to_string(), holder_id)
         .await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Wave B / R12-02: durable v2 orchestration state.
+//
+// These wrappers map between the v2 domain types and the store DTOs. Every
+// write goes through the store's `*_fenced` variant with the daemon fence, so a
+// stale daemon cannot land a workflow write after a successor took the lease.
+// ---------------------------------------------------------------------------
+
+pub async fn persist_workflow_run_if_absent(
+    store: &SqliteStore,
+    run: &WorkflowRun,
+    fence: &DaemonFence,
+) -> Result<(), TaskPersistenceError> {
+    let state = match run.state {
+        WorkflowRunState::Pending => "pending",
+        WorkflowRunState::Running => "running",
+        WorkflowRunState::WaitingForAttention => "waiting_decision",
+        WorkflowRunState::Suspended => "blocked",
+        WorkflowRunState::Completed => "completed",
+        WorkflowRunState::Failed => "failed",
+        WorkflowRunState::Cancelled => "cancelled",
+    };
+    let rec = NewWorkflowRunRecord {
+        id: run.id.to_string(),
+        task_id: run.task_id.to_string(),
+        execution_grant_id: run.execution_grant_id.to_string(),
+        workflow_definition_id: run.workflow_definition_id.to_string(),
+        state: state.to_owned(),
+        config_snapshot_id: run.config_snapshot_id.to_string(),
+    };
+    store
+        .insert_workflow_run_if_absent_fenced(&rec, fence)
+        .await?;
+    Ok(())
+}
+
+pub async fn update_durable_workflow_run_state(
+    store: &SqliteStore,
+    run: &WorkflowRun,
+    fence: &DaemonFence,
+) -> Result<(), TaskPersistenceError> {
+    let state = match run.state {
+        WorkflowRunState::Pending => "pending",
+        WorkflowRunState::Running => "running",
+        WorkflowRunState::WaitingForAttention => "waiting_decision",
+        WorkflowRunState::Suspended => "blocked",
+        WorkflowRunState::Completed => "completed",
+        WorkflowRunState::Failed => "failed",
+        WorkflowRunState::Cancelled => "cancelled",
+    };
+    store
+        .update_workflow_run_state_fenced(&run.id.0, state, fence)
+        .await?;
+    Ok(())
+}
+
+fn role_instance_state_str(state: RoleInstanceState) -> &'static str {
+    match state {
+        RoleInstanceState::Created => "created",
+        RoleInstanceState::WaitingInputs => "waiting_inputs",
+        RoleInstanceState::Ready => "ready",
+        RoleInstanceState::Active => "active",
+        RoleInstanceState::WaitingChildren => "waiting_children",
+        RoleInstanceState::ResultPending => "result_pending",
+        RoleInstanceState::Completed => "completed",
+        RoleInstanceState::Blocked => "blocked",
+        RoleInstanceState::Failed => "failed",
+        RoleInstanceState::Cancelled => "cancelled",
+    }
+}
+
+fn role_attempt_state_str(state: RoleAttemptState) -> &'static str {
+    match state {
+        RoleAttemptState::Queued => "queued",
+        RoleAttemptState::Provisioning => "provisioning",
+        RoleAttemptState::Starting => "starting",
+        RoleAttemptState::Running => "running",
+        RoleAttemptState::ResultPending => "result_pending",
+        RoleAttemptState::Completed => "completed",
+        RoleAttemptState::Interrupted => "interrupted",
+        RoleAttemptState::Failed => "failed",
+        RoleAttemptState::Cancelled => "cancelled",
+        RoleAttemptState::Lost => "lost",
+    }
+}
+
+pub async fn persist_role_instance_if_absent(
+    store: &SqliteStore,
+    instance: &RoleInstance,
+    fence: &DaemonFence,
+) -> Result<(), TaskPersistenceError> {
+    let rec = NewRoleInstanceRecord {
+        id: instance.id.to_string(),
+        workflow_run_id: instance.workflow_run_id.to_string(),
+        role_definition_id: instance.role_definition_id.to_string(),
+        generation: i64::from(instance.generation),
+        state: role_instance_state_str(instance.state).to_owned(),
+        parent_role_instance_id: instance
+            .parent_role_instance_id
+            .as_ref()
+            .map(|parent| parent.to_string()),
+    };
+    store
+        .insert_role_instance_if_absent_fenced(&rec, fence)
+        .await?;
+    Ok(())
+}
+
+pub async fn update_durable_role_instance(
+    store: &SqliteStore,
+    instance: &RoleInstance,
+    fence: &DaemonFence,
+) -> Result<(), TaskPersistenceError> {
+    store
+        .update_role_instance_fenced(
+            &instance.id.to_string(),
+            role_instance_state_str(instance.state),
+            instance.accepted_result_artifact.as_deref(),
+            i64::from(instance.attempts_count),
+            fence,
+        )
+        .await?;
+    Ok(())
+}
+
+pub async fn persist_role_attempt_if_absent(
+    store: &SqliteStore,
+    attempt: &RoleAttempt,
+    fence: &DaemonFence,
+) -> Result<(), TaskPersistenceError> {
+    let target_json = serde_json::to_string(&attempt.execution_target)?;
+    let rec = NewRoleAttemptRecord {
+        id: attempt.id.to_string(),
+        role_instance_id: attempt.role_instance_id.to_string(),
+        attempt_no: i64::from(attempt.attempt_no),
+        execution_target_json: target_json,
+        state: role_attempt_state_str(attempt.state).to_owned(),
+        lease_id: attempt.lease_id.clone(),
+        fencing_token: attempt.fencing_token.map(|token| token as i64),
+    };
+    store
+        .insert_role_attempt_if_absent_fenced(&rec, fence)
+        .await?;
+    Ok(())
+}
+
+pub async fn update_durable_role_attempt(
+    store: &SqliteStore,
+    attempt: &RoleAttempt,
+    fence: &DaemonFence,
+) -> Result<(), TaskPersistenceError> {
+    store
+        .update_role_attempt_fenced(
+            &attempt.id.to_string(),
+            role_attempt_state_str(attempt.state),
+            attempt.runtime_outcome.as_deref(),
+            attempt.result_artifact_id.as_deref(),
+            fence,
+        )
+        .await?;
+    Ok(())
+}
+
+/// Persists the write lease an attempt was admitted under, together with that
+/// lease's fencing token, so the durable attempt records which lease generation
+/// it ran with. A no-op for attempts admitted without a lease (read-only roles).
+pub async fn record_role_attempt_lease(
+    store: &SqliteStore,
+    attempt: &RoleAttempt,
+    fence: &DaemonFence,
+) -> Result<(), TaskPersistenceError> {
+    let Some(lease_id) = attempt.lease_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(lease) = store.get_resource_lease(lease_id).await? else {
+        return Ok(());
+    };
+    store
+        .set_role_attempt_lease_fenced(
+            &attempt.id.to_string(),
+            lease_id,
+            lease.fencing_token,
+            fence,
+        )
+        .await?;
+    Ok(())
+}
+
+/// Records the backplane handle an attempt was actually launched as, so a
+/// restarted daemon can reconcile that exact process instead of guessing.
+pub async fn record_role_attempt_runtime_handle(
+    store: &SqliteStore,
+    attempt: &RoleAttempt,
+    fence: &DaemonFence,
+) -> Result<(), TaskPersistenceError> {
+    let (Some(handle_id), Some(backplane_id)) = (
+        attempt.runtime_handle_id.as_deref(),
+        attempt.runtime_backplane_id.as_deref(),
+    ) else {
+        return Ok(());
+    };
+    store
+        .set_role_attempt_runtime_handle_fenced(
+            &attempt.id.to_string(),
+            handle_id,
+            backplane_id,
+            fence,
+        )
+        .await?;
+    Ok(())
+}
+
+pub fn record_to_workflow_run(
+    record: WorkflowRunRecord,
+) -> Result<WorkflowRun, TaskPersistenceError> {
+    let state = match record.state.as_str() {
+        "pending" => WorkflowRunState::Pending,
+        "running" => WorkflowRunState::Running,
+        "waiting_decision" => WorkflowRunState::WaitingForAttention,
+        "blocked" => WorkflowRunState::Suspended,
+        "completed" => WorkflowRunState::Completed,
+        "failed" => WorkflowRunState::Failed,
+        "cancelled" => WorkflowRunState::Cancelled,
+        other => {
+            return Err(TaskPersistenceError::CorruptTaskRecord {
+                id: record.id,
+                reason: format!("unknown workflow run state '{other}'"),
+            });
+        }
+    };
+    let task_id = TaskId::parse(&record.task_id).map_err(|source| {
+        TaskPersistenceError::CorruptTaskRecord {
+            id: record.id.clone(),
+            reason: format!("invalid task id: {source}"),
+        }
+    })?;
+    Ok(WorkflowRun {
+        id: WorkflowRunId(record.id),
+        task_id,
+        execution_grant_id: ExecutionGrantId(record.execution_grant_id),
+        workflow_definition_id: WorkflowDefinitionId::new(record.workflow_definition_id),
+        state,
+        config_snapshot_id: ConfigSnapshotId(record.config_snapshot_id),
+        started_at: record.started_at,
+        completed_at: record.completed_at,
+    })
+}
+
+pub fn record_to_role_instance(
+    record: RoleInstanceRecord,
+) -> Result<RoleInstance, TaskPersistenceError> {
+    let state = match record.state.as_str() {
+        "created" => RoleInstanceState::Created,
+        "waiting_inputs" => RoleInstanceState::WaitingInputs,
+        "ready" => RoleInstanceState::Ready,
+        "active" => RoleInstanceState::Active,
+        "waiting_children" => RoleInstanceState::WaitingChildren,
+        "result_pending" => RoleInstanceState::ResultPending,
+        "completed" => RoleInstanceState::Completed,
+        "blocked" => RoleInstanceState::Blocked,
+        "failed" => RoleInstanceState::Failed,
+        "cancelled" => RoleInstanceState::Cancelled,
+        other => {
+            return Err(TaskPersistenceError::CorruptTaskRecord {
+                id: record.id,
+                reason: format!("unknown role instance state '{other}'"),
+            });
+        }
+    };
+    Ok(RoleInstance {
+        id: RoleInstanceId(record.id),
+        workflow_run_id: WorkflowRunId(record.workflow_run_id),
+        role_definition_id: RoleDefinitionId::new(record.role_definition_id),
+        generation: record.generation as u32,
+        state,
+        parent_role_instance_id: record.parent_role_instance_id.map(RoleInstanceId),
+        accepted_result_artifact: record.accepted_result_artifact,
+        attempts_count: record.attempts_count as u32,
+    })
+}
+
+pub fn record_to_role_attempt(
+    record: RoleAttemptRecord,
+) -> Result<RoleAttempt, TaskPersistenceError> {
+    let state = match record.state.as_str() {
+        "queued" => RoleAttemptState::Queued,
+        "provisioning" => RoleAttemptState::Provisioning,
+        "starting" => RoleAttemptState::Starting,
+        "running" => RoleAttemptState::Running,
+        "result_pending" => RoleAttemptState::ResultPending,
+        "completed" => RoleAttemptState::Completed,
+        "interrupted" => RoleAttemptState::Interrupted,
+        "failed" => RoleAttemptState::Failed,
+        "cancelled" => RoleAttemptState::Cancelled,
+        "lost" => RoleAttemptState::Lost,
+        other => {
+            return Err(TaskPersistenceError::CorruptTaskRecord {
+                id: record.id,
+                reason: format!("unknown role attempt state '{other}'"),
+            });
+        }
+    };
+    let execution_target: ExecutionTarget = serde_json::from_str(&record.execution_target_json)
+        .map_err(|source| TaskPersistenceError::CorruptTaskRecord {
+            id: record.id.clone(),
+            reason: format!("invalid execution target json: {source}"),
+        })?;
+    Ok(RoleAttempt {
+        id: RoleAttemptId(record.id),
+        role_instance_id: RoleInstanceId(record.role_instance_id),
+        attempt_no: record.attempt_no as u32,
+        execution_target,
+        state,
+        lease_id: record.lease_id,
+        fencing_token: record.fencing_token.map(|token| token as u64),
+        runtime_outcome: record.runtime_outcome,
+        result_artifact_id: record.result_artifact_id,
+        started_at: record.started_at,
+        ended_at: record.ended_at,
+        runtime_handle_id: record.runtime_handle_id,
+        runtime_backplane_id: record.runtime_backplane_id,
+    })
+}
+
+pub async fn get_durable_workflow_run(
+    store: &SqliteStore,
+    id: &str,
+) -> Result<Option<WorkflowRun>, TaskPersistenceError> {
+    match store.get_workflow_run(id).await? {
+        Some(record) => Ok(Some(record_to_workflow_run(record)?)),
+        None => Ok(None),
+    }
+}
+
+pub async fn list_active_workflow_runs(
+    store: &SqliteStore,
+) -> Result<Vec<WorkflowRun>, TaskPersistenceError> {
+    let records = store.list_active_workflow_runs().await?;
+    records.into_iter().map(record_to_workflow_run).collect()
+}
+
+pub async fn list_role_instances_for_run(
+    store: &SqliteStore,
+    workflow_run_id: &WorkflowRunId,
+) -> Result<Vec<RoleInstance>, TaskPersistenceError> {
+    let records = store
+        .list_role_instances_for_run(&workflow_run_id.0)
+        .await?;
+    records.into_iter().map(record_to_role_instance).collect()
+}
+
+pub async fn list_role_attempts_for_instance(
+    store: &SqliteStore,
+    role_instance_id: &RoleInstanceId,
+) -> Result<Vec<RoleAttempt>, TaskPersistenceError> {
+    let records = store
+        .list_role_attempts_for_instance(&role_instance_id.0)
+        .await?;
+    records.into_iter().map(record_to_role_attempt).collect()
 }
 
 #[cfg(test)]

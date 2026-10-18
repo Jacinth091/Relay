@@ -951,6 +951,8 @@ pub struct ConfigSnapshot {
     pub id: ConfigSnapshotId,
     pub workflow_version: u32,
     pub budget: ExecutionBudget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_target: Option<ExecutionTarget>,
     pub policy_digest: String,
     pub captured_at: String,
 }
@@ -961,6 +963,7 @@ impl ConfigSnapshot {
             id: ConfigSnapshotId::generate(),
             workflow_version,
             budget,
+            execution_target: None,
             policy_digest,
             captured_at: now_timestamp(),
         }

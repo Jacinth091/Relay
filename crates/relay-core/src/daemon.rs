@@ -1024,14 +1024,37 @@ impl DaemonServer {
                     deterministic_command_id(command_id, "intent")
                 ));
 
+                let trusted_relay = self.trusted_registry_for_submission()?;
+                let project = trusted_relay
+                    .project_registry()
+                    .get(stored_task.project_key.as_str())
+                    .map_err(|_| {
+                        DaemonError::Command(format!(
+                            "project '{}' is not registered",
+                            stored_task.project_key
+                        ))
+                    })?;
+                let stack = stored_task
+                    .handoff
+                    .stack
+                    .as_deref()
+                    .or_else(|| project.default_stack())
+                    .ok_or_else(|| {
+                        DaemonError::Command("no runtime stack is configured".to_owned())
+                    })?;
+                let execution_target = crate::legacy_adapter::execution_target_for_stack(stack)
+                    .map_err(|error| DaemonError::Command(error.to_string()))?;
+
                 let default_budget = crate::ExecutionBudget::default();
-                let (mut grant, mut run, mut snapshot) = crate::create_v1_compatibility_run(
-                    &stored_task,
-                    &intent,
-                    default_budget,
-                    granted_by,
-                )
-                .map_err(|e| DaemonError::Command(e.to_string()))?;
+                let (mut grant, mut run, mut snapshot) =
+                    crate::create_v1_compatibility_run_with_target(
+                        &stored_task,
+                        &intent,
+                        execution_target,
+                        default_budget,
+                        granted_by,
+                    )
+                    .map_err(|e| DaemonError::Command(e.to_string()))?;
 
                 grant.id = ExecutionGrantId(format!(
                     "grant-{}",

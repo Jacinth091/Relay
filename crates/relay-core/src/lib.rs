@@ -27,6 +27,9 @@ mod project_registry;
 pub mod recovery_v2;
 mod repository_safety;
 pub mod retention;
+mod role_prompt;
+#[cfg(windows)]
+pub mod run_context;
 pub mod scheduler_v2;
 mod task_ingress;
 pub mod workflow;
@@ -54,9 +57,9 @@ pub use daemon::{
 };
 #[cfg(windows)]
 pub use daemon_runtime::{
-    DaemonClientHandle, EmbeddedDaemon, WorkflowDriverContext, WorkflowRunContextResolver,
-    connect_or_embed, new_command_id, run_full_daemon, run_full_daemon_with_workflow_driver,
-    run_workflow_driver,
+    DaemonClientHandle, EmbeddedDaemon, WorkflowDriverContext, WorkflowRunContextFuture,
+    WorkflowRunContextResolver, connect_or_embed, connect_or_embed_with_workflow_driver,
+    new_command_id, run_full_daemon, run_full_daemon_with_workflow_driver, run_workflow_driver,
 };
 #[cfg(windows)]
 pub use daemon_transport::{NamedPipeDaemonClient, default_pipe_name};
@@ -114,9 +117,12 @@ pub use execution_planning::{
 };
 pub use legacy_adapter::{
     LegacyAdapterError, adapt_v1_handoff_to_approved_intent, create_v1_compatibility_run,
-    v1_compatibility_workflow_definition,
+    create_v1_compatibility_run_with_target, v1_compatibility_workflow_definition,
 };
-pub use orchestrator_v2::{OrchestratorError, OrchestratorV2, PhaseContext};
+pub use orchestrator_v2::{
+    OrchestratorError, OrchestratorV2, PhaseContext, PublishedRoleResult, ResultDefect,
+    RoleResultPayload, observed_role_result,
+};
 pub use policy::{
     Capability, EnforcementClass, PolicyCompiler, PolicyDecision, PolicyDisposition, PolicyLayer,
     built_in_safety_floor,
@@ -148,6 +154,9 @@ pub use repository_safety::{
     inspect_trusted_project_repository, read_repository_remote_origin,
 };
 pub use retention::{CleanupReport, RetentionError, RetentionManager, RetentionPolicy};
+pub use role_prompt::role_prompt;
+#[cfg(windows)]
+pub use run_context::TrustedRunContextResolver;
 pub use scheduler_v2::{
     ActiveExecutionSlot, QueuedWorkItem, SchedulePriority, SchedulerV2, SchedulerV2Config,
     SchedulerV2Error,

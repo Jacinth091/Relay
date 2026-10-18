@@ -24,26 +24,28 @@ Normative sources: `docs/adr/0020-relay-architecture-v2.md`, `docs/v2_architectu
 
 ## 2. Current Status Snapshot
 
-Relay Architecture v2 (ADR-0020) is accepted and is delivered as 16
-dependency-ordered vertical slices (phases 00–15).
+Relay Architecture v2 (ADR-0020) is organized as 16 dependency-ordered phases
+(00–15). The current roadmap marks no phase `DONE`.
 
 **Authoritative phase status is the table in `docs/v2_architecture_rebaseline/ROADMAP.md`**
-(status date 2026-09-18). Read it for current truth; do not rely on this summary.
-As of that date the roadmap records phases 00–15 as `DONE` on the strength of
-unit and integration test evidence. Those are **self-reported** results from the
-roadmap, not independent end-to-end validation: most v2 proof runs against
-deterministic/fake infrastructure (`FakeBackplane`, fake runtime, in-process
-clients), and live provider, Herdr, or multi-process paths are not exercised by
-CI. Do not present a module or test as proof that a path is production-ready.
+(status date 2026-10-18). Wave A is **LANDED** (governed re-review pending).
+Wave B is **PARTIAL**: R12-05 through R12-08 landed; R12-02 is implemented on
+unmerged draft PR #31. Wave C is **PARTIAL** on unmerged draft PR #32: R12-09,
+R12-11, and the local-process Run/TUI cutover are implemented; R12-10
+(production Herdr backplane) is split into a separate future run. The proof
+uses fake/mock providers and a local PowerShell stand-in; it has not exercised
+the real Codex CLI and does not establish a promoted production path. Read the
+roadmap for current truth and do not present a module or test as proof that a
+path is production-ready.
 
 | Item | State |
 |---|---|
 | Historical v1 lineage (M0–M9) | Frozen as historical evidence; ADR-0017 superseded by ADR-0020 |
 | v2 phase table (00–15) | **No phase is `DONE`.** The audit reset the dated roadmap's `DONE` markings; every phase now carries an evidence-based verdict — read `ROADMAP.md` |
-| Working end-to-end path today | Local paste/file import (and `relay serve-mcp` `submit_handoff`) → TUI review → explicit Run approval → `ExecutionScheduler` → runtime → events/diff/logs/history |
+| Working end-to-end path today | On unmerged draft PRs #31/#32: local paste/file import or `relay serve-mcp` `submit_handoff` → TUI review → explicit Run approval → daemon `RunTask` (approved intent, execution grant, config snapshot, and execution target frozen) → `OrchestratorV2` → `TrustedRunContextResolver` (registered project, trust classification, isolated `relay-run-<id>` worktree) → `LocalProcessBackplane` → `CodexProviderAdapter` → typed role result → `COMPLETE` or typed failure. Windows CI uses fakes/mocks and a local PowerShell stand-in; no real Codex CLI run has occurred. The v1 `ExecutionScheduler` is available only with `RELAY_LEGACY_V1_RUN=1`. |
 | A real Web UI | **Does not exist.** Phase 12's evidence was an in-process `DaemonClient` abstraction and integration tests, not a web application |
-| Daemon | `relay daemon` runs the durable daemon process (store lease ownership + fencing token, heartbeat renewal) and serves clients over a **Windows named pipe**. The TUI and `relay serve-mcp` submit durable mutations through it, embedding one in-process when none is running (`connect_or_embed`). Windows-only at this revision — see issue #17 |
-| Herdr backplane | Reference/fake-protocol vertical slice; not a durable production transport |
+| Daemon | `relay daemon` and daemons embedded by the TUI and `relay serve-mcp` run the v2 workflow driver (`run_full_daemon_with_workflow_driver` / `connect_or_embed_with_workflow_driver`). The daemon owns its store lease and fencing token, renews its heartbeat, and serves clients over a **Windows named pipe**. Windows-only at this revision — see issue #17 |
+| Herdr backplane | Topology/client abstractions remain test-only; there is no production Herdr transport or durable RuntimeBinding recovery. R12-10 (production Herdr backplane) is split into a separate future run |
 | Jev / semantic decisions | Optional advisory adapter behind a provider-neutral seam; not required for correctness |
 | Ingress reality | Local file/paste plus `relay serve-mcp` (local stdio). GitHub ingress descoped from v0.1 by ADR-0016 |
 | Provider distribution | Route-to-chosen-provider and slot-bounded concurrent executions exist; fan-out, health-aware routing, and cross-provider aggregation are design intent only (unimplemented portion of ADR-0018, superseded by ADR-0020) |
@@ -123,7 +125,7 @@ crates/
   relay-runtime/       Runtime abstraction layer: traits, profiles, router, activity
   relay-store/         SQLite persistence (SqliteStore)
 runtimes/
-  relay-runtime-codex/       Codex adapter (app-server stdio JSONL default; exec fallback)
+  relay-runtime-codex/       v1 Codex app-server runtime for the legacy Run path
   relay-runtime-antigravity/ Antigravity adapter
   relay-runtime-fake/        Scriptable runtime + fake backplane for tests
   relay-decision-jev/        Optional advisory semantic decision adapter
@@ -138,14 +140,17 @@ contexts/               Project-level context documents
 | Module | Responsibility |
 |---|---|
 | `task_ingress.rs` | Local task intake: preview/validate paste & file imports (size caps, duplicate-key rejection, project resolution, fail-closed). Entry point for ALL transports |
-| `execution.rs` | v1 `ExecutionScheduler`: queueing, global/project concurrency slots, permission broker (scoped grants), bounded repair loop, verification, escalation events, cancellation. M6 semantics are FROZEN — additive amendments only |
-| `execution_planning.rs` | `plan_execution` / `build_execution_plan`: turns user *intent* (profile/model/effort preferences) into a validated, clamped plan. Trusted workspace derives ONLY from registered projects |
+| `execution.rs` | Legacy v1 `ExecutionScheduler`: queueing, global/project concurrency slots, permission broker (scoped grants), bounded repair loop, verification, escalation events, cancellation. Used for Run only with `RELAY_LEGACY_V1_RUN=1`; M6 semantics are FROZEN — additive amendments only |
+| `execution_planning.rs` | Legacy v1 `plan_execution` / `build_execution_plan`: turns user *intent* (profile/model/effort preferences) into a validated, clamped plan. The default daemon v2 Run path sends `RunTask`; trusted workspace derives ONLY from registered projects |
 | `project_registry.rs` | Trusted local project registry: filesystem paths, expected Git remotes, default stacks. Remote/task input may reference projects by key only — never paths |
 | `repository_safety.rs` | Pre-run repository inspection/eligibility checks via git |
 | `durable_state.rs` | Stored-task state machine over relay-store; corrupt rows are quarantined, not fatal to listing |
+| `run_context.rs` | `TrustedRunContextResolver`: resolves a Run against the registered project, trust classification, and isolated run worktree |
+| `orchestrator_v2.rs` | `OrchestratorV2`: drives approved workflows through role attempts, runtime backplane, and typed role results on the default daemon Run path |
+| `legacy_adapter.rs` | Adapts accepted task data into the v2 workflow/run contract used by the default `RunTask` path; also provides the v1 compatibility execution target |
 | `daemon.rs` | v2 Phase 01 daemon ownership: client protocol types, typed commands, monotonic events, durable effects, and a lease + fencing token. `relay daemon` acquires the store lease, renews a heartbeat, and serves `DaemonClient` requests |
-| `daemon_runtime.rs`, `daemon_transport.rs` | Wave A daemon client/lifecycle seam: `DaemonClientHandle`, `connect_or_embed`, `run_full_daemon`, and the Windows named-pipe transport + framing. Both modules are `#[cfg(windows)]`, which is why the Linux CI leg is advisory (issue #17) |
-| v2 domain modules (`workflow`, `policy`, `candidate`, `lease`, `artifact`, `exchange`, `delegation`, `privileged`, `scheduler_v2`, …) | v2 orchestration domain. Mostly `PARTIAL` and not yet on the production Run path — check `ROADMAP.md` before relying on any of it |
+| `daemon_runtime.rs`, `daemon_transport.rs` | Wave A daemon client/lifecycle seam: `DaemonClientHandle`, `run_workflow_driver`, `run_full_daemon_with_workflow_driver`, `connect_or_embed_with_workflow_driver`, and Windows named-pipe transport/framing. TUI and `serve-mcp` embedded daemons attach the v2 workflow driver. Both modules are `#[cfg(windows)]`; see issue #17 |
+| v2 domain modules (`workflow`, `policy`, `candidate`, `lease`, `artifact`, `exchange`, `delegation`, `privileged`, `scheduler_v2`, …) | `workflow`, `orchestrator_v2`, and `legacy_adapter` are on the default Run path. `OrchestratorV2` uses `SchedulerV2` for per-run role slots and write leases; multi-project/provider scheduling durability, Exchange/outbox, delegation, and privileged-action enforcement remain partial or outside the production Run path under Waves D/E. Check `ROADMAP.md` before relying on them |
 
 ### apps/relay-tui — presentation (must not own policy)
 
@@ -153,8 +158,8 @@ Post-split module layout (was a monolith):
 
 | Module | Contents |
 |---|---|
-| `main.rs` (~140 lines) | Startup, store opening, event loop wiring |
-| `state.rs` | `AppState` (all UI state incl. preflight cache, permission queue), health probing, router construction |
+| `main.rs` | Startup and daemon wiring; `production_workflow_driver` composes `LocalProcessBackplane`, `CodexProviderAdapter`, and `TrustedRunContextResolver`, and selects `RunPath` |
+| `state.rs` | `AppState` and `RunPath::{DaemonV2, LegacyV1}`; default `submit_selected_task_v2` sends `RunTask` to the daemon |
 | `input.rs` | Key handling per screen; Ctrl+C quits globally; Enter prefers exactly-typed commands over suggestions |
 | `commands.rs` | Command palette command dispatch (`RelayCommand::execute_relay_command`) |
 | `command_completion.rs` | Palette catalog, suggestions, autocomplete eligibility |
@@ -164,7 +169,7 @@ Post-split module layout (was a monolith):
 
 UI language rule: user-facing copy speaks handoff language ("Handoff status", escalations, distribution), never orchestrator/AI-manager framing. Internal identifiers keep scheduler/runtime names unchanged.
 
-Presentation must not own: task execution, ingress logic, project routing, runtime selection, repository validation, persistence policy, repair policy. It gathers **intent** and calls `plan_execution`; core owns everything downstream.
+Presentation must not own: task execution, ingress logic, project routing, runtime selection, repository validation, persistence policy, repair policy. The default path sends `RunTask` to the daemon; `plan_execution` belongs to the legacy v1 path behind `RELAY_LEGACY_V1_RUN=1`.
 
 ### crates/relay-runtime — the seam between core and providers
 
@@ -175,11 +180,17 @@ Presentation must not own: task execution, ingress logic, project routing, runti
 | `router.rs` | `RuntimeRouter`: routes each execution to a registered runtime by profile prefix (capability-based dispatch is the goal; name-prefix is the current mechanism) |
 | `profile.rs` | Runtime profiles, capability enums (filesystem/network), effective-profile resolution |
 | `activity.rs` | Provider-neutral activity normalization |
+| `backplane.rs` | `RuntimeBackplane` contract for launching, observing, and controlling runtime processes |
+| `local_process_backplane.rs` | `LocalProcessBackplane`, the local process implementation used by the default daemon Run composition |
+| `process_tree.rs` | Process-tree containment and identity-aware orphan handling |
+| `role_result.rs` | Parses and validates typed published role-result artifacts; process exit alone is insufficient for completion |
+| `provider/mod.rs` | Provider adapter contract and exports |
+| `provider/codex.rs` | `CodexProviderAdapter` for the v2 local Run path |
+| `provider/mock.rs` | Mock provider adapter for deterministic tests |
 
 ### Runtimes (edges)
 
-Each implements the Runtime trait against its provider's local CLI:
-- `relay-runtime-codex`: `codex app-server` over stdio JSONL is the DEFAULT transport (`RELAY_CODEX_TRANSPORT=exec` opts out); handles turn/start with model+reasoning, paginated model/list catalogs, real approval-request parsing, process-tree containment (Windows job objects/taskkill).
+The v2 `CodexProviderAdapter` in `crates/relay-runtime/src/provider/codex.rs` launches one-shot `codex exec`. The separate `runtimes/relay-runtime-codex` app-server stdio JSONL runtime serves the legacy v1 path behind `RELAY_LEGACY_V1_RUN=1`.
 - `relay-runtime-fake`: scriptable outcomes for tests; recovery-loop tests depend on it.
 
 ---
@@ -187,17 +198,19 @@ Each implements the Runtime trait against its provider's local CLI:
 ## 6. How A Run Flows (mental model)
 
 ```text
-paste/file import -> protocol validate -> preview -> human confirms import
-   -> task READY (SQLite, canonical)
-review screen (cached preflight) -> explicit Run approval (invariant 13)
-   -> plan_execution(intent) -> validated/clamped ExecutionRunPolicy
-   -> scheduler queue (global/project slots) -> RuntimeRouter -> runtime process
-   -> events: output chunks, activity, permission requests (TUI popup grants scoped)
-   -> bounded auto-repair within approved scope
+Default daemon v2 Run path (implemented on unmerged draft PRs #31/#32):
+paste/file import or `serve-mcp` `submit_handoff` -> TUI review -> explicit Run approval
+   -> daemon `RunTask` (approved intent, execution grant, config snapshot, execution target)
+   -> `OrchestratorV2` -> `TrustedRunContextResolver` (registered project, trust classification,
+      isolated `relay-run-<id>` worktree) -> `LocalProcessBackplane` -> `CodexProviderAdapter`
+   -> typed role result -> COMPLETE or typed failure
+
+Legacy v1 Run path (`RELAY_LEGACY_V1_RUN=1` only):
+task review -> `plan_execution(intent)` -> `ExecutionScheduler` -> legacy runtime
    -> DONE | FAILED | NEEDS_CLARIFICATION | NEEDS_DECISION (structured Markdown packet)
 ```
 
-Escalation packets are the engine's most important output; they surface in the Dashboard ESCALATION INBOX.
+Legacy v1 clarification and decision packets remain an important engine output and surface in the Dashboard ESCALATION INBOX. The current `OrchestratorV2` path completes a workflow or returns a typed failure; it does not emit `NEEDS_CLARIFICATION` or `NEEDS_DECISION` packets.
 
 ---
 
@@ -291,9 +304,10 @@ Add focused integration tests for process boundaries, repository safety, recover
 ## 12. Next Up (so agents don't guess)
 
 1. **Relay Architecture v2 Rebaseline** — follow the 16-phase sequential implementation plan in `docs/v2_architecture_rebaseline/02-IMPLEMENTATION-SEQUENCE.md`. Per-phase status is tracked authoritatively in `docs/v2_architecture_rebaseline/ROADMAP.md` — read that table for current truth, do not rely on this section for phase status, and do not mark a phase `DONE` here or there until its production exit gate is proven.
-2. A governed external review found PR #12 could not merge: v2 modules existed but were not wired into the production path and most v2 state was memory-only. The correction plan is tracked wave-by-wave in `docs/v2_architecture_rebaseline/REMEDIATION-WAVES.md`. **Wave A is landed**: canonical daemon ownership is wired into the TUI and MCP, command/effect handling is crash-safe, and the state that wave touches is durable. It still awaits the governed re-review, which the owner has deferred — see that doc before treating any finding as resolved.
-3. **Wave B is partially landed**: R12-05 (trust verifies the expected remote), R12-06 (workflow/intent/policy validation contract), R12-07 (SHA-256 integrity digests) and R12-08 (durable, fenced write leases) are committed. **R12-02 is outstanding** — the user-facing Run path still executes the v1 `ExecutionScheduler`. Waves C–F are not started; do not begin them until Wave B is complete.
-4. No v2 phase is marked `DONE` in `ROADMAP.md`; each carries an evidence-based verdict. Most v2 proof runs use deterministic/fake infrastructure (`FakeBackplane`, fake runtime, in-process clients). The production **Run** path still executes the v1 `ExecutionScheduler`, and the cutover to the v2 orchestrator is **not implemented at this revision**. Do not describe the v2 orchestration domain as wired into the production path until that cutover lands and is proven end to end.
+2. **Wave A is LANDED** (governed re-review remains deferred). Wave B R12-02 is on draft PR #31; Wave C R12-09, R12-11, the local-process Run path, and TUI cutover are on stacked draft PR #32. Both PRs are unmerged and await the owner's merge decision; the governed re-review is also deferred. This stack is not a promoted production build.
+3. Next is **Wave D** (R12-12/13/14). Production Herdr backplane work, R12-10, is split into a separate future run.
+4. Residual gaps: Exchange/outbox idempotency, durable delegation and multi-project scheduler recovery, truthful policy enforcement, privileged/failure correctness, no v2 cancel command or per-run model/effort selection, no live execution output or provider-health display, only Codex is wired in the local composition, no real-provider smoke run, no production Herdr transport, and the v1 scheduler remains available behind its opt-in.
+   Additional gap: no clarification/decision escalation on the v2 path.
 5. If committed work on a branch contradicts `ROADMAP.md`, **report the drift to the maintainer**; do not rewrite the status tables yourself.
 
 ## 13. Working on this repository as a public project

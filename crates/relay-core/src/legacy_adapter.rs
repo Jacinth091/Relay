@@ -17,9 +17,9 @@ use thiserror::Error;
 
 use crate::{
     ApprovedIntent, ConfigSnapshot, ExecutionBudget, ExecutionGrant, ExecutionGrantId,
-    RoleDefinition, RoleDefinitionId, RoleWriteMode, StoredTask, TaskState, TransitionCondition,
-    WorkflowDefinition, WorkflowDefinitionId, WorkflowNodeDefinition, WorkflowRun,
-    WorkflowRunState, WorkflowTransitionDefinition,
+    ExecutionTarget, RoleDefinition, RoleDefinitionId, RoleWriteMode, StoredTask, TaskState,
+    TransitionCondition, WorkflowDefinition, WorkflowDefinitionId, WorkflowNodeDefinition,
+    WorkflowRun, WorkflowRunState, WorkflowTransitionDefinition,
 };
 
 #[derive(Debug, Error)]
@@ -28,6 +28,28 @@ pub enum LegacyAdapterError {
     TaskNotReady { current: String },
     #[error("task data error: {0}")]
     TaskData(String),
+    #[error("unsupported runtime stack '{0}'")]
+    UnsupportedRuntimeStack(String),
+}
+
+pub(crate) fn execution_target_for_stack(
+    stack: &str,
+) -> Result<ExecutionTarget, LegacyAdapterError> {
+    let (provider_id, runtime_profile_id) = match stack {
+        "chatgpt-codex" | "codex" => ("codex", "codex/default"),
+        "antigravity" | "agy" => ("antigravity", "antigravity/default"),
+        other => {
+            return Err(LegacyAdapterError::UnsupportedRuntimeStack(
+                other.to_owned(),
+            ));
+        }
+    };
+
+    Ok(ExecutionTarget {
+        provider_id: provider_id.to_owned(),
+        runtime_profile_id: runtime_profile_id.to_owned(),
+        provider_adapter_version: "0.1.0".to_owned(),
+    })
 }
 
 /// The standard v1 compatibility workflow definition:
@@ -111,6 +133,20 @@ pub fn create_v1_compatibility_run(
     budget: ExecutionBudget,
     granted_by: &str,
 ) -> Result<(ExecutionGrant, WorkflowRun, ConfigSnapshot), LegacyAdapterError> {
+    let stack = task.handoff.stack.as_deref().unwrap_or("codex");
+    let execution_target = execution_target_for_stack(stack)?;
+    create_v1_compatibility_run_with_target(task, intent, execution_target, budget, granted_by)
+}
+
+/// Creates a compatibility workflow run with the exact execution target frozen
+/// by the Run approval path.
+pub fn create_v1_compatibility_run_with_target(
+    task: &StoredTask,
+    intent: &ApprovedIntent,
+    execution_target: ExecutionTarget,
+    budget: ExecutionBudget,
+    granted_by: &str,
+) -> Result<(ExecutionGrant, WorkflowRun, ConfigSnapshot), LegacyAdapterError> {
     if task.state != TaskState::Ready {
         return Err(LegacyAdapterError::TaskNotReady {
             current: task.state.as_str().to_owned(),
@@ -118,8 +154,9 @@ pub fn create_v1_compatibility_run(
     }
 
     let wf_def = v1_compatibility_workflow_definition();
-    let snapshot =
+    let mut snapshot =
         ConfigSnapshot::capture(wf_def.version, budget.clone(), wf_def.content_hash.clone());
+    snapshot.execution_target = Some(execution_target);
 
     let grant = ExecutionGrant {
         id: ExecutionGrantId::generate(),
@@ -197,9 +234,14 @@ mod tests {
         assert_eq!(intent.acceptance_criteria, vec!["Must be fast"]);
         assert_eq!(intent.constraints, vec!["No external network"]);
 
-        let (grant, run, snapshot) = create_v1_compatibility_run(
+        let (grant, run, snapshot) = create_v1_compatibility_run_with_target(
             &task_ready,
             &intent,
+            ExecutionTarget {
+                provider_id: "codex".to_owned(),
+                runtime_profile_id: "codex/default".to_owned(),
+                provider_adapter_version: "0.1.0".to_owned(),
+            },
             ExecutionBudget::default(),
             "operator",
         )

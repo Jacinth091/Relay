@@ -21,6 +21,7 @@ use thiserror::Error;
 use crate::{
     EffectKey, LaunchSpecification, ProcessStatus, RuntimeModelSelection, RuntimeObservation,
     RuntimeReasoningSelection,
+    role_result::{ResultDefect, observed_role_result},
 };
 
 mod codex;
@@ -229,6 +230,7 @@ pub struct LaunchContext {
     pub trusted_cwd: PathBuf,
     pub role_purpose: String,
     pub effect_key: EffectKey,
+    pub role_prompt: String,
 }
 
 impl LaunchContext {
@@ -236,11 +238,13 @@ impl LaunchContext {
         trusted_cwd: impl Into<PathBuf>,
         role_purpose: impl Into<String>,
         effect_key: EffectKey,
+        role_prompt: impl Into<String>,
     ) -> Self {
         Self {
             trusted_cwd: trusted_cwd.into(),
             role_purpose: role_purpose.into(),
             effect_key,
+            role_prompt: role_prompt.into(),
         }
     }
 }
@@ -289,12 +293,27 @@ pub trait ProviderAdapter: Send + Sync + 'static {
 /// Shared readiness interpretation for adapters driven by a generic
 /// `ProcessStatus`-based backplane observation, given an adapter-specific
 /// heuristic for detecting a mid-run "waiting for user" marker in stdout.
+///
+/// Provider exit is never a role result. A process that exited successfully
+/// counts as `ResultPublished` only when it actually published a well-formed
+/// typed result envelope on stdout; exiting 0 with no envelope (or with an
+/// unusable one) is reported as a provider error.
 pub(crate) fn interpret_process_observation(
     obs: &RuntimeObservation,
     waiting_for_user: impl FnOnce(&RuntimeObservation) -> bool,
 ) -> ProviderReadiness {
     match &obs.status {
-        ProcessStatus::ExitedSuccess { .. } => ProviderReadiness::ResultPublished,
+        ProcessStatus::ExitedSuccess { .. } => match observed_role_result(obs) {
+            Ok(_) => ProviderReadiness::ResultPublished,
+            Err(ResultDefect::Missing) => ProviderReadiness::ProviderError {
+                reason:
+                    "provider process exited successfully without publishing a typed role result"
+                        .to_owned(),
+            },
+            Err(ResultDefect::Malformed(reason)) => ProviderReadiness::ProviderError {
+                reason: format!("provider process published an unusable role result: {reason}"),
+            },
+        },
         ProcessStatus::ExitedFailure { exit_code } => ProviderReadiness::ProviderError {
             reason: format!("process exited with failure (exit_code={exit_code:?})"),
         },

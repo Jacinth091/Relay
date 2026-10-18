@@ -21,18 +21,18 @@
 //! 4. Unbounded remediation is strictly halted by execution budget limits.
 //! 5. Execution state transitions are persisted durably in SQLite for restart rehydration.
 
-use std::{collections::HashSet, path::Path, sync::Arc};
+use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
 
 use relay_runtime::{
-    EffectKey, LaunchSpecification, ProcessStatus, ReconcileOutcome, RuntimeBackplane,
-    RuntimeHandle, RuntimeObservation, RuntimeProvisionRequest, SanitizedEnvironment,
+    EffectKey, LaunchContext, LaunchSpecification, ProcessStatus, ProviderAdapter, ProviderError,
+    ReconcileOutcome, RuntimeBackplane, RuntimeHandle, RuntimeModelSelection,
+    RuntimeProvisionRequest, RuntimeReasoningSelection, SanitizedEnvironment,
 };
 use relay_store::{DaemonFence, StoreError};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    ArtifactKind, ArtifactStore, Candidate, CandidateFingerprint, CheckoutId,
+    ApprovedIntent, ArtifactKind, ArtifactStore, Candidate, CandidateFingerprint, CheckoutId,
     CreateArtifactRequest, ExecutionBudget, ExecutionTarget, ProjectId, RoleAttempt,
     RoleAttemptState, RoleDefinitionId, RoleInstance, SchedulePriority, SchedulerV2, SqliteStore,
     WorkflowRun, WorkflowRunId, WorkflowRunState,
@@ -56,6 +56,10 @@ pub enum OrchestratorError {
     RunNotFound(String),
     #[error("scheduling failed: {0}")]
     SchedulingFailed(String),
+    #[error("no provider adapter is registered for frozen provider '{0}'")]
+    ProviderAdapterMissing(String),
+    #[error("provider launch could not be built: {0}")]
+    ProviderLaunchFailed(String),
     #[error("backplane error: {0}")]
     Backplane(String),
     #[error("workflow error: {0}")]
@@ -89,86 +93,13 @@ impl OrchestratorError {
     }
 }
 
-/// The typed result a role process must publish on stdout for its attempt to
-/// be accepted. Process exit success alone is never sufficient: exit status
-/// says a process ended, not that the role produced anything usable.
-///
-/// Wire form is one JSON object on its own line of stdout:
-///
-/// ```text
-/// {"role_result":"implemented","detail":"..."}
-/// {"role_result":"verification_passed"}
-/// {"role_result":"verification_failed","reason":"..."}
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "role_result", rename_all = "snake_case")]
-pub enum RoleResultPayload {
-    Implemented { detail: String },
-    VerificationPassed,
-    VerificationFailed { reason: String },
-}
-
-impl RoleResultPayload {
-    /// Stable name used in diagnostics and in "wrong role" rejections.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Implemented { .. } => "implemented",
-            Self::VerificationPassed => "verification_passed",
-            Self::VerificationFailed { .. } => "verification_failed",
-        }
-    }
-}
-
-/// Why an observation could not be accepted as a typed role result.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResultDefect {
-    /// The process published no recognizable result object at all.
-    Missing,
-    /// A result object was present but violated the contract, or belonged to a
-    /// different role than the one that produced it.
-    Malformed(String),
-}
-
-/// A role result as published, kept alongside the exact bytes the process
-/// wrote so the resulting artifact stores the observation rather than a
-/// summary the orchestrator invented.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublishedRoleResult {
-    pub payload: RoleResultPayload,
-    pub raw: String,
-}
-
-/// Extracts the typed role result a process published on stdout.
-pub fn observed_role_result(
-    observation: &RuntimeObservation,
-) -> Result<PublishedRoleResult, ResultDefect> {
-    let stdout = String::from_utf8_lossy(&observation.stdout_chunk);
-
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if value.get("role_result").is_none() {
-            continue;
-        }
-
-        return match serde_json::from_value::<RoleResultPayload>(value) {
-            Ok(payload) => Ok(PublishedRoleResult {
-                payload,
-                raw: line.to_owned(),
-            }),
-            Err(error) => Err(ResultDefect::Malformed(format!(
-                "result object does not satisfy the role result contract: {error}"
-            ))),
-        };
-    }
-
-    Err(ResultDefect::Missing)
-}
+// The typed role-result contract lives in the runtime layer (see
+// `relay_runtime::role_result`), so provider adapters and this orchestrator
+// share exactly one parser. It is re-exported here to preserve the historical
+// `relay_core::orchestrator_v2::*` public paths.
+pub use relay_runtime::{
+    PublishedRoleResult, ResultDefect, RoleResultPayload, observed_role_result,
+};
 
 /// Inputs shared by every role phase of one workflow run.
 #[derive(Clone, Copy)]
@@ -186,6 +117,7 @@ pub struct OrchestratorV2<B: RuntimeBackplane> {
     scheduler: Arc<SchedulerV2>,
     backplane: Arc<B>,
     artifact_store: ArtifactStore,
+    provider_adapters: Vec<Arc<dyn ProviderAdapter>>,
 }
 
 impl<B: RuntimeBackplane> OrchestratorV2<B> {
@@ -194,12 +126,14 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
         scheduler: Arc<SchedulerV2>,
         backplane: Arc<B>,
         artifact_store: ArtifactStore,
+        provider_adapters: Vec<Arc<dyn ProviderAdapter>>,
     ) -> Self {
         Self {
             store,
             scheduler,
             backplane,
             artifact_store,
+            provider_adapters,
         }
     }
 
@@ -252,6 +186,7 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
         };
         let mut current_generation = 1u32;
         let mut role_activations = 0u32;
+        let mut remediation_reason = None;
 
         loop {
             role_activations += 1;
@@ -266,7 +201,13 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
 
             // 1. Run Implementer
             let (candidate, _impl_artifact_id) = self
-                .run_implementer_phase(&workflow_run, &ctx, current_generation, fence)
+                .run_implementer_phase_with_reason(
+                    &workflow_run,
+                    &ctx,
+                    current_generation,
+                    remediation_reason.as_deref(),
+                    fence,
+                )
                 .await?;
 
             role_activations += 1;
@@ -280,11 +221,17 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
             }
 
             // 2. Run Verifier
-            let verifier_passed = self
-                .run_verifier_phase(&workflow_run, &ctx, current_generation, &candidate, fence)
+            let verifier_failure_reason = self
+                .run_verifier_phase_with_failure_reason(
+                    &workflow_run,
+                    &ctx,
+                    current_generation,
+                    &candidate,
+                    fence,
+                )
                 .await?;
 
-            if verifier_passed {
+            if verifier_failure_reason.is_none() {
                 workflow_run.complete();
                 update_durable_workflow_run_state(&self.store, &workflow_run, fence).await?;
                 return Ok(WorkflowRunState::Completed);
@@ -292,6 +239,7 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
 
             // Verifier failed: trigger bounded remediation loop
             current_generation += 1;
+            remediation_reason = verifier_failure_reason;
         }
     }
 
@@ -303,6 +251,18 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
         generation: u32,
         fence: &DaemonFence,
     ) -> Result<(Candidate, String), OrchestratorError> {
+        self.run_implementer_phase_with_reason(workflow_run, ctx, generation, None, fence)
+            .await
+    }
+
+    async fn run_implementer_phase_with_reason(
+        &self,
+        workflow_run: &WorkflowRun,
+        ctx: &PhaseContext<'_>,
+        generation: u32,
+        remediation_reason: Option<&str>,
+        fence: &DaemonFence,
+    ) -> Result<(Candidate, String), OrchestratorError> {
         let PhaseContext {
             project_id,
             checkout_id,
@@ -310,6 +270,7 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
             execution_target,
             budget,
         } = *ctx;
+        let approved_intent = self.load_approved_intent(workflow_run).await?;
         let implementer_role_id = RoleDefinitionId::new("implementer");
         let mut implementer_instance = RoleInstance::new(
             workflow_run.id.clone(),
@@ -324,6 +285,29 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
             .map_err(OrchestratorError::Workflow)?;
         persist_role_attempt_if_absent(&self.store, &attempt, fence).await?;
         update_durable_role_instance(&self.store, &implementer_instance, fence).await?;
+
+        let effect_key = EffectKey::new(format!("effect-{}", attempt.id));
+        let launch = match self.build_role_launch(
+            execution_target,
+            &attempt,
+            working_directory,
+            "implementer",
+            &approved_intent,
+            remediation_reason,
+            effect_key.clone(),
+        ) {
+            Ok(launch) => launch,
+            Err(error) => {
+                self.fail_attempt_before_launch(
+                    &mut attempt,
+                    &mut implementer_instance,
+                    error.to_string(),
+                    fence,
+                )
+                .await?;
+                return Err(error);
+            }
+        };
 
         // Enqueue to SchedulerV2 with write lease requirement
         let item = QueuedWorkItem {
@@ -365,20 +349,39 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
         record_role_attempt_lease(&self.store, &attempt, fence).await?;
 
         // Provision on RuntimeBackplane
+        let executable = launch.executable.clone();
         let prov_req = RuntimeProvisionRequest::new(
-            EffectKey::new(format!("effect-{}", attempt.id)),
+            effect_key,
             attempt.id.to_string(),
             working_directory,
-            LaunchSpecification::new("relay-implementer", vec![]),
+            launch,
             SanitizedEnvironment::new(),
             1024 * 1024,
         );
 
-        let handle = self
-            .backplane
-            .provision(prov_req)
-            .await
-            .map_err(|e| OrchestratorError::Backplane(e.to_string()))?;
+        let handle = match self.backplane.provision(prov_req).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                let reason = match error {
+                    relay_runtime::BackplaneError::LaunchFailed(reason) => format!(
+                        "provider executable '{}' could not be started: {reason}",
+                        executable.display()
+                    ),
+                    other => other.to_string(),
+                };
+                self.fail_attempt_before_launch(
+                    &mut attempt,
+                    &mut implementer_instance,
+                    reason.clone(),
+                    fence,
+                )
+                .await?;
+                self.scheduler
+                    .release_slot(&slot.slot_id, &self.store)
+                    .await;
+                return Err(OrchestratorError::Backplane(reason));
+            }
+        };
 
         // Record the process identity durably so a restarted daemon can
         // reconcile the process this attempt actually launched.
@@ -387,11 +390,23 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
         record_role_attempt_runtime_handle(&self.store, &attempt, fence).await?;
 
         // Observe process execution
-        let observation = self
-            .backplane
-            .observe(&handle)
-            .await
-            .map_err(|e| OrchestratorError::Backplane(e.to_string()))?;
+        let observation = match self.observe_until_terminal(&handle, budget).await {
+            Ok(observation) => observation,
+            Err(error) => {
+                self.fail_attempt_before_launch(
+                    &mut attempt,
+                    &mut implementer_instance,
+                    error.to_string(),
+                    fence,
+                )
+                .await?;
+                let _ = self.backplane.dispose(&handle).await;
+                self.scheduler
+                    .release_slot(&slot.slot_id, &self.store)
+                    .await;
+                return Err(error);
+            }
+        };
 
         // INVARIANT: Process success alone NEVER completes a role instance!
         if !matches!(observation.status, ProcessStatus::ExitedSuccess { .. }) {
@@ -502,6 +517,20 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
         candidate: &Candidate,
         fence: &DaemonFence,
     ) -> Result<bool, OrchestratorError> {
+        Ok(self
+            .run_verifier_phase_with_failure_reason(workflow_run, ctx, generation, candidate, fence)
+            .await?
+            .is_none())
+    }
+
+    async fn run_verifier_phase_with_failure_reason(
+        &self,
+        workflow_run: &WorkflowRun,
+        ctx: &PhaseContext<'_>,
+        generation: u32,
+        candidate: &Candidate,
+        fence: &DaemonFence,
+    ) -> Result<Option<String>, OrchestratorError> {
         let PhaseContext {
             project_id,
             checkout_id,
@@ -509,6 +538,7 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
             execution_target,
             budget,
         } = *ctx;
+        let approved_intent = self.load_approved_intent(workflow_run).await?;
         let verifier_role_id = RoleDefinitionId::new("verifier");
         let mut verifier_instance =
             RoleInstance::new(workflow_run.id.clone(), verifier_role_id, generation, None);
@@ -519,6 +549,29 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
             .map_err(OrchestratorError::Workflow)?;
         persist_role_attempt_if_absent(&self.store, &attempt, fence).await?;
         update_durable_role_instance(&self.store, &verifier_instance, fence).await?;
+
+        let effect_key = EffectKey::new(format!("effect-{}", attempt.id));
+        let launch = match self.build_role_launch(
+            execution_target,
+            &attempt,
+            working_directory,
+            "verifier",
+            &approved_intent,
+            None,
+            effect_key.clone(),
+        ) {
+            Ok(launch) => launch,
+            Err(error) => {
+                self.fail_attempt_before_launch(
+                    &mut attempt,
+                    &mut verifier_instance,
+                    error.to_string(),
+                    fence,
+                )
+                .await?;
+                return Err(error);
+            }
+        };
 
         // Verifier is ReadOnly (no exclusive checkout write lease required)
         let item = QueuedWorkItem {
@@ -557,20 +610,39 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
         update_durable_role_attempt(&self.store, &attempt, fence).await?;
 
         // Backplane provision & observe
+        let executable = launch.executable.clone();
         let prov_req = RuntimeProvisionRequest::new(
-            EffectKey::new(format!("effect-{}", attempt.id)),
+            effect_key,
             attempt.id.to_string(),
             working_directory,
-            LaunchSpecification::new("relay-verifier", vec![]),
+            launch,
             SanitizedEnvironment::new(),
             1024 * 1024,
         );
 
-        let handle = self
-            .backplane
-            .provision(prov_req)
-            .await
-            .map_err(|e| OrchestratorError::Backplane(e.to_string()))?;
+        let handle = match self.backplane.provision(prov_req).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                let reason = match error {
+                    relay_runtime::BackplaneError::LaunchFailed(reason) => format!(
+                        "provider executable '{}' could not be started: {reason}",
+                        executable.display()
+                    ),
+                    other => other.to_string(),
+                };
+                self.fail_attempt_before_launch(
+                    &mut attempt,
+                    &mut verifier_instance,
+                    reason.clone(),
+                    fence,
+                )
+                .await?;
+                self.scheduler
+                    .release_slot(&slot.slot_id, &self.store)
+                    .await;
+                return Err(OrchestratorError::Backplane(reason));
+            }
+        };
 
         // Record the process identity durably so a restarted daemon can
         // reconcile the process this attempt actually launched.
@@ -578,11 +650,23 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
         attempt.runtime_backplane_id = Some(handle.backplane_id.to_string());
         record_role_attempt_runtime_handle(&self.store, &attempt, fence).await?;
 
-        let observation = self
-            .backplane
-            .observe(&handle)
-            .await
-            .map_err(|e| OrchestratorError::Backplane(e.to_string()))?;
+        let observation = match self.observe_until_terminal(&handle, budget).await {
+            Ok(observation) => observation,
+            Err(error) => {
+                self.fail_attempt_before_launch(
+                    &mut attempt,
+                    &mut verifier_instance,
+                    error.to_string(),
+                    fence,
+                )
+                .await?;
+                let _ = self.backplane.dispose(&handle).await;
+                self.scheduler
+                    .release_slot(&slot.slot_id, &self.store)
+                    .await;
+                return Err(error);
+            }
+        };
 
         let _ = self.backplane.dispose(&handle).await;
         self.scheduler
@@ -617,9 +701,9 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
                     .await);
             }
         };
-        let verification_passed = match &published.payload {
-            RoleResultPayload::VerificationPassed => true,
-            RoleResultPayload::VerificationFailed { .. } => false,
+        let failure_reason = match &published.payload {
+            RoleResultPayload::VerificationPassed => None,
+            RoleResultPayload::VerificationFailed { reason } => Some(reason.clone()),
             other => {
                 let defect = ResultDefect::Malformed(format!(
                     "verifier attempt published a '{}' result",
@@ -675,11 +759,136 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
         verifier_instance.accept_result(verif_artifact.id.0.clone());
         update_durable_role_instance(&self.store, &verifier_instance, fence).await?;
 
-        let outcome = if verification_passed { "PASS" } else { "FAIL" };
+        let outcome = if failure_reason.is_none() {
+            "PASS"
+        } else {
+            "FAIL"
+        };
         attempt.finish(outcome.to_owned(), Some(verif_artifact.id.0));
         update_durable_role_attempt(&self.store, &attempt, fence).await?;
 
-        Ok(verification_passed)
+        Ok(failure_reason)
+    }
+
+    async fn load_approved_intent(
+        &self,
+        workflow_run: &WorkflowRun,
+    ) -> Result<ApprovedIntent, OrchestratorError> {
+        let record = self
+            .store
+            .get_workflow_run(&workflow_run.id.0)
+            .await?
+            .ok_or_else(|| OrchestratorError::RunNotFound(workflow_run.id.0.clone()))?;
+        if record.approved_intent_json.trim().is_empty() {
+            return Err(OrchestratorError::InvariantViolation(format!(
+                "workflow run '{}' has no frozen approved intent",
+                workflow_run.id
+            )));
+        }
+        serde_json::from_str(&record.approved_intent_json).map_err(|error| {
+            OrchestratorError::InvariantViolation(format!(
+                "workflow run '{}' has invalid frozen approved intent JSON: {error}",
+                workflow_run.id
+            ))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_role_launch(
+        &self,
+        execution_target: &ExecutionTarget,
+        attempt: &RoleAttempt,
+        working_directory: &Path,
+        role: &str,
+        approved_intent: &ApprovedIntent,
+        remediation_reason: Option<&str>,
+        effect_key: EffectKey,
+    ) -> Result<LaunchSpecification, OrchestratorError> {
+        let adapter = self
+            .provider_adapters
+            .iter()
+            .find(|adapter| adapter.provider_id().0 == execution_target.provider_id)
+            .ok_or_else(|| {
+                OrchestratorError::ProviderAdapterMissing(execution_target.provider_id.clone())
+            })?;
+        let runtime_target = relay_runtime::ExecutionTarget {
+            provider_id: adapter.provider_id(),
+            runtime_profile_id: execution_target.runtime_profile_id.clone(),
+            model: RuntimeModelSelection::ProviderDefault,
+            reasoning_effort: RuntimeReasoningSelection::ProfileDefault,
+            capability_snapshot: adapter.capabilities(),
+            provider_adapter_version: execution_target.provider_adapter_version.clone(),
+        };
+        let mut runtime_attempt = relay_runtime::RoleAttempt::new(
+            attempt.role_instance_id.0.clone(),
+            attempt.attempt_no,
+            relay_runtime::ProviderCapabilityRequirements::new(role),
+        );
+        runtime_attempt.id = relay_runtime::RoleAttemptId(attempt.id.0.clone());
+        runtime_attempt.provider_pin = Some(runtime_target.provider_id.clone());
+        runtime_attempt.runtime_profile_id = runtime_target.runtime_profile_id.clone();
+        let context = LaunchContext::new(
+            working_directory,
+            role,
+            effect_key,
+            crate::role_prompt(role, approved_intent, remediation_reason),
+        );
+
+        adapter
+            .build_launch(&runtime_target, &runtime_attempt, &context)
+            .map_err(|error: ProviderError| {
+                OrchestratorError::ProviderLaunchFailed(error.to_string())
+            })
+    }
+
+    async fn fail_attempt_before_launch(
+        &self,
+        attempt: &mut RoleAttempt,
+        role_instance: &mut RoleInstance,
+        reason: String,
+        fence: &DaemonFence,
+    ) -> Result<(), OrchestratorError> {
+        attempt.fail(reason);
+        update_durable_role_attempt(&self.store, attempt, fence).await?;
+        role_instance.fail();
+        update_durable_role_instance(&self.store, role_instance, fence).await?;
+        Ok(())
+    }
+
+    async fn observe_until_terminal(
+        &self,
+        handle: &RuntimeHandle,
+        budget: &ExecutionBudget,
+    ) -> Result<relay_runtime::RuntimeObservation, OrchestratorError> {
+        let started = tokio::time::Instant::now();
+        loop {
+            let observation = self
+                .backplane
+                .observe(handle)
+                .await
+                .map_err(|error| OrchestratorError::Backplane(error.to_string()))?;
+            if !matches!(
+                observation.status,
+                ProcessStatus::Starting | ProcessStatus::Running
+            ) {
+                return Ok(observation);
+            }
+
+            let delay = match budget.max_wall_clock_secs {
+                Some(seconds) => {
+                    let limit = Duration::from_secs(seconds);
+                    let elapsed = started.elapsed();
+                    if elapsed >= limit {
+                        return Err(OrchestratorError::Backplane(format!(
+                            "provider process exceeded the wall-clock budget of {seconds} seconds"
+                        )));
+                    }
+                    Duration::from_millis(50).min(limit - elapsed)
+                }
+                None => Duration::from_millis(50),
+            };
+            tokio::time::sleep(delay).await;
+        }
     }
 
     /// Refuses an attempt whose published result cannot be accepted.
@@ -773,6 +982,31 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
                         match outcome {
                             Ok(ReconcileOutcome::Alive { .. }) => {
                                 // Still alive
+                            }
+                            Ok(ReconcileOutcome::Orphaned { pid }) => {
+                                // Verified: the PID is still the exact process
+                                // Relay launched, so terminating its whole tree
+                                // cannot hit a recycled PID. Terminate it before
+                                // marking the attempt lost so no orphan is left
+                                // running behind the new daemon.
+                                relay_runtime::terminate_pid_tree(pid).await;
+                                attempt.state = RoleAttemptState::Lost;
+                                attempt.runtime_outcome = Some(
+                                    "orphaned provider process from a previous daemon was terminated"
+                                        .to_owned(),
+                                );
+                                update_durable_role_attempt(&self.store, &attempt, fence).await?;
+                            }
+                            Ok(ReconcileOutcome::OrphanUnverified { pid, .. }) => {
+                                // Fail closed. A live PID is not proof it is our
+                                // process: it may have been recycled by an
+                                // unrelated program. Terminate nothing and record
+                                // the truthful outcome instead.
+                                attempt.state = RoleAttemptState::Lost;
+                                attempt.runtime_outcome = Some(format!(
+                                    "previous provider process {pid} could not be verified; it was not terminated"
+                                ));
+                                update_durable_role_attempt(&self.store, &attempt, fence).await?;
                             }
                             _ => {
                                 // Process died or backplane was restarted: reconcile attempt state

@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     process::Stdio,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::{
@@ -21,6 +21,56 @@ use crate::backplane::{
     InterruptReceipt, ProcessStatus, ReconcileOutcome, RuntimeBackplane, RuntimeHandle,
     RuntimeObservation, RuntimeProvisionRequest, SendReceipt,
 };
+use crate::process_tree::{
+    ProcessIdentity, process_identity, terminate_pid_tree, terminate_process_tree,
+};
+
+/// Bound how long inherited output handles can delay a terminal observation.
+const TERMINAL_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Standard non-secret OS plumbing inherited by local provider processes.
+///
+/// The child environment starts cleared so arbitrary parent variables cannot
+/// leak. This list preserves OS paths, shell and module lookup, and machine and
+/// user identity values needed by Windows, PowerShell, and common local CLIs to
+/// start. Every other parent variable is dropped. Request-sanitized variables
+/// override inherited values.
+const PARENT_ENV_ALLOW_LIST: [&str; 34] = [
+    "SystemRoot",
+    "SYSTEMDRIVE",
+    "windir",
+    "TEMP",
+    "TMP",
+    "PATH",
+    "PATHEXT",
+    "COMSPEC",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "HOME",
+    "USER",
+    "LANG",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "ProgramData",
+    "CommonProgramFiles",
+    "CommonProgramFiles(x86)",
+    "CommonProgramW6432",
+    "PSModulePath",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "NUMBER_OF_PROCESSORS",
+    "OS",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "USERNAME",
+    "USERDOMAIN",
+    "COMPUTERNAME",
+    "PUBLIC",
+    "ALLUSERSPROFILE",
+    "SystemDrive",
+];
 
 fn now_timestamp() -> String {
     SystemTime::now()
@@ -34,6 +84,8 @@ struct ProcessSlot {
     stdin_tx: Option<mpsc::Sender<Vec<u8>>>,
     stdout_buf: Arc<Mutex<Vec<u8>>>,
     stderr_buf: Arc<Mutex<Vec<u8>>>,
+    stdout_reader: Option<tokio::task::JoinHandle<()>>,
+    stderr_reader: Option<tokio::task::JoinHandle<()>>,
     exited_code: Option<Option<i32>>,
 }
 
@@ -87,7 +139,19 @@ impl RuntimeBackplane for LocalProcessBackplane {
             cmd.args(&req.launch.args);
             cmd.current_dir(&req.trusted_cwd);
 
-            // Apply sanitized environment
+            // On Unix, start the child as its own process-group leader so a
+            // later group kill reaches the whole process tree.
+            #[cfg(unix)]
+            cmd.process_group(0);
+
+            // Start cleared: inherit only the OS allow-list from the parent,
+            // then let the sanitized vars override anything.
+            cmd.env_clear();
+            for name in PARENT_ENV_ALLOW_LIST {
+                if let Some(value) = std::env::var_os(name) {
+                    cmd.env(name, value);
+                }
+            }
             for (k, v) in &req.environment.vars {
                 cmd.env(k, v);
             }
@@ -113,7 +177,7 @@ impl RuntimeBackplane for LocalProcessBackplane {
             let stderr_buf = Arc::new(Mutex::new(Vec::new()));
 
             // Stream stdout in background task
-            if let Some(mut stdout) = child.stdout.take() {
+            let stdout_reader = child.stdout.take().map(|mut stdout| {
                 let sbuf = stdout_buf.clone();
                 let limit = req.output_byte_limit;
                 tokio::spawn(async move {
@@ -128,11 +192,11 @@ impl RuntimeBackplane for LocalProcessBackplane {
                             b.extend_from_slice(&chunk[..take]);
                         }
                     }
-                });
-            }
+                })
+            });
 
             // Stream stderr in background task
-            if let Some(mut stderr) = child.stderr.take() {
+            let stderr_reader = child.stderr.take().map(|mut stderr| {
                 let sbuf = stderr_buf.clone();
                 let limit = req.output_byte_limit;
                 tokio::spawn(async move {
@@ -147,8 +211,8 @@ impl RuntimeBackplane for LocalProcessBackplane {
                             b.extend_from_slice(&chunk[..take]);
                         }
                     }
-                });
-            }
+                })
+            });
 
             // Setup stdin channel to avoid holding mutex locks across async writes
             let stdin_tx = if let Some(mut stdin) = child.stdin.take() {
@@ -174,6 +238,8 @@ impl RuntimeBackplane for LocalProcessBackplane {
                 stdin_tx,
                 stdout_buf,
                 stderr_buf,
+                stdout_reader,
+                stderr_reader,
                 exited_code: None,
             };
 
@@ -189,25 +255,53 @@ impl RuntimeBackplane for LocalProcessBackplane {
 
     fn observe<'a>(&'a self, handle: &'a RuntimeHandle) -> BackplaneFuture<'a, RuntimeObservation> {
         Box::pin(async move {
-            let mut active = self.active.lock().unwrap();
-            let slot = active
-                .get_mut(&handle.handle_id)
-                .ok_or_else(|| BackplaneError::HandleNotFound(handle.handle_id.clone()))?;
+            let (status, readers) = {
+                let mut active = self.active.lock().unwrap();
+                let slot = active
+                    .get_mut(&handle.handle_id)
+                    .ok_or_else(|| BackplaneError::HandleNotFound(handle.handle_id.clone()))?;
 
-            // Poll child exit status non-blockingly
-            if slot.exited_code.is_none() {
-                if let Ok(Some(status)) = slot.child.try_wait() {
-                    slot.exited_code = Some(status.code());
+                // Poll child exit status non-blockingly.
+                if slot.exited_code.is_none() {
+                    if let Ok(Some(status)) = slot.child.try_wait() {
+                        slot.exited_code = Some(status.code());
+                    }
                 }
-            }
 
-            let status = match slot.exited_code {
-                Some(Some(0)) => ProcessStatus::ExitedSuccess { exit_code: 0 },
-                Some(Some(c)) => ProcessStatus::ExitedFailure { exit_code: Some(c) },
-                Some(None) => ProcessStatus::ExitedFailure { exit_code: None },
-                None => ProcessStatus::Running,
+                let status = match slot.exited_code {
+                    Some(Some(0)) => ProcessStatus::ExitedSuccess { exit_code: 0 },
+                    Some(Some(code)) => ProcessStatus::ExitedFailure {
+                        exit_code: Some(code),
+                    },
+                    Some(None) => ProcessStatus::ExitedFailure { exit_code: None },
+                    None => ProcessStatus::Running,
+                };
+                let readers = if matches!(
+                    status,
+                    ProcessStatus::ExitedSuccess { .. } | ProcessStatus::ExitedFailure { .. }
+                ) {
+                    (slot.stdout_reader.take(), slot.stderr_reader.take())
+                } else {
+                    (None, None)
+                };
+                (status, readers)
             };
 
+            // A terminal process closes both pipes. Drain their reader tasks
+            // before returning the final observation so its typed result is not
+            // lost to a race between process exit and pipe capture. A descendant
+            // may keep an inherited handle open, so bound each drain wait.
+            if let Some(reader) = readers.0 {
+                let _ = tokio::time::timeout(TERMINAL_OUTPUT_DRAIN_TIMEOUT, reader).await;
+            }
+            if let Some(reader) = readers.1 {
+                let _ = tokio::time::timeout(TERMINAL_OUTPUT_DRAIN_TIMEOUT, reader).await;
+            }
+
+            let active = self.active.lock().unwrap();
+            let slot = active
+                .get(&handle.handle_id)
+                .ok_or_else(|| BackplaneError::HandleNotFound(handle.handle_id.clone()))?;
             let stdout_chunk = slot.stdout_buf.lock().unwrap().clone();
             let stderr_chunk = slot.stderr_buf.lock().unwrap().clone();
             let total = stdout_chunk.len() + stderr_chunk.len();
@@ -250,13 +344,22 @@ impl RuntimeBackplane for LocalProcessBackplane {
 
     fn interrupt<'a>(&'a self, handle: &'a RuntimeHandle) -> BackplaneFuture<'a, InterruptReceipt> {
         Box::pin(async move {
-            let mut active = self.active.lock().unwrap();
-            let slot = active
-                .get_mut(&handle.handle_id)
-                .ok_or_else(|| BackplaneError::HandleNotFound(handle.handle_id.clone()))?;
+            // Copy the PID out instead of holding the std::sync::Mutex guard
+            // across the termination await.
+            let pid = {
+                let mut active = self.active.lock().unwrap();
+                let slot = active
+                    .get_mut(&handle.handle_id)
+                    .ok_or_else(|| BackplaneError::HandleNotFound(handle.handle_id.clone()))?;
 
-            let _ = slot.child.start_kill();
-            slot.exited_code = Some(None);
+                slot.exited_code = Some(None);
+                slot.child.id()
+            };
+
+            if let Some(pid) = pid {
+                terminate_pid_tree(pid).await;
+            }
+
             Ok(InterruptReceipt { initiated: true })
         })
     }
@@ -269,7 +372,9 @@ impl RuntimeBackplane for LocalProcessBackplane {
             };
 
             if let Some(ref mut slot) = removed {
-                let _ = slot.child.kill().await;
+                // The slot is already out of the map, so the guard is not held
+                // across the await. Kill the whole tree, not just the child.
+                terminate_process_tree(&mut slot.child).await;
                 Ok(DisposeReceipt { reaped: true })
             } else {
                 Ok(DisposeReceipt { reaped: false })
@@ -290,20 +395,57 @@ impl RuntimeBackplane for LocalProcessBackplane {
 
     fn reconcile<'a>(&'a self, handle: &'a RuntimeHandle) -> BackplaneFuture<'a, ReconcileOutcome> {
         Box::pin(async move {
-            let mut active = self.active.lock().unwrap();
-            if let Some(slot) = active.get_mut(&handle.handle_id) {
-                if let Ok(Some(status)) = slot.child.try_wait() {
-                    Ok(ReconcileOutcome::CleanlyExited {
-                        exit_code: status.code(),
-                    })
-                } else if let Some(pid) = handle.pid {
-                    Ok(ReconcileOutcome::Alive { pid })
-                } else {
-                    Ok(ReconcileOutcome::ResourceNotFound)
+            // Classify the slot while the lock is held, then drop the guard
+            // before any await (the orphan liveness probe).
+            let state = {
+                let mut active = self.active.lock().unwrap();
+                match active.get_mut(&handle.handle_id) {
+                    Some(slot) => match slot.child.try_wait() {
+                        Ok(Some(status)) => SlotState::Exited(status.code()),
+                        _ => SlotState::Running(handle.pid),
+                    },
+                    None => SlotState::Absent,
                 }
-            } else {
-                Ok(ReconcileOutcome::ResourceNotFound)
+            };
+
+            match state {
+                SlotState::Exited(exit_code) => Ok(ReconcileOutcome::CleanlyExited { exit_code }),
+                SlotState::Running(Some(pid)) => Ok(ReconcileOutcome::Alive { pid }),
+                SlotState::Running(None) => Ok(ReconcileOutcome::ResourceNotFound),
+                // Not active in this backplane instance. A durable handle from
+                // a previous daemon may still be running, but a live PID alone
+                // is not proof: operating systems recycle PIDs, so the process
+                // at that PID may now be an unrelated program. Only a verified
+                // match is reported as killable.
+                SlotState::Absent => match handle.pid {
+                    Some(pid) => match process_identity(pid, &handle.created_at).await {
+                        ProcessIdentity::Same => Ok(ReconcileOutcome::Orphaned { pid }),
+                        ProcessIdentity::Dead => Ok(ReconcileOutcome::ResourceNotFound),
+                        ProcessIdentity::Different => Ok(ReconcileOutcome::OrphanUnverified {
+                            pid,
+                            reason: format!(
+                                "pid {pid} now belongs to a process started after Relay \
+                                     launched it; the pid was reused"
+                            ),
+                        }),
+                        ProcessIdentity::Unverifiable => Ok(ReconcileOutcome::OrphanUnverified {
+                            pid,
+                            reason: format!(
+                                "pid {pid} could not be proven to identify the process Relay \
+                                     launched"
+                            ),
+                        }),
+                    },
+                    None => Ok(ReconcileOutcome::ResourceNotFound),
+                },
             }
         })
     }
+}
+
+/// Classification of a handle against this backplane instance's active slots.
+enum SlotState {
+    Exited(Option<i32>),
+    Running(Option<u32>),
+    Absent,
 }

@@ -4,7 +4,10 @@
 //! quota exhaustion, auth loss, or unavailability without spawning real
 //! processes.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use super::{
     ExecutionTarget, LaunchContext, ProviderAdapter, ProviderCapabilities, ProviderError,
@@ -18,6 +21,7 @@ pub struct MockProviderAdapter {
     capabilities: ProviderCapabilities,
     health: Mutex<ProviderHealthSnapshot>,
     launch_executable: String,
+    role_executables: HashMap<String, String>,
 }
 
 impl MockProviderAdapter {
@@ -28,7 +32,18 @@ impl MockProviderAdapter {
             provider_id,
             capabilities,
             health: Mutex::new(ProviderHealthSnapshot::Healthy),
+            role_executables: HashMap::new(),
         }
+    }
+
+    pub fn with_role_executable(
+        mut self,
+        role_purpose: impl Into<String>,
+        executable: impl Into<String>,
+    ) -> Self {
+        self.role_executables
+            .insert(role_purpose.into(), executable.into());
+        self
     }
 
     pub fn set_health(&self, health: ProviderHealthSnapshot) {
@@ -62,8 +77,12 @@ impl ProviderAdapter for MockProviderAdapter {
         attempt: &RoleAttempt,
         context: &LaunchContext,
     ) -> Result<LaunchSpecification, ProviderError> {
+        let executable = self
+            .role_executables
+            .get(&context.role_purpose)
+            .unwrap_or(&self.launch_executable);
         Ok(LaunchSpecification::new(
-            self.launch_executable.clone(),
+            executable.clone(),
             vec![
                 "--role-attempt".to_owned(),
                 attempt.id.0.clone(),

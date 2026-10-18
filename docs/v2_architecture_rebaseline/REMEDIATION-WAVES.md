@@ -33,13 +33,13 @@ Status: **LANDED, re-review pending**
 
 ## Wave B — Establish a real v2 execution vertical slice
 
-Status: **PARTIAL — R12-05, R12-06, R12-07 and R12-08 landed; R12-02 outstanding**
+Status: **PARTIAL — R12-05, R12-06, R12-07 and R12-08 landed; R12-02 implemented on draft PR #31, unmerged**
 
 - **R12-05** — Project trust classification can become trusted without verifying the expected remote — **landed** (`17866e6`)
 - **R12-06** — Workflow, intent, and policy contracts are below the rebaseline specification — **landed** (`9f96216`)
 - **R12-07** — Candidate/artifact/intent integrity digests are not stable cryptographic digests — **landed** (`b142aca`)
 - **R12-08** — Lease fencing and expiry validation are incorrect — **landed** (`db97bb4`); the durable-checkout lease expiry path was corrected and regression-tested by PR #16 promotion-review finding **R16-01** (see the corrections below)
-- **R12-02** — The user-facing Run path still executes the v1 scheduler, not the v2 orchestrator — **outstanding**
+- **R12-02** — The approved Run path uses the v2 orchestrator — **implemented on draft PR #31, not merged**. `f8db7f2` adds durable workflow runs, role instances and attempts plus migrations `0010` and `0011`; `af4b84a` adds migration `0012` and atomically stores the approved intent, execution grant and config snapshot with the Run start; `623b9d5` drives the approved run through `OrchestratorV2`; `3c95021` adds the daemon/store/orchestrator proof; `92cfb38` refuses a second distinct Run approval for an already-running task. Draft PR #31 head is `0cf46f8`; Windows CI run `39094441207` is green. The PR is unmerged, so this does not establish a promoted production cutover.
 
 ### PR #16 promotion-review corrections
 
@@ -291,11 +291,28 @@ work mixed in. All three were reproduced in source before any change.
 
 ## Wave C — Harden runtime/provider semantics
 
-Status: **NOT STARTED**
+Status: **PARTIAL — R12-09 and R12-11 plus the local-process Run path/TUI cutover are implemented on draft PR #32; R12-10 is split into a separate future run. PR #32 is unmerged.**
 
-- **R12-09** — LocalProcessBackplane does not yet provide the required containment/idempotency semantics
-- **R12-11** — Provider process exit success is incorrectly treated as semantic result publication
-- **R12-10** — Herdr integration is a mock vertical shape, not a durable production backplane
+- **R12-11 — provider result semantics:** `415337c` makes provider exit insufficient to publish a role result; completion requires a valid typed result artifact (`crates/relay-runtime/tests/role_result_readiness.rs`, `crates/relay-runtime/tests/phase08_provider_adapters.rs`, and `process_exit_success_without_a_published_result_cannot_advance_a_role` in `crates/relay-core/tests/wave_b_run_path_v2.rs`). `d226a9b` launches role attempts through provider adapters and builds the role prompt from approved intent. These changes use fake/mock adapters in CI; no real provider CLI is exercised.
+- **R12-09 — local process containment:** `7cddeb9` sanitizes the provider environment, kills process trees and reports orphans; `2af3cb6` verifies process identity before terminating an orphan; `760a25d` passes standard non-secret Windows OS variables. Boundary coverage is in `crates/relay-runtime/tests/phase06_runtime_backplane.rs`.
+- **Daemon Run composition:** `26b63e3` runs approved workflows with `LocalProcessBackplane`, `TrustedRunContextResolver` and `CodexProviderAdapter`; `1f1196a` stabilizes reused worktree paths and bounds output drain; `7a0bd93` routes TUI Run through daemon `RunTask` by default and keeps the v1 scheduler behind `RELAY_LEGACY_V1_RUN=1`. The daemon and embedded-daemon composition use the same workflow driver. The local-process proof is `approved_run_completes_through_local_process_backplane_and_trusted_resolver`; `missing_codex_executable_fails_the_attempt_and_run_with_a_clear_reason` covers fail-closed behavior. TUI coverage includes `daemon_v2_run_uses_the_daemon_and_refreshes_durable_state`, `legacy_v1_run_path_constructs_the_scheduler` and the `legacy_v1_run_path_*` tests.
+- **Windows CI evidence:** run `39126016714` on `1f1196a` is green; run `39128455124` on draft head `9b3ae87` is green and covers the TUI cutover tests, including `daemon_v2_run_*` and `legacy_v1_run_path_*`. Draft PR #32 is stacked on draft PR #31 and remains unmerged.
+- **R12-10 — production Herdr backplane:** **not done**. The existing Herdr shape remains fake/test-only; the owner split the production backplane into a separate future run.
+
+### What the evidence proves / does not prove
+
+Windows CI exercises the deterministic v2 daemon/store/orchestrator path with `FakeBackplane` and a scriptable mock provider, including approval replay, result validation, bounded remediation, fencing and restart reconciliation (`3c95021`, `crates/relay-core/tests/wave_b_run_path_v2.rs`). It also exercises a local PowerShell stand-in provider through the real `LocalProcessBackplane` + `TrustedRunContextResolver` + daemon composition (`approved_run_completes_through_local_process_backplane_and_trusted_resolver`). The TUI tests cover the default daemon `RunTask` route and the explicit legacy-v1 opt-in. The green Windows CI runs are `39094441207`, `39126016714` and `39128455124`.
+
+This evidence does **not** include a real Codex CLI invocation or any live-provider smoke run; the PowerShell process is a stand-in. It does not prove production Herdr transport, provider authentication/model behavior, or that the unmerged PR stack is present in a promoted build. A missing Codex executable is tested to fail closed, not to prove a successful real-provider run.
+
+### Known residual gaps carried into Wave D (and the separate Herdr run)
+
+- **Wave D findings remain open:** R12-12 Exchange state is memory-only and outbox ingestion is not idempotent; R12-13 delegation and Scheduler v2 remain nonrecoverable in-memory algorithms; R12-14 policy enforcement classes still overstate what Relay enforces.
+- The default v2 Run path cannot yet raise structured clarification or decision escalations required by AGENTS.md invariants 5–6 and §8: `OrchestratorV2` completes or fails with a typed error, and only the legacy v1 path escalates; this gap must be closed before the v1 path can be removed.
+- The v2 path has no cancel command, per-run model or effort selection (the TUI refuses overrides), live execution output on the execution screen, or provider-health display. The v1 `ExecutionScheduler` remains behind `RELAY_LEGACY_V1_RUN=1`; its removal is not done.
+- Only `CodexProviderAdapter` is wired into the local production composition. The Antigravity target has no production adapter and fails closed.
+- Production Herdr backplane work (R12-10) is a separate future run; the current Herdr shape is test-only.
+- No real-provider smoke run has been performed. Draft PRs #31 and #32 are unmerged, and the governed re-review remains deferred.
 
 ## Wave D — Make orchestration durable/recoverable
 

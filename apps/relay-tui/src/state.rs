@@ -160,6 +160,22 @@ pub(crate) fn build_runtime_router() -> RuntimeRouter {
     router
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunPath {
+    DaemonV2,
+    LegacyV1,
+}
+
+impl RunPath {
+    pub(crate) fn from_env_value(value: Option<&str>) -> Self {
+        if value == Some("1") {
+            Self::LegacyV1
+        } else {
+            Self::DaemonV2
+        }
+    }
+}
+
 impl Default for AppRuntime {
     fn default() -> Self {
         #[cfg(test)]
@@ -207,6 +223,7 @@ pub(crate) struct AppState {
     pub(crate) registry_writable: bool,
     pub(crate) database_path: PathBuf,
     pub(crate) store: Option<SqliteStore>,
+    pub(crate) run_path: RunPath,
     /// Client handle to the canonical Relay Daemon, used for durable
     /// mutations (task submission). `store` is kept alongside it only for
     /// reads (snapshots, listings) and the still-v1 execution/scheduler path.
@@ -915,6 +932,7 @@ impl AppState {
         config_path: PathBuf,
         registry_writable: bool,
         feedback: String,
+        run_path: RunPath,
     ) -> Self {
         Self::new_with_store(
             relay,
@@ -924,9 +942,11 @@ impl AppState {
             None,
             Vec::new(),
             feedback,
+            run_path,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_store(
         relay: Relay,
         config_path: PathBuf,
@@ -935,6 +955,7 @@ impl AppState {
         store: Option<SqliteStore>,
         durable_tasks: Vec<StoredTask>,
         feedback: String,
+        run_path: RunPath,
     ) -> Self {
         // Test builds stay hermetic: the developer's real runtimes.toml
         // (e.g. an antigravity default profile) must not decide test outcomes.
@@ -946,16 +967,20 @@ impl AppState {
         )
         .unwrap_or_default();
         let default_profile = runtime_settings.runtime.default_profile.clone();
-        let scheduler = store.as_ref().map(|store| {
-            let mut router = build_runtime_router();
-            router.set_default_profile(default_profile.clone());
-            Arc::new(ExecutionScheduler::new(
-                relay.clone(),
-                store.clone(),
-                Arc::new(router),
-                app_execution_limits(),
-            ))
-        });
+        let scheduler = if run_path == RunPath::LegacyV1 {
+            store.as_ref().map(|store| {
+                let mut router = build_runtime_router();
+                router.set_default_profile(default_profile.clone());
+                Arc::new(ExecutionScheduler::new(
+                    relay.clone(),
+                    store.clone(),
+                    Arc::new(router),
+                    app_execution_limits(),
+                ))
+            })
+        } else {
+            None
+        };
         let scheduler_events = scheduler.as_ref().map(|scheduler| scheduler.subscribe());
         Self {
             relay,
@@ -963,6 +988,7 @@ impl AppState {
             registry_writable,
             database_path,
             store,
+            run_path,
             daemon: None,
             durable_tasks,
             selected_task: None,
@@ -1043,6 +1069,10 @@ impl AppState {
     /// `None` degrades task import the same way a missing `store` does.
     pub(crate) fn attach_daemon(&mut self, daemon: Option<DaemonClientHandle>) {
         self.daemon = daemon;
+    }
+
+    pub(crate) fn legacy_run_path_label(&self) -> Option<&'static str> {
+        (self.run_path == RunPath::LegacyV1).then_some("Legacy v1 Run path (RELAY_LEGACY_V1_RUN)")
     }
 
     pub(crate) fn handle_paste(&mut self, text: &str) {
@@ -1179,23 +1209,25 @@ impl AppState {
         if task.state != TaskState::Ready {
             return Some("unavailable: task is not READY".to_owned());
         }
-        if self.scheduler.is_none() {
+        if self.run_path == RunPath::LegacyV1 && self.scheduler.is_none() {
             return Some("unavailable: local runtime or store is unavailable".to_owned());
         }
-        let provider = self.active_profile_id.split('/').next().unwrap_or_default();
-        let health_ready = match provider {
-            "codex" => self.runtime_health.is_ready(),
-            "antigravity" => matches!(
-                self.antigravity_health,
-                AntigravityRuntimeHealth::Available { .. }
-                    | AntigravityRuntimeHealth::AuthUnverifiable { .. }
-            ),
-            _ => false,
-        };
-        if !health_ready {
-            return Some(format!(
-                "unavailable: runtime provider '{provider}' is not ready"
-            ));
+        if self.run_path == RunPath::LegacyV1 {
+            let provider = self.active_profile_id.split('/').next().unwrap_or_default();
+            let health_ready = match provider {
+                "codex" => self.runtime_health.is_ready(),
+                "antigravity" => matches!(
+                    self.antigravity_health,
+                    AntigravityRuntimeHealth::Available { .. }
+                        | AntigravityRuntimeHealth::AuthUnverifiable { .. }
+                ),
+                _ => false,
+            };
+            if !health_ready {
+                return Some(format!(
+                    "unavailable: runtime provider '{provider}' is not ready"
+                ));
+            }
         }
         match self.effective_stack(task) {
             Ok("chatgpt-codex" | "codex" | "antigravity" | "agy") => {}
@@ -1298,6 +1330,11 @@ impl AppState {
     }
 
     pub(crate) async fn submit_selected_task(&mut self) {
+        if self.run_path == RunPath::DaemonV2 {
+            self.submit_selected_task_v2().await;
+            return;
+        }
+
         self.reap_finished_scheduler_driver().await;
         if self.scheduler_rebind_pending {
             self.rebind_scheduler_if_idle();
@@ -1421,10 +1458,70 @@ impl AppState {
         }
     }
 
+    async fn submit_selected_task_v2(&mut self) {
+        let Some(task) = self.selected_stored_task().cloned() else {
+            return;
+        };
+        if task.state != TaskState::Ready
+            || self
+                .scheduler_snapshot
+                .tasks
+                .iter()
+                .any(|snapshot| snapshot.task_id == task.id)
+            || self
+                .execution_views
+                .get(&task.id)
+                .and_then(|view| view.scheduler_status.as_ref())
+                .is_some()
+        {
+            self.feedback = "Run is available only once for a durable READY task.".to_owned();
+            return;
+        }
+        let preflight = self.fresh_ui_preflight(&task).await;
+        if preflight != "eligible" {
+            self.feedback = format!("Run unavailable: {preflight}");
+            return;
+        }
+        if self.one_run_model_override.is_some() || self.one_run_reasoning_override.is_some() {
+            self.feedback = "The daemon v2 Run path does not apply one-run model or effort overrides. Clear the override or start Relay with RELAY_LEGACY_V1_RUN=1.".to_owned();
+            return;
+        }
+        let Some(daemon) = self.daemon.as_ref() else {
+            self.feedback = "Run is unavailable until the daemon is reachable.".to_owned();
+            return;
+        };
+        let command_id = new_command_id();
+        match daemon
+            .submit_command(
+                &command_id,
+                DaemonCommand::RunTask {
+                    task_id: task.id.to_string(),
+                    granted_by: "local-tui".to_owned(),
+                },
+            )
+            .await
+        {
+            Ok(CommandStatus::Applied | CommandStatus::Duplicate) => {
+                self.refresh_durable_tasks().await;
+                self.feedback = "Run approved. Sent to the Relay daemon.".to_owned();
+                self.screen = Screen::TaskReview;
+            }
+            Ok(CommandStatus::Failed) => {
+                self.feedback =
+                    "Run was not approved: the Relay daemon rejected the command.".to_owned();
+            }
+            Err(error) => self.feedback = format!("Run was not approved: {error}"),
+        }
+    }
+
     pub(crate) async fn confirm_cancel(&mut self) {
         let Some(task_id) = self.cancel_confirmation.take() else {
             return;
         };
+        if self.run_path == RunPath::DaemonV2 {
+            self.feedback = "Cancel is not available for daemon v2 runs yet.".to_owned();
+            return;
+        }
         let Some(scheduler) = self.scheduler.clone() else {
             return;
         };
@@ -1517,6 +1614,9 @@ impl AppState {
     }
 
     pub(crate) fn rebind_scheduler_if_idle(&mut self) {
+        if self.run_path == RunPath::DaemonV2 {
+            return;
+        }
         if self.scheduler_driver.is_some() || !self.scheduler_snapshot.tasks.is_empty() {
             self.scheduler_rebind_pending = true;
             return;

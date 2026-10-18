@@ -27,6 +27,7 @@ mod project_registry;
 pub mod recovery_v2;
 mod repository_safety;
 pub mod retention;
+mod role_prompt;
 pub mod scheduler_v2;
 mod task_ingress;
 pub mod workflow;
@@ -151,6 +152,7 @@ pub use repository_safety::{
     inspect_trusted_project_repository, read_repository_remote_origin,
 };
 pub use retention::{CleanupReport, RetentionError, RetentionManager, RetentionPolicy};
+pub use role_prompt::role_prompt;
 pub use scheduler_v2::{
     ActiveExecutionSlot, QueuedWorkItem, SchedulePriority, SchedulerV2, SchedulerV2Config,
     SchedulerV2Error,

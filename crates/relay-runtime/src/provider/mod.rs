@@ -230,6 +230,7 @@ pub struct LaunchContext {
     pub trusted_cwd: PathBuf,
     pub role_purpose: String,
     pub effect_key: EffectKey,
+    pub role_prompt: String,
 }
 
 impl LaunchContext {
@@ -237,11 +238,13 @@ impl LaunchContext {
         trusted_cwd: impl Into<PathBuf>,
         role_purpose: impl Into<String>,
         effect_key: EffectKey,
+        role_prompt: impl Into<String>,
     ) -> Self {
         Self {
             trusted_cwd: trusted_cwd.into(),
             role_purpose: role_purpose.into(),
             effect_key,
+            role_prompt: role_prompt.into(),
         }
     }
 }

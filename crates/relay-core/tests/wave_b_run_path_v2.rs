@@ -29,24 +29,24 @@ use std::{
 };
 
 use relay_core::{
-    ArtifactStore, CheckoutId, CommandStatus, DaemonCommand, DaemonRequest, DaemonResponse,
-    DaemonServer, ExecutionBudget, ExecutionTarget, OrchestratorError, OrchestratorV2,
-    PhaseContext, ProjectId, ProjectKey, ProjectRegistry, RegisterProject, Relay, RoleAttemptState,
-    RoleDefinitionId, RoleInstance, SchedulerV2, SchedulerV2Config, SqliteStore, StoredTask,
-    SubmissionTransport, TaskId, TaskState, WorkflowDriverContext, WorkflowRun,
-    WorkflowRunContextResolver, WorkflowRunId, WorkflowRunState,
-    adapt_v1_handoff_to_approved_intent, create_v1_compatibility_run, get_durable_workflow_run,
-    get_stored_task, list_role_attempts_for_instance, list_role_instances_for_run,
-    persist_role_attempt_if_absent, persist_role_instance_if_absent,
-    persist_workflow_run_if_absent, record_role_attempt_runtime_handle, run_full_daemon,
-    run_full_daemon_with_workflow_driver,
+    ApprovedIntent, ArtifactStore, CheckoutId, CommandStatus, ConfigSnapshot, DaemonCommand,
+    DaemonRequest, DaemonResponse, DaemonServer, ExecutionBudget, ExecutionGrant, ExecutionTarget,
+    OrchestratorError, OrchestratorV2, PhaseContext, ProjectId, ProjectKey, ProjectRegistry,
+    RegisterProject, Relay, RoleAttemptState, RoleDefinitionId, RoleInstance, SchedulerV2,
+    SchedulerV2Config, SqliteStore, StoredTask, SubmissionTransport, TaskId, TaskState,
+    WorkflowDriverContext, WorkflowRun, WorkflowRunContextResolver, WorkflowRunId,
+    WorkflowRunState, adapt_v1_handoff_to_approved_intent, create_v1_compatibility_run,
+    get_durable_workflow_run, get_stored_task, list_role_attempts_for_instance,
+    list_role_instances_for_run, persist_role_attempt_if_absent, persist_role_instance_if_absent,
+    record_role_attempt_runtime_handle, run_full_daemon, run_full_daemon_with_workflow_driver,
 };
 use relay_protocol::{AmbiguityPolicy, HandoffTask, TaskSpec};
 use relay_runtime::{
-    EffectKey, LaunchSpecification, RuntimeBackplane, RuntimeProvisionRequest, SanitizedEnvironment,
+    EffectKey, LaunchSpecification, MockProviderAdapter, ProviderAdapter, ProviderCapabilities,
+    RuntimeBackplane, RuntimeProvisionRequest, SanitizedEnvironment,
 };
 use relay_runtime_fake::{FakeBackplane, FakeProcessBehavior};
-use relay_store::{DaemonFence, NewTaskRecord};
+use relay_store::{DaemonFence, NewTaskRecord, NewWorkflowRunRecord, WorkflowRunStart};
 
 const IMPLEMENTER: &str = "relay-implementer";
 const VERIFIER: &str = "relay-verifier";
@@ -240,6 +240,74 @@ async fn persist_task_row(store: &SqliteStore, task: &StoredTask, fence: &Daemon
         .unwrap();
 }
 
+async fn persist_approved_workflow_run(
+    store: &SqliteStore,
+    task: &StoredTask,
+    intent: &ApprovedIntent,
+    grant: &ExecutionGrant,
+    workflow_run: &WorkflowRun,
+    snapshot: &ConfigSnapshot,
+    fence: &DaemonFence,
+) {
+    let run_record = NewWorkflowRunRecord {
+        id: workflow_run.id.0.clone(),
+        task_id: workflow_run.task_id.to_string(),
+        execution_grant_id: workflow_run.execution_grant_id.0.clone(),
+        workflow_definition_id: workflow_run.workflow_definition_id.0.clone(),
+        state: "running".to_owned(),
+        config_snapshot_id: workflow_run.config_snapshot_id.0.clone(),
+    };
+    let intent_json = serde_json::to_string(intent).unwrap();
+    let grant_json = serde_json::to_string(grant).unwrap();
+    let snapshot_json = serde_json::to_string(snapshot).unwrap();
+    let event_json = serde_json::json!({
+        "task_id": task.id.to_string(),
+        "workflow_run_id": workflow_run.id.0,
+        "execution_grant_id": grant.id.0,
+        "config_snapshot_id": snapshot.id.0,
+        "state": "running",
+    })
+    .to_string();
+
+    store
+        .start_workflow_run_fenced(
+            &WorkflowRunStart {
+                run: &run_record,
+                approved_intent_json: &intent_json,
+                execution_grant_json: &grant_json,
+                config_snapshot_json: &snapshot_json,
+                task_expected_state: "ready",
+                task_new_state: "running",
+                event_kind: "workflow_run_started",
+                event_json: Some(&event_json),
+            },
+            fence,
+        )
+        .await
+        .unwrap();
+}
+
+fn test_provider_adapters() -> Vec<Arc<dyn ProviderAdapter>> {
+    let adapter: Arc<dyn ProviderAdapter> = MockProviderAdapter::new(
+        "fake",
+        ProviderCapabilities {
+            supported_roles: ["implementer", "verifier"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            filesystem_write: true,
+            network: false,
+            streaming_output: true,
+            cancellation: true,
+            supported_models: vec!["default".to_owned()],
+        },
+    )
+    .with_role_executable("implementer", IMPLEMENTER)
+    .with_role_executable("verifier", VERIFIER)
+    .arc();
+    vec![adapter]
+}
+
 /// Submits a daemon command and returns the raw response.
 ///
 /// `DaemonClient::submit_command` only reports the status, so these tests go
@@ -431,6 +499,7 @@ async fn a_ready_handoff_reaches_complete_through_daemon_and_backplane() {
             project_id: ProjectId::parse("wave-b-proj").unwrap(),
             working_directory: repo.clone(),
         }),
+        test_provider_adapters(),
     )
     .await
     .unwrap();
@@ -511,6 +580,7 @@ async fn verifier_failure_enters_bounded_remediation_and_completes() {
             project_id: ProjectId::parse("wave-b-proj").unwrap(),
             working_directory: repo.clone(),
         }),
+        test_provider_adapters(),
     )
     .await
     .unwrap();
@@ -578,6 +648,19 @@ async fn orchestrator_fixture(
     WorkflowRun,
     DaemonFence,
 ) {
+    orchestrator_fixture_with_adapters(name, test_provider_adapters()).await
+}
+
+async fn orchestrator_fixture_with_adapters(
+    name: &str,
+    provider_adapters: Vec<Arc<dyn ProviderAdapter>>,
+) -> (
+    SqliteStore,
+    OrchestratorV2<FakeBackplane>,
+    PathBuf,
+    WorkflowRun,
+    DaemonFence,
+) {
     let base = unique_temp_dir(name);
     let repo = base.join("repo");
     fs::create_dir_all(&repo).unwrap();
@@ -592,20 +675,73 @@ async fn orchestrator_fixture(
     let task = sample_task();
     persist_task_row(&store, &task, &fence).await;
     let intent = adapt_v1_handoff_to_approved_intent(&task, "operator-alice").unwrap();
-    let (_grant, workflow_run, _snapshot) =
+    let (grant, workflow_run, snapshot) =
         create_v1_compatibility_run(&task, &intent, budget(), "operator-alice").unwrap();
-    persist_workflow_run_if_absent(&store, &workflow_run, &fence)
-        .await
-        .unwrap();
+    persist_approved_workflow_run(
+        &store,
+        &task,
+        &intent,
+        &grant,
+        &workflow_run,
+        &snapshot,
+        &fence,
+    )
+    .await;
 
     let orchestrator = OrchestratorV2::new(
         store.clone(),
         Arc::new(SchedulerV2::new(SchedulerV2Config::default())),
         Arc::clone(&backplane),
         ArtifactStore::new(&artifact_root).unwrap(),
+        provider_adapters,
     );
 
     (store, orchestrator, repo, workflow_run, fence)
+}
+
+#[tokio::test]
+async fn missing_provider_adapter_fails_attempt_without_provisioning() {
+    let (store, orchestrator, repo, workflow_run, fence) =
+        orchestrator_fixture_with_adapters("missing-provider-adapter", vec![]).await;
+    let project_id = ProjectId::parse("wave-b-proj").unwrap();
+    let checkout_id = CheckoutId::generate();
+    let target = fake_target();
+    let budget = budget();
+    let ctx = PhaseContext {
+        project_id: &project_id,
+        checkout_id: &checkout_id,
+        working_directory: &repo,
+        execution_target: &target,
+        budget: &budget,
+    };
+
+    let error = orchestrator
+        .run_implementer_phase(&workflow_run, &ctx, 1, &fence)
+        .await
+        .expect_err("unregistered frozen provider must fail closed");
+    assert!(
+        matches!(error, OrchestratorError::ProviderAdapterMissing(ref provider) if provider == "fake"),
+        "expected a clear missing-adapter error, got {error:?}"
+    );
+
+    let instances = list_role_instances_for_run(&store, &workflow_run.id)
+        .await
+        .unwrap();
+    let attempts = list_role_attempts_for_instance(&store, &instances[0].id)
+        .await
+        .unwrap();
+    assert_eq!(attempts[0].state, RoleAttemptState::Failed);
+    assert!(attempts[0].runtime_handle_id.is_none());
+    assert_eq!(
+        orchestrator
+            .backplane()
+            .snapshot()
+            .await
+            .unwrap()
+            .active_processes,
+        0,
+        "an unregistered provider must not provision a process"
+    );
 }
 
 #[tokio::test]
@@ -729,11 +865,18 @@ async fn restart_reconciliation_uses_the_recorded_runtime_handle() {
     let task = sample_task();
     persist_task_row(&store, &task, &fence).await;
     let intent = adapt_v1_handoff_to_approved_intent(&task, "operator-alice").unwrap();
-    let (_grant, workflow_run, _snapshot) =
+    let (grant, workflow_run, snapshot) =
         create_v1_compatibility_run(&task, &intent, budget(), "operator-alice").unwrap();
-    persist_workflow_run_if_absent(&store, &workflow_run, &fence)
-        .await
-        .unwrap();
+    persist_approved_workflow_run(
+        &store,
+        &task,
+        &intent,
+        &grant,
+        &workflow_run,
+        &snapshot,
+        &fence,
+    )
+    .await;
 
     let mut instance = RoleInstance::new(
         workflow_run.id.clone(),
@@ -784,6 +927,7 @@ async fn restart_reconciliation_uses_the_recorded_runtime_handle() {
         Arc::new(SchedulerV2::new(SchedulerV2Config::default())),
         Arc::clone(&backplane),
         ArtifactStore::new(&artifact_root).unwrap(),
+        test_provider_adapters(),
     );
 
     orchestrator.reconcile_on_startup(&fence).await.unwrap();
@@ -1081,6 +1225,7 @@ async fn a_daemon_that_lost_its_lease_cannot_start_or_drive_a_run() {
         Arc::new(SchedulerV2::new(SchedulerV2Config::default())),
         Arc::new(FakeBackplane::new()),
         ArtifactStore::new(base.join("artifacts")).unwrap(),
+        test_provider_adapters(),
     );
     let project_id = ProjectId::parse("wave-b-proj").unwrap();
     let checkout_id = CheckoutId::generate();

@@ -24,14 +24,15 @@
 use std::{collections::HashSet, path::Path, sync::Arc};
 
 use relay_runtime::{
-    EffectKey, LaunchSpecification, ProcessStatus, ReconcileOutcome, RuntimeBackplane,
-    RuntimeHandle, RuntimeProvisionRequest, SanitizedEnvironment,
+    EffectKey, LaunchContext, LaunchSpecification, ProcessStatus, ProviderAdapter, ProviderError,
+    ReconcileOutcome, RuntimeBackplane, RuntimeHandle, RuntimeModelSelection,
+    RuntimeProvisionRequest, RuntimeReasoningSelection, SanitizedEnvironment,
 };
 use relay_store::{DaemonFence, StoreError};
 use thiserror::Error;
 
 use crate::{
-    ArtifactKind, ArtifactStore, Candidate, CandidateFingerprint, CheckoutId,
+    ApprovedIntent, ArtifactKind, ArtifactStore, Candidate, CandidateFingerprint, CheckoutId,
     CreateArtifactRequest, ExecutionBudget, ExecutionTarget, ProjectId, RoleAttempt,
     RoleAttemptState, RoleDefinitionId, RoleInstance, SchedulePriority, SchedulerV2, SqliteStore,
     WorkflowRun, WorkflowRunId, WorkflowRunState,
@@ -55,6 +56,10 @@ pub enum OrchestratorError {
     RunNotFound(String),
     #[error("scheduling failed: {0}")]
     SchedulingFailed(String),
+    #[error("no provider adapter is registered for frozen provider '{0}'")]
+    ProviderAdapterMissing(String),
+    #[error("provider launch could not be built: {0}")]
+    ProviderLaunchFailed(String),
     #[error("backplane error: {0}")]
     Backplane(String),
     #[error("workflow error: {0}")]
@@ -112,6 +117,7 @@ pub struct OrchestratorV2<B: RuntimeBackplane> {
     scheduler: Arc<SchedulerV2>,
     backplane: Arc<B>,
     artifact_store: ArtifactStore,
+    provider_adapters: Vec<Arc<dyn ProviderAdapter>>,
 }
 
 impl<B: RuntimeBackplane> OrchestratorV2<B> {
@@ -120,12 +126,14 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
         scheduler: Arc<SchedulerV2>,
         backplane: Arc<B>,
         artifact_store: ArtifactStore,
+        provider_adapters: Vec<Arc<dyn ProviderAdapter>>,
     ) -> Self {
         Self {
             store,
             scheduler,
             backplane,
             artifact_store,
+            provider_adapters,
         }
     }
 
@@ -178,6 +186,7 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
         };
         let mut current_generation = 1u32;
         let mut role_activations = 0u32;
+        let mut remediation_reason = None;
 
         loop {
             role_activations += 1;
@@ -192,7 +201,13 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
 
             // 1. Run Implementer
             let (candidate, _impl_artifact_id) = self
-                .run_implementer_phase(&workflow_run, &ctx, current_generation, fence)
+                .run_implementer_phase_with_reason(
+                    &workflow_run,
+                    &ctx,
+                    current_generation,
+                    remediation_reason.as_deref(),
+                    fence,
+                )
                 .await?;
 
             role_activations += 1;
@@ -206,11 +221,17 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
             }
 
             // 2. Run Verifier
-            let verifier_passed = self
-                .run_verifier_phase(&workflow_run, &ctx, current_generation, &candidate, fence)
+            let verifier_failure_reason = self
+                .run_verifier_phase_with_failure_reason(
+                    &workflow_run,
+                    &ctx,
+                    current_generation,
+                    &candidate,
+                    fence,
+                )
                 .await?;
 
-            if verifier_passed {
+            if verifier_failure_reason.is_none() {
                 workflow_run.complete();
                 update_durable_workflow_run_state(&self.store, &workflow_run, fence).await?;
                 return Ok(WorkflowRunState::Completed);
@@ -218,6 +239,7 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
 
             // Verifier failed: trigger bounded remediation loop
             current_generation += 1;
+            remediation_reason = verifier_failure_reason;
         }
     }
 
@@ -229,6 +251,18 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
         generation: u32,
         fence: &DaemonFence,
     ) -> Result<(Candidate, String), OrchestratorError> {
+        self.run_implementer_phase_with_reason(workflow_run, ctx, generation, None, fence)
+            .await
+    }
+
+    async fn run_implementer_phase_with_reason(
+        &self,
+        workflow_run: &WorkflowRun,
+        ctx: &PhaseContext<'_>,
+        generation: u32,
+        remediation_reason: Option<&str>,
+        fence: &DaemonFence,
+    ) -> Result<(Candidate, String), OrchestratorError> {
         let PhaseContext {
             project_id,
             checkout_id,
@@ -236,6 +270,7 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
             execution_target,
             budget,
         } = *ctx;
+        let approved_intent = self.load_approved_intent(workflow_run).await?;
         let implementer_role_id = RoleDefinitionId::new("implementer");
         let mut implementer_instance = RoleInstance::new(
             workflow_run.id.clone(),
@@ -250,6 +285,29 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
             .map_err(OrchestratorError::Workflow)?;
         persist_role_attempt_if_absent(&self.store, &attempt, fence).await?;
         update_durable_role_instance(&self.store, &implementer_instance, fence).await?;
+
+        let effect_key = EffectKey::new(format!("effect-{}", attempt.id));
+        let launch = match self.build_role_launch(
+            execution_target,
+            &attempt,
+            working_directory,
+            "implementer",
+            &approved_intent,
+            remediation_reason,
+            effect_key.clone(),
+        ) {
+            Ok(launch) => launch,
+            Err(error) => {
+                self.fail_attempt_before_launch(
+                    &mut attempt,
+                    &mut implementer_instance,
+                    error.to_string(),
+                    fence,
+                )
+                .await?;
+                return Err(error);
+            }
+        };
 
         // Enqueue to SchedulerV2 with write lease requirement
         let item = QueuedWorkItem {
@@ -292,10 +350,10 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
 
         // Provision on RuntimeBackplane
         let prov_req = RuntimeProvisionRequest::new(
-            EffectKey::new(format!("effect-{}", attempt.id)),
+            effect_key,
             attempt.id.to_string(),
             working_directory,
-            LaunchSpecification::new("relay-implementer", vec![]),
+            launch,
             SanitizedEnvironment::new(),
             1024 * 1024,
         );
@@ -428,6 +486,20 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
         candidate: &Candidate,
         fence: &DaemonFence,
     ) -> Result<bool, OrchestratorError> {
+        Ok(self
+            .run_verifier_phase_with_failure_reason(workflow_run, ctx, generation, candidate, fence)
+            .await?
+            .is_none())
+    }
+
+    async fn run_verifier_phase_with_failure_reason(
+        &self,
+        workflow_run: &WorkflowRun,
+        ctx: &PhaseContext<'_>,
+        generation: u32,
+        candidate: &Candidate,
+        fence: &DaemonFence,
+    ) -> Result<Option<String>, OrchestratorError> {
         let PhaseContext {
             project_id,
             checkout_id,
@@ -435,6 +507,7 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
             execution_target,
             budget,
         } = *ctx;
+        let approved_intent = self.load_approved_intent(workflow_run).await?;
         let verifier_role_id = RoleDefinitionId::new("verifier");
         let mut verifier_instance =
             RoleInstance::new(workflow_run.id.clone(), verifier_role_id, generation, None);
@@ -445,6 +518,29 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
             .map_err(OrchestratorError::Workflow)?;
         persist_role_attempt_if_absent(&self.store, &attempt, fence).await?;
         update_durable_role_instance(&self.store, &verifier_instance, fence).await?;
+
+        let effect_key = EffectKey::new(format!("effect-{}", attempt.id));
+        let launch = match self.build_role_launch(
+            execution_target,
+            &attempt,
+            working_directory,
+            "verifier",
+            &approved_intent,
+            None,
+            effect_key.clone(),
+        ) {
+            Ok(launch) => launch,
+            Err(error) => {
+                self.fail_attempt_before_launch(
+                    &mut attempt,
+                    &mut verifier_instance,
+                    error.to_string(),
+                    fence,
+                )
+                .await?;
+                return Err(error);
+            }
+        };
 
         // Verifier is ReadOnly (no exclusive checkout write lease required)
         let item = QueuedWorkItem {
@@ -484,10 +580,10 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
 
         // Backplane provision & observe
         let prov_req = RuntimeProvisionRequest::new(
-            EffectKey::new(format!("effect-{}", attempt.id)),
+            effect_key,
             attempt.id.to_string(),
             working_directory,
-            LaunchSpecification::new("relay-verifier", vec![]),
+            launch,
             SanitizedEnvironment::new(),
             1024 * 1024,
         );
@@ -543,9 +639,9 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
                     .await);
             }
         };
-        let verification_passed = match &published.payload {
-            RoleResultPayload::VerificationPassed => true,
-            RoleResultPayload::VerificationFailed { .. } => false,
+        let failure_reason = match &published.payload {
+            RoleResultPayload::VerificationPassed => None,
+            RoleResultPayload::VerificationFailed { reason } => Some(reason.clone()),
             other => {
                 let defect = ResultDefect::Malformed(format!(
                     "verifier attempt published a '{}' result",
@@ -601,11 +697,100 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
         verifier_instance.accept_result(verif_artifact.id.0.clone());
         update_durable_role_instance(&self.store, &verifier_instance, fence).await?;
 
-        let outcome = if verification_passed { "PASS" } else { "FAIL" };
+        let outcome = if failure_reason.is_none() {
+            "PASS"
+        } else {
+            "FAIL"
+        };
         attempt.finish(outcome.to_owned(), Some(verif_artifact.id.0));
         update_durable_role_attempt(&self.store, &attempt, fence).await?;
 
-        Ok(verification_passed)
+        Ok(failure_reason)
+    }
+
+    async fn load_approved_intent(
+        &self,
+        workflow_run: &WorkflowRun,
+    ) -> Result<ApprovedIntent, OrchestratorError> {
+        let record = self
+            .store
+            .get_workflow_run(&workflow_run.id.0)
+            .await?
+            .ok_or_else(|| OrchestratorError::RunNotFound(workflow_run.id.0.clone()))?;
+        if record.approved_intent_json.trim().is_empty() {
+            return Err(OrchestratorError::InvariantViolation(format!(
+                "workflow run '{}' has no frozen approved intent",
+                workflow_run.id
+            )));
+        }
+        serde_json::from_str(&record.approved_intent_json).map_err(|error| {
+            OrchestratorError::InvariantViolation(format!(
+                "workflow run '{}' has invalid frozen approved intent JSON: {error}",
+                workflow_run.id
+            ))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_role_launch(
+        &self,
+        execution_target: &ExecutionTarget,
+        attempt: &RoleAttempt,
+        working_directory: &Path,
+        role: &str,
+        approved_intent: &ApprovedIntent,
+        remediation_reason: Option<&str>,
+        effect_key: EffectKey,
+    ) -> Result<LaunchSpecification, OrchestratorError> {
+        let adapter = self
+            .provider_adapters
+            .iter()
+            .find(|adapter| adapter.provider_id().0 == execution_target.provider_id)
+            .ok_or_else(|| {
+                OrchestratorError::ProviderAdapterMissing(execution_target.provider_id.clone())
+            })?;
+        let runtime_target = relay_runtime::ExecutionTarget {
+            provider_id: adapter.provider_id(),
+            runtime_profile_id: execution_target.runtime_profile_id.clone(),
+            model: RuntimeModelSelection::ProviderDefault,
+            reasoning_effort: RuntimeReasoningSelection::ProfileDefault,
+            capability_snapshot: adapter.capabilities(),
+            provider_adapter_version: execution_target.provider_adapter_version.clone(),
+        };
+        let mut runtime_attempt = relay_runtime::RoleAttempt::new(
+            attempt.role_instance_id.0.clone(),
+            attempt.attempt_no,
+            relay_runtime::ProviderCapabilityRequirements::new(role),
+        );
+        runtime_attempt.id = relay_runtime::RoleAttemptId(attempt.id.0.clone());
+        runtime_attempt.provider_pin = Some(runtime_target.provider_id.clone());
+        runtime_attempt.runtime_profile_id = runtime_target.runtime_profile_id.clone();
+        let context = LaunchContext::new(
+            working_directory,
+            role,
+            effect_key,
+            crate::role_prompt(role, approved_intent, remediation_reason),
+        );
+
+        adapter
+            .build_launch(&runtime_target, &runtime_attempt, &context)
+            .map_err(|error: ProviderError| {
+                OrchestratorError::ProviderLaunchFailed(error.to_string())
+            })
+    }
+
+    async fn fail_attempt_before_launch(
+        &self,
+        attempt: &mut RoleAttempt,
+        role_instance: &mut RoleInstance,
+        reason: String,
+        fence: &DaemonFence,
+    ) -> Result<(), OrchestratorError> {
+        attempt.fail(reason);
+        update_durable_role_attempt(&self.store, attempt, fence).await?;
+        role_instance.fail();
+        update_durable_role_instance(&self.store, role_instance, fence).await?;
+        Ok(())
     }
 
     /// Refuses an attempt whose published result cannot be accepted.

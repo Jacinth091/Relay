@@ -375,6 +375,7 @@ pub async fn run_full_daemon(
 /// Separate from [`run_full_daemon`] because the driver is generic over the
 /// runtime backplane while the daemon itself is not: this is the seam where a
 /// host composes a concrete backplane with the orchestration loop.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_full_daemon_with_workflow_driver<B, R>(
     store: SqliteStore,
     relay: Relay,
@@ -383,6 +384,7 @@ pub async fn run_full_daemon_with_workflow_driver<B, R>(
     artifact_root: impl Into<std::path::PathBuf>,
     backplane: Arc<B>,
     resolver: Arc<R>,
+    provider_adapters: Vec<Arc<dyn relay_runtime::ProviderAdapter>>,
 ) -> Result<(Arc<DaemonServer>, EmbeddedDaemon), DaemonError>
 where
     B: relay_runtime::RuntimeBackplane + 'static,
@@ -394,6 +396,7 @@ where
         backplane,
         crate::ArtifactStore::new(artifact_root)
             .map_err(|err| DaemonError::Command(err.to_string()))?,
+        provider_adapters,
     ));
 
     let (server, handles) = start_daemon_tasks(store, relay, lease_id, lease_ttl).await?;

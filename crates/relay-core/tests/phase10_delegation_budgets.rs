@@ -422,6 +422,7 @@ fn provider_cannot_name_executable_to_bypass_resolver() {
         std::env::temp_dir(),
         "worker",
         relay_runtime::EffectKey::new("eff-phase10-1"),
+        "Run the approved role".to_owned(),
     );
     let spec = adapter
         .build_launch(&target, &runtime_attempt, &context)

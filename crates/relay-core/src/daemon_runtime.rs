@@ -307,12 +307,18 @@ pub async fn run_workflow_driver<B, R>(
                                 "workflow drive attempt failed"
                             );
                             let task_id = run.task_id.to_string();
-                            let payload =
-                                serde_json::json!({ "error": err.to_string() }).to_string();
+                            // The event JSON carries the workflow run id. The
+                            // `execution_id` column keys the v1 `executions`
+                            // table, so it stays NULL for a v2 workflow event.
+                            let payload = serde_json::json!({
+                                "workflow_run_id": run.id.0,
+                                "error": err.to_string(),
+                            })
+                            .to_string();
                             if let Err(append_err) = store
                                 .append_event_fenced(
                                     Some(task_id.as_str()),
-                                    Some(&run.id.0),
+                                    None,
                                     "workflow_drive_failed",
                                     Some(&payload),
                                     &fence,

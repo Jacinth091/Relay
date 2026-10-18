@@ -2653,11 +2653,16 @@ impl SqliteStore {
         // Exactly one start event per run: only the call that created the run
         // appends it, and that call's insert, transition and event share this
         // transaction.
+        //
+        // `execution_id` stays NULL. That column is a foreign key into the v1
+        // `executions` table and a workflow run id is never a v1 execution id,
+        // so writing it there violates the constraint. The event JSON carries
+        // `workflow_run_id`, which is the v2 identity a reader needs.
         if first_start {
             insert_event(
                 &mut transaction,
                 Some(&start.run.task_id),
-                Some(&start.run.id),
+                None,
                 start.event_kind,
                 start.event_json,
             )
@@ -5472,7 +5477,15 @@ mod tests {
             "a replayed approval must not append a second start event, got {events:?}"
         );
         assert_eq!(starts[0].task_id.as_deref(), Some("task-start"));
-        assert_eq!(starts[0].execution_id.as_deref(), Some("run-start"));
+        assert!(
+            starts[0].execution_id.is_none(),
+            "a workflow run id is not a v1 execution id and must never be stored as execution_id"
+        );
+        let start_json = starts[0].event_json.as_deref().unwrap_or_default();
+        assert!(
+            start_json.contains(r#""workflow_run_id":"run-start""#),
+            "the start event JSON must carry the workflow run id, got {start_json}"
+        );
 
         // A task in any other state is a genuine conflict, and the run row that
         // would have accompanied it is rolled back with the refusal.

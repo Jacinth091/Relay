@@ -886,9 +886,9 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
                                 // Still alive
                             }
                             Ok(ReconcileOutcome::Orphaned { pid }) => {
-                                // The backplane no longer owns this process, but
-                                // a provider process from a previous daemon is
-                                // still alive. Terminate its whole tree before
+                                // Verified: the PID is still the exact process
+                                // Relay launched, so terminating its whole tree
+                                // cannot hit a recycled PID. Terminate it before
                                 // marking the attempt lost so no orphan is left
                                 // running behind the new daemon.
                                 relay_runtime::terminate_pid_tree(pid).await;
@@ -897,6 +897,17 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
                                     "orphaned provider process from a previous daemon was terminated"
                                         .to_owned(),
                                 );
+                                update_durable_role_attempt(&self.store, &attempt, fence).await?;
+                            }
+                            Ok(ReconcileOutcome::OrphanUnverified { pid, .. }) => {
+                                // Fail closed. A live PID is not proof it is our
+                                // process: it may have been recycled by an
+                                // unrelated program. Terminate nothing and record
+                                // the truthful outcome instead.
+                                attempt.state = RoleAttemptState::Lost;
+                                attempt.runtime_outcome = Some(format!(
+                                    "previous provider process {pid} could not be verified; it was not terminated"
+                                ));
                                 update_durable_role_attempt(&self.store, &attempt, fence).await?;
                             }
                             _ => {

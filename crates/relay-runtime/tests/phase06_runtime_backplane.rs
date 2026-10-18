@@ -8,6 +8,7 @@
 //! 5. Reconcile accurately detects clean exit vs alive process.
 //! 6. Rejection of unauthorized/non-existent CWD.
 //! 7. FakeBackplane behaves deterministically for unit/mock scenarios.
+//! 8. A recycled PID is never reported as a killable orphan (identity proof).
 
 use std::{fs, path::PathBuf};
 
@@ -256,13 +257,32 @@ fn spawn_long_running_probe() -> std::process::Child {
         .expect("failed to spawn long-running probe process")
 }
 
-fn handle_for_pid(backplane: &LocalProcessBackplane, handle_id: &str, pid: u32) -> RuntimeHandle {
+/// Now, formatted the way a `RuntimeHandle` records its launch time.
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is before the Unix epoch")
+        .as_secs()
+}
+
+fn handle_with_launch_time(
+    backplane: &LocalProcessBackplane,
+    handle_id: &str,
+    pid: u32,
+    created_at: &str,
+) -> RuntimeHandle {
     RuntimeHandle {
         handle_id: handle_id.to_owned(),
         backplane_id: backplane.id(),
         pid: Some(pid),
-        created_at: "test".to_owned(),
+        created_at: created_at.to_owned(),
     }
+}
+
+/// A handle recorded as launched now, so a process already running at `pid`
+/// is provably the same process Relay launched.
+fn handle_for_pid(backplane: &LocalProcessBackplane, handle_id: &str, pid: u32) -> RuntimeHandle {
+    handle_with_launch_time(backplane, handle_id, pid, &now_epoch_secs().to_string())
 }
 
 #[tokio::test]
@@ -401,4 +421,60 @@ async fn test_local_process_backplane_reconcile_dead_pid_is_not_found() {
 
     let outcome = backplane.reconcile(&handle).await.unwrap();
     assert_eq!(outcome, ReconcileOutcome::ResourceNotFound);
+}
+
+/// A live PID is only reported as killable once its OS creation time proves it
+/// is the process Relay launched. A handle whose recorded launch time is an hour
+/// before the process started is a recycled PID and must never be terminated.
+#[cfg(windows)]
+#[tokio::test]
+async fn test_local_process_backplane_reconcile_verifies_process_identity() {
+    let mut probe = spawn_long_running_probe();
+    let pid = probe.id();
+
+    // A fresh backplane instance, as after a daemon restart, owns no slot for
+    // this handle, so identity has to come from the recorded launch time.
+    let backplane = LocalProcessBackplane::new("test-identity-bp", 4);
+    let now = now_epoch_secs();
+
+    // The probe started no later than "now", so a launch time even further in
+    // the future still identifies the same process.
+    let same = handle_with_launch_time(
+        &backplane,
+        "identity-same-handle",
+        pid,
+        &(now + 60).to_string(),
+    );
+    assert_eq!(
+        backplane.reconcile(&same).await.unwrap(),
+        ReconcileOutcome::Orphaned { pid }
+    );
+
+    // Recorded as launched an hour before the probe started: this PID must have
+    // been recycled, so the process is not ours.
+    let reused = handle_with_launch_time(
+        &backplane,
+        "identity-reused-handle",
+        pid,
+        &(now - 3600).to_string(),
+    );
+    match backplane.reconcile(&reused).await.unwrap() {
+        ReconcileOutcome::OrphanUnverified {
+            pid: reported,
+            reason,
+        } => {
+            assert_eq!(reported, pid);
+            assert!(!reason.is_empty(), "an unverified orphan needs a reason");
+        }
+        other => panic!("a recycled pid must never be reported as killable: {other:?}"),
+    }
+
+    // Fail closed: the unverified process must still be running afterwards.
+    assert!(
+        process_is_alive(pid).await,
+        "an unverified pid {pid} must never be terminated"
+    );
+
+    let _ = probe.kill();
+    let _ = probe.wait();
 }

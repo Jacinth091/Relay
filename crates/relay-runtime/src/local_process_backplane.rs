@@ -21,7 +21,9 @@ use crate::backplane::{
     InterruptReceipt, ProcessStatus, ReconcileOutcome, RuntimeBackplane, RuntimeHandle,
     RuntimeObservation, RuntimeProvisionRequest, SendReceipt,
 };
-use crate::process_tree::{process_is_alive, terminate_pid_tree, terminate_process_tree};
+use crate::process_tree::{
+    ProcessIdentity, process_identity, terminate_pid_tree, terminate_process_tree,
+};
 
 /// OS-provided environment variables that are copied from the parent process.
 ///
@@ -355,14 +357,30 @@ impl RuntimeBackplane for LocalProcessBackplane {
                 SlotState::Running(Some(pid)) => Ok(ReconcileOutcome::Alive { pid }),
                 SlotState::Running(None) => Ok(ReconcileOutcome::ResourceNotFound),
                 // Not active in this backplane instance. A durable handle from
-                // a previous daemon may still be running: report it as an
-                // orphan so the orchestrator can terminate it and mark the
-                // attempt lost instead of silently ignoring it.
+                // a previous daemon may still be running, but a live PID alone
+                // is not proof: operating systems recycle PIDs, so the process
+                // at that PID may now be an unrelated program. Only a verified
+                // match is reported as killable.
                 SlotState::Absent => match handle.pid {
-                    Some(pid) if process_is_alive(pid).await => {
-                        Ok(ReconcileOutcome::Orphaned { pid })
-                    }
-                    _ => Ok(ReconcileOutcome::ResourceNotFound),
+                    Some(pid) => match process_identity(pid, &handle.created_at).await {
+                        ProcessIdentity::Same => Ok(ReconcileOutcome::Orphaned { pid }),
+                        ProcessIdentity::Dead => Ok(ReconcileOutcome::ResourceNotFound),
+                        ProcessIdentity::Different => Ok(ReconcileOutcome::OrphanUnverified {
+                            pid,
+                            reason: format!(
+                                "pid {pid} now belongs to a process started after Relay \
+                                     launched it; the pid was reused"
+                            ),
+                        }),
+                        ProcessIdentity::Unverifiable => Ok(ReconcileOutcome::OrphanUnverified {
+                            pid,
+                            reason: format!(
+                                "pid {pid} could not be proven to identify the process Relay \
+                                     launched"
+                            ),
+                        }),
+                    },
+                    None => Ok(ReconcileOutcome::ResourceNotFound),
                 },
             }
         })

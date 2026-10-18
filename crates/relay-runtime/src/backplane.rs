@@ -257,7 +257,13 @@ pub enum ReconcileOutcome {
     FailedExit { exit_code: Option<i32> },
     // A process this backplane no longer owns is still running, typically left
     // behind by a previous daemon instance.
+    // Reported only once the PID is proven to still be the exact process Relay
+    // launched, so terminating it cannot hit a recycled PID.
     Orphaned { pid: u32 },
+    // A PID this backplane no longer owns could not be proven to be the process
+    // Relay launched (for example it was recycled, or identity probing failed).
+    // It must never be terminated.
+    OrphanUnverified { pid: u32, reason: String },
     ResourceNotFound,
     Mismatched { reason: String },
 }

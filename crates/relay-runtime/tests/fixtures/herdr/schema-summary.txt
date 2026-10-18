@@ -1,0 +1,4 @@
+Herdr API schema
+protocol: 22
+schema_version: 1
+schemas: error_response, event, request, subscription_event, success_response

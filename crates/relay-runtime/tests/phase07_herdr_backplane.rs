@@ -1,471 +1,413 @@
-//! Phase 07: HerdrBackplane One-Role Vertical Slice Tests.
-//!
-//! Verifies:
-//! 1. Herdr protocol capability negotiation and version checks.
-//! 2. Duplicate effect reconciliation idempotency (no duplicate panes spawned).
-//! 3. Relay restart while Herdr session survives (reattached and reconciled as Alive).
-//! 4. Herdr restart/crash while Relay survives (reconciled as ResourceNotFound, never fabricating completion).
-//! 5. Missing and mismatched resource reconciliation outcomes.
-//! 6. Manual user intervention / termination detection (never fabricating semantic role completion).
-//! 7. Internal topology planner isolation (adapter policy, never exposed as Relay domain identity).
-//! 8. Cleanup ownership preservation (never deleting user-created unrelated Herdr resources).
-//! 9. Bounded output capture and terminal input streaming.
+//! Phase 07: HerdrBackplane role-host integration coverage.
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use relay_runtime::{
-    BackplaneId, EffectKey, HerdrBackplane, HerdrCapabilities, HerdrClient, HerdrClientError,
-    HerdrPaneStatus, LaunchSpecification, MockHerdrTransport, ProcessStatus, ReconcileOutcome,
-    RuntimeBackplane, RuntimeBindingState, RuntimeHandle, RuntimeMetadata, RuntimeProvisionRequest,
-    SanitizedEnvironment,
+    BackplaneError, BackplaneId, EffectKey, FakeHerdr, HerdrBackplane, HerdrClientError,
+    HerdrVersion, LaunchSpecification, ProcessStatus, ReconcileOutcome, RoleHostResult,
+    RoleHostSpec, RuntimeBackplane, RuntimeBindingState, RuntimeHandle, RuntimeMetadata,
+    RuntimeProvisionRequest, SanitizedEnvironment, TrustedToken, check_compatibility,
+    observed_role_result, role_host_result_path, role_host_spec_path,
 };
 
 fn unique_temp_dir(suffix: &str) -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.push(format!("relay_phase07_{}_{}", suffix, uuid::Uuid::new_v4()));
+    let path =
+        std::env::temp_dir().join(format!("relay_phase07_{suffix}_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&path).expect("failed to create temp dir");
     path
 }
 
-#[tokio::test]
-async fn test_fake_herdr_protocol_and_capabilities() {
-    let mock = Arc::new(MockHerdrTransport::new());
-    let client = HerdrClient::new(mock.clone());
-
-    // 1. Valid default capabilities
-    let caps = client
-        .negotiate_capabilities()
-        .await
-        .expect("negotiation failed");
-    assert_eq!(caps.protocol_version, "1.0.0");
-    assert!(caps.supports_metadata);
-    assert!(caps.supports_interrupt);
-
-    // 2. Incompatible major version
-    let bad_mock = Arc::new(MockHerdrTransport::with_capabilities(HerdrCapabilities {
-        protocol_version: "2.0.0".to_string(),
-        ..Default::default()
-    }));
-    let bad_client = HerdrClient::new(bad_mock);
-    let err = bad_client.negotiate_capabilities().await.unwrap_err();
-    assert!(matches!(err, HerdrClientError::IncompatibleVersion { .. }));
-
-    // 3. Missing critical capability (metadata)
-    let missing_meta_mock = Arc::new(MockHerdrTransport::with_capabilities(HerdrCapabilities {
-        protocol_version: "1.0.0".to_string(),
-        supports_metadata: false,
-        ..Default::default()
-    }));
-    let missing_client = HerdrClient::new(missing_meta_mock);
-    let err = missing_client.negotiate_capabilities().await.unwrap_err();
-    assert!(matches!(err, HerdrClientError::MissingCapability(cap) if cap == "supports_metadata"));
+fn new_backplane(
+    ops: Arc<FakeHerdr>,
+    role_host_dir: PathBuf,
+    relay_executable: PathBuf,
+) -> HerdrBackplane<FakeHerdr> {
+    HerdrBackplane::new("herdr-test", ops, 8, relay_executable, role_host_dir)
 }
 
-#[tokio::test]
-async fn test_herdr_duplicate_effect_reconciliation_idempotency() {
-    let mock = Arc::new(MockHerdrTransport::new());
-    let backplane = HerdrBackplane::new("herdr-test", mock.clone(), 8);
-    let tmp = unique_temp_dir("idempotency");
-
-    let req = RuntimeProvisionRequest {
-        effect_key: EffectKey::new("eff-dup-1"),
-        role_attempt_id: "attempt-dup-1".to_string(),
-        trusted_cwd: tmp.clone(),
-        launch: LaunchSpecification::new("dummy-exec", vec!["--arg".to_string()]),
-        environment: SanitizedEnvironment::new(),
+fn request(cwd: PathBuf, attempt: &str, effect: &str) -> RuntimeProvisionRequest {
+    let mut environment = SanitizedEnvironment::new();
+    environment.insert("RELAY_TEST_ALLOWED", "visible-value");
+    RuntimeProvisionRequest {
+        effect_key: EffectKey::new(effect),
+        role_attempt_id: attempt.to_owned(),
+        trusted_cwd: cwd,
+        launch: LaunchSpecification::new(
+            "powershell.exe",
+            vec![
+                "-NoProfile".into(),
+                "-Command".into(),
+                "Write-Output task; & 'quoted'".into(),
+            ],
+        ),
+        environment,
         output_byte_limit: 1024,
-        metadata: Some(RuntimeMetadata::new(
-            "attempt-dup-1",
-            EffectKey::new("eff-dup-1"),
-        )),
-    };
-
-    // First provision: creates physical pane
-    let handle1 = backplane
-        .provision(req.clone())
-        .await
-        .expect("first provision failed");
-    assert_eq!(mock.panes.lock().unwrap().len(), 1);
-
-    // Second provision with the identical effect_key (e.g. scheduler retry or lost RPC)
-    let handle2 = backplane
-        .provision(req)
-        .await
-        .expect("second provision failed");
-    assert_eq!(handle1, handle2);
-
-    // INVARIANT: Exactly 1 pane spawned in Herdr, duplicate was deduplicated idempotently
-    assert_eq!(mock.panes.lock().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn test_relay_restart_herdr_session_survives() {
-    let mock = Arc::new(MockHerdrTransport::new());
-    let backplane1 = HerdrBackplane::new("herdr-test", mock.clone(), 8);
-    let tmp = unique_temp_dir("restart_relay");
-
-    let mut meta = RuntimeMetadata::new("att-survive-1", EffectKey::new("eff-survive-1"));
-    meta.task_id = Some("task-survive".to_string());
-    meta.checkout_id = Some("chk-main".to_string());
-
-    let req = RuntimeProvisionRequest {
-        effect_key: EffectKey::new("eff-survive-1"),
-        role_attempt_id: "att-survive-1".to_string(),
-        trusted_cwd: tmp.clone(),
-        launch: LaunchSpecification::new("agent-cli", vec![]),
-        environment: SanitizedEnvironment::new(),
-        output_byte_limit: 2048,
-        metadata: Some(meta),
-    };
-
-    let handle1 = backplane1.provision(req).await.expect("provision failed");
-    assert_eq!(mock.panes.lock().unwrap().len(), 1);
-
-    // Relay snapshots active bindings to durable storage before shutdown
-    let snapshot = backplane1.bindings().snapshot();
-    assert_eq!(snapshot.len(), 1);
-
-    // Simulate Relay restart: fresh backplane instance initialized
-    let backplane2 = HerdrBackplane::new("herdr-test", mock.clone(), 8);
-    // Reload bindings from durable storage
-    backplane2.bindings().restore_from_snapshot(snapshot);
-
-    // Reconcile surviving Herdr session
-    let outcome = backplane2
-        .reconcile(&handle1)
-        .await
-        .expect("reconcile failed");
-    match outcome {
-        ReconcileOutcome::Alive { pid } => {
-            assert!(pid > 0);
-        }
-        other => panic!("expected Alive outcome, got {:?}", other),
+        metadata: Some(RuntimeMetadata::new(attempt, EffectKey::new(effect))),
     }
-
-    // Live observation continues across Relay restart
-    mock.simulate_pane_output(&handle1.handle_id, b"resumed output\n", b"");
-    let obs = backplane2.observe(&handle1).await.expect("observe failed");
-    assert_eq!(obs.status, ProcessStatus::Running);
-    assert_eq!(obs.stdout_chunk, b"resumed output\n");
 }
 
 #[tokio::test]
-async fn test_herdr_restart_relay_survives() {
-    let mock = Arc::new(MockHerdrTransport::new());
-    let backplane = HerdrBackplane::new("herdr-test", mock.clone(), 8);
-    let tmp = unique_temp_dir("restart_herdr");
+async fn compatibility_rejects_an_unsupported_herdr_version() {
+    let ops = FakeHerdr::new();
+    assert_eq!(check_compatibility(&ops).await.unwrap().protocol, 22);
 
-    let req = RuntimeProvisionRequest {
-        effect_key: EffectKey::new("eff-herdr-crash"),
-        role_attempt_id: "att-crash-1".to_string(),
-        trusted_cwd: tmp.clone(),
-        launch: LaunchSpecification::new("agent-cli", vec![]),
-        environment: SanitizedEnvironment::new(),
-        output_byte_limit: 1024,
-        metadata: Some(RuntimeMetadata::new(
-            "att-crash-1",
-            EffectKey::new("eff-herdr-crash"),
-        )),
-    };
+    ops.set_version(HerdrVersion {
+        major: 1,
+        minor: 0,
+        patch: 0,
+        pre_release: None,
+        build: None,
+    });
+    assert!(matches!(
+        check_compatibility(&ops).await,
+        Err(HerdrClientError::IncompatibleVersion { .. })
+    ));
+    ops.set_version(HerdrVersion {
+        major: 0,
+        minor: 9,
+        patch: 5,
+        pre_release: None,
+        build: None,
+    });
+    ops.set_protocol(23);
+    assert!(matches!(
+        check_compatibility(&ops).await,
+        Err(HerdrClientError::IncompatibleVersion { .. })
+    ));
+}
 
-    let handle = backplane.provision(req).await.expect("provision failed");
+#[tokio::test]
+async fn provisions_real_herdr_ids_and_only_types_the_trusted_launcher() {
+    let ops = Arc::new(FakeHerdr::new());
+    let root = unique_temp_dir("provision");
+    let role_host_dir = root.join("state/role-host");
+    let backplane = new_backplane(
+        ops.clone(),
+        role_host_dir.clone(),
+        PathBuf::from(r"C:\Relay\relay.exe"),
+    );
+    let req = request(root.clone(), "attempt-host-1", "effect-host-1");
+    let handle = backplane.provision(req.clone()).await.unwrap();
 
-    // Simulate Herdr daemon crashing / restarting: all physical panes are lost
-    mock.simulate_server_restart();
+    let workspaces = ops.workspace_list().await.unwrap();
+    assert_eq!(workspaces.len(), 1);
+    let workspace = &workspaces[0];
+    let tabs = ops.tab_list(&workspace.workspace_id).await.unwrap();
+    let attempt_tab = tabs
+        .iter()
+        .find(|tab| tab.label == "Relay Attempt [attempt-host-1]")
+        .expect("attempt tab should use the topology planner label");
+    let pane = ops.pane_get(&handle.handle_id).await.unwrap().unwrap();
+    assert_eq!(pane.workspace_id, workspace.workspace_id);
+    assert_eq!(pane.tab_id, attempt_tab.tab_id);
+    assert_eq!(pane.title.as_deref(), Some("attempt-host-1"));
 
-    // Relay reconciles active binding
-    let outcome = backplane
-        .reconcile(&handle)
+    let spec_path = role_host_spec_path(&role_host_dir, "attempt-host-1").unwrap();
+    let spec: RoleHostSpec = serde_json::from_slice(&std::fs::read(spec_path).unwrap()).unwrap();
+    assert_eq!(spec.attempt_id, "attempt-host-1");
+    assert_eq!(
+        spec.argv,
+        req.launch.args.iter().cloned().fold(
+            vec![req.launch.executable.to_string_lossy().into_owned()],
+            |mut argv, arg| {
+                argv.push(arg);
+                argv
+            }
+        )
+    );
+    assert!(
+        spec.env
+            .iter()
+            .any(|(key, value)| { key == "RELAY_TEST_ALLOWED" && value == "visible-value" })
+    );
+
+    let calls = ops.pane_run_trusted_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, handle.handle_id);
+    assert_eq!(
+        calls[0]
+            .1
+            .iter()
+            .map(TrustedToken::as_str)
+            .collect::<Vec<_>>(),
+        vec![
+            r"C:\Relay\relay.exe",
+            "role-host",
+            "--attempt",
+            "attempt-host-1"
+        ]
+    );
+    assert!(
+        !calls[0]
+            .1
+            .iter()
+            .any(|token| token.as_str().contains("quoted"))
+    );
+}
+
+#[tokio::test]
+async fn unsafe_relay_path_fails_before_any_herdr_operation() {
+    let ops = Arc::new(FakeHerdr::new());
+    let root = unique_temp_dir("unsafe-executable");
+    let backplane = new_backplane(
+        ops.clone(),
+        root.join("state/role-host"),
+        PathBuf::from(r"C:\Program Files\Relay\relay.exe"),
+    );
+    let error = backplane
+        .provision(request(root, "attempt-unsafe-1", "effect-unsafe-1"))
         .await
-        .expect("reconcile failed");
-    assert_eq!(outcome, ReconcileOutcome::ResourceNotFound);
-
-    // Check binding updated to Missing
-    let binding = backplane
-        .bindings()
-        .get_by_handle(&handle.handle_id)
-        .unwrap();
-    assert_eq!(binding.state, RuntimeBindingState::Missing);
-
-    // Observe reports Lost
-    let obs = backplane.observe(&handle).await.expect("observe failed");
-    assert_eq!(obs.status, ProcessStatus::Lost);
-
-    // INVARIANT: Herdr loss NEVER fabricates semantic role completion!
-    assert!(!matches!(obs.status, ProcessStatus::ExitedSuccess { .. }));
+        .unwrap_err();
+    assert!(
+        matches!(error, BackplaneError::LaunchFailed(message) if message.contains("can't be typed safely"))
+    );
+    assert_eq!(ops.operation_count(), 0);
+    assert!(ops.workspace_list().await.unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn test_missing_and_mismatched_resource_reconciliation() {
-    let mock = Arc::new(MockHerdrTransport::new());
-    let backplane = HerdrBackplane::new("herdr-test", mock.clone(), 8);
-    let tmp = unique_temp_dir("mismatch");
+async fn duplicate_effect_key_reuses_the_same_herdr_pane_and_tab() {
+    let ops = Arc::new(FakeHerdr::new());
+    let root = unique_temp_dir("idempotency");
+    let role_host_dir = root.join("state/role-host");
+    let backplane = new_backplane(
+        ops.clone(),
+        role_host_dir,
+        PathBuf::from(r"C:\Relay\relay.exe"),
+    );
+    let req = request(root.clone(), "attempt-dup-1", "effect-dup-1");
+    let first = backplane.provision(req.clone()).await.unwrap();
+    let second = backplane.provision(req).await.unwrap();
+    assert_eq!(first, second);
+    assert_eq!(ops.pane_run_trusted_calls().len(), 1);
+    let workspace = ops.workspace_list().await.unwrap().pop().unwrap();
+    assert_eq!(
+        ops.tab_list(&workspace.workspace_id)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|tab| tab.label == "Relay Attempt [attempt-dup-1]")
+            .count(),
+        1
+    );
+}
 
-    let req = RuntimeProvisionRequest {
-        effect_key: EffectKey::new("eff-mismatch"),
-        role_attempt_id: "att-orig".to_string(),
-        trusted_cwd: tmp.clone(),
-        launch: LaunchSpecification::new("agent-cli", vec![]),
-        environment: SanitizedEnvironment::new(),
-        output_byte_limit: 1024,
-        metadata: Some(RuntimeMetadata::new(
-            "att-orig",
-            EffectKey::new("eff-mismatch"),
-        )),
-    };
+#[tokio::test]
+async fn binding_snapshot_can_reconcile_a_surviving_herdr_pane() {
+    let ops = Arc::new(FakeHerdr::new());
+    let root = unique_temp_dir("reattach");
+    let role_host_dir = root.join("state/role-host");
+    let first = new_backplane(
+        ops.clone(),
+        role_host_dir.clone(),
+        PathBuf::from(r"C:\Relay\relay.exe"),
+    );
+    let handle = first
+        .provision(request(
+            root.clone(),
+            "attempt-reattach-1",
+            "effect-reattach-1",
+        ))
+        .await
+        .unwrap();
+    let binding = first.bindings().snapshot().pop().unwrap();
+    let second = new_backplane(
+        ops.clone(),
+        role_host_dir,
+        PathBuf::from(r"C:\Relay\relay.exe"),
+    );
+    let outcome = second.reconcile_binding(&binding).await.unwrap();
+    assert_eq!(outcome, ReconcileOutcome::Alive { pid: 1 });
+    assert_eq!(handle.handle_id, binding.runtime_handle.handle_id);
+}
 
-    let handle = backplane.provision(req).await.expect("provision failed");
+#[tokio::test]
+async fn server_unavailable_is_lost_and_never_fabricates_success() {
+    let ops = Arc::new(FakeHerdr::new());
+    let root = unique_temp_dir("server-down");
+    let backplane = new_backplane(
+        ops.clone(),
+        root.join("state/role-host"),
+        PathBuf::from(r"C:\Relay\relay.exe"),
+    );
+    let handle = backplane
+        .provision(request(
+            root,
+            "attempt-server-down-1",
+            "effect-server-down-1",
+        ))
+        .await
+        .unwrap();
+    ops.set_server_down(true);
+    let observation = backplane.observe(&handle).await.unwrap();
+    assert_eq!(observation.status, ProcessStatus::Lost);
+    assert!(!matches!(
+        observation.status,
+        ProcessStatus::ExitedSuccess { .. }
+    ));
+}
 
-    // 1. Non-existent handle reconciliation
-    let bogus_handle = RuntimeHandle {
-        handle_id: "non-existent-pane".to_string(),
+#[tokio::test]
+async fn missing_handle_is_not_reconciled_as_a_live_attempt() {
+    let ops = Arc::new(FakeHerdr::new());
+    let root = unique_temp_dir("missing");
+    let backplane = new_backplane(
+        ops,
+        root.join("state/role-host"),
+        PathBuf::from(r"C:\Relay\relay.exe"),
+    );
+    let missing = RuntimeHandle {
+        handle_id: "w99:p9".into(),
         backplane_id: BackplaneId::new("herdr-test"),
         pid: None,
-        created_at: "now".to_string(),
+        created_at: "0".into(),
     };
-    let outcome_missing = backplane
-        .reconcile(&bogus_handle)
-        .await
-        .expect("reconcile failed");
-    assert_eq!(outcome_missing, ReconcileOutcome::ResourceNotFound);
-
-    // 2. Corrupted / repurposed pane metadata
-    let mut hijacked_tags = HashMap::new();
-    hijacked_tags.insert(
-        "relay.role_attempt_id".to_string(),
-        "att-attacker-hijack".to_string(),
-    );
-    mock.corrupt_metadata(&handle.handle_id, hijacked_tags);
-
-    let outcome_mismatch = backplane
-        .reconcile(&handle)
-        .await
-        .expect("reconcile failed");
     assert!(matches!(
-        outcome_mismatch,
-        ReconcileOutcome::Mismatched { .. }
-    ));
-
-    // Binding is marked Mismatched
-    let binding = backplane
-        .bindings()
-        .get_by_handle(&handle.handle_id)
-        .unwrap();
-    assert!(matches!(
-        binding.state,
-        RuntimeBindingState::Mismatched { .. }
+        backplane.reconcile(&missing).await,
+        Err(BackplaneError::HandleNotFound(_))
     ));
 }
 
 #[tokio::test]
-async fn test_manual_user_termination_detection() {
-    let mock = Arc::new(MockHerdrTransport::new());
-    let backplane = HerdrBackplane::new("herdr-test", mock.clone(), 8);
-    let tmp = unique_temp_dir("user_term");
-
-    let req = RuntimeProvisionRequest {
-        effect_key: EffectKey::new("eff-term-1"),
-        role_attempt_id: "att-term-1".to_string(),
-        trusted_cwd: tmp.clone(),
-        launch: LaunchSpecification::new("agent-cli", vec![]),
-        environment: SanitizedEnvironment::new(),
-        output_byte_limit: 1024,
-        metadata: Some(RuntimeMetadata::new(
-            "att-term-1",
-            EffectKey::new("eff-term-1"),
-        )),
-    };
-
-    let handle = backplane.provision(req).await.expect("provision failed");
-
-    // User opens Herdr terminal and manually closes/terminates the pane
-    mock.simulate_external_termination(&handle.handle_id);
-
-    // Observation reflects external termination
-    let obs = backplane.observe(&handle).await.expect("observe failed");
-    assert_eq!(obs.status, ProcessStatus::Interrupted);
-
-    // Reconcile reflects non-successful exit
-    let outcome = backplane
-        .reconcile(&handle)
+async fn user_closed_pane_is_interrupted_and_never_success() {
+    let ops = Arc::new(FakeHerdr::new());
+    let root = unique_temp_dir("user-close");
+    let backplane = new_backplane(
+        ops.clone(),
+        root.join("state/role-host"),
+        PathBuf::from(r"C:\Relay\relay.exe"),
+    );
+    let handle = backplane
+        .provision(request(root, "attempt-close-1", "effect-close-1"))
         .await
-        .expect("reconcile failed");
-    assert_eq!(outcome, ReconcileOutcome::FailedExit { exit_code: None });
-
-    // Binding state reflects interrupted
-    let binding = backplane
-        .bindings()
-        .get_by_handle(&handle.handle_id)
         .unwrap();
-    assert_eq!(binding.state, RuntimeBindingState::Interrupted);
-
-    // INVARIANT: Manual user termination NEVER fabricates semantic completion!
-    assert_ne!(obs.status, ProcessStatus::ExitedSuccess { exit_code: 0 });
-}
-
-#[tokio::test]
-async fn test_internal_topology_planner_isolation_and_ownership() {
-    let mock = Arc::new(MockHerdrTransport::new());
-    let backplane = HerdrBackplane::new("herdr-test", mock.clone(), 8);
-    let tmp = unique_temp_dir("topology");
-
-    let mut meta = RuntimeMetadata::new("role-att-88", EffectKey::new("eff-topo-88"));
-    meta.task_id = Some("task-omega".to_string());
-    meta.checkout_id = Some("chk-gamma".to_string());
-    meta.project_id = Some("proj-alpha".to_string());
-
-    let req = RuntimeProvisionRequest {
-        effect_key: EffectKey::new("eff-topo-88"),
-        role_attempt_id: "role-att-88".to_string(),
-        trusted_cwd: tmp.clone(),
-        launch: LaunchSpecification::new("agent-cli", vec![]),
-        environment: SanitizedEnvironment::new(),
-        output_byte_limit: 1024,
-        metadata: Some(meta),
-    };
-
-    let handle = backplane.provision(req).await.expect("provision failed");
-
-    // Relay Core domain ID is independent of physical IDs:
-    // Core only sees RuntimeHandle and RuntimeBinding, not Herdr tab/workspace structs
-    assert_eq!(handle.handle_id, "pane-relay-role-att-88");
-
-    let pane_info = mock
-        .panes
-        .lock()
-        .unwrap()
-        .get(&handle.handle_id)
-        .cloned()
-        .unwrap();
-    assert_eq!(pane_info.tab_id, "tab-relay-task-omega");
-    assert_eq!(pane_info.workspace_id, "ws-relay-chk-gamma");
-    assert_eq!(
-        pane_info.metadata.get("relay.managed_by"),
-        Some(&"relay".to_string())
+    ops.pane_close(&handle.handle_id).await.unwrap();
+    let observation = backplane.observe(&handle).await.unwrap();
+    assert_eq!(observation.status, ProcessStatus::Interrupted);
+    assert_ne!(
+        observation.status,
+        ProcessStatus::ExitedSuccess { exit_code: 0 }
     );
     assert_eq!(
-        pane_info.metadata.get("relay.task_id"),
-        Some(&"task-omega".to_string())
+        backplane.reconcile(&handle).await.unwrap(),
+        ReconcileOutcome::FailedExit { exit_code: None }
     );
     assert_eq!(
-        pane_info.metadata.get("relay.project_id"),
-        Some(&"proj-alpha".to_string())
-    );
-}
-
-#[tokio::test]
-async fn test_cleanup_ownership_preservation() {
-    let mock = Arc::new(MockHerdrTransport::new());
-    let backplane = HerdrBackplane::new("herdr-test", mock.clone(), 8);
-    let tmp = unique_temp_dir("cleanup");
-
-    // 1. Relay provisions an attempt
-    let req = RuntimeProvisionRequest {
-        effect_key: EffectKey::new("eff-clean-1"),
-        role_attempt_id: "att-clean-1".to_string(),
-        trusted_cwd: tmp.clone(),
-        launch: LaunchSpecification::new("agent-cli", vec![]),
-        environment: SanitizedEnvironment::new(),
-        output_byte_limit: 1024,
-        metadata: Some(RuntimeMetadata::new(
-            "att-clean-1",
-            EffectKey::new("eff-clean-1"),
-        )),
-    };
-    let relay_handle = backplane.provision(req).await.expect("provision failed");
-
-    // 2. An external user creates an unrelated pane in Herdr
-    let user_pane_id = "user-interactive-pane".to_string();
-    mock.panes.lock().unwrap().insert(
-        user_pane_id.clone(),
-        relay_runtime::HerdrPaneInfo {
-            pane_id: user_pane_id.clone(),
-            tab_id: "user-tab".to_string(),
-            workspace_id: "user-ws".to_string(),
-            pid: 9999,
-            status: HerdrPaneStatus::Running,
-            metadata: HashMap::new(),
-            user_attached: true,
-        },
-    );
-
-    // 3. Attempting to dispose the user-owned pane must NOT delete it!
-    let user_handle = RuntimeHandle {
-        handle_id: user_pane_id.clone(),
-        backplane_id: BackplaneId::new("herdr-test"),
-        pid: Some(9999),
-        created_at: "now".to_string(),
-    };
-    let receipt_user = backplane
-        .dispose(&user_handle)
-        .await
-        .expect("dispose user handle");
-    assert!(
-        !receipt_user.reaped,
-        "Relay must NOT reap user-created Herdr resources"
-    );
-    assert!(mock.panes.lock().unwrap().contains_key(&user_pane_id));
-
-    // 4. Disposing the Relay-owned pane cleanly reaps it
-    let receipt_relay = backplane
-        .dispose(&relay_handle)
-        .await
-        .expect("dispose relay handle");
-    assert!(
-        receipt_relay.reaped,
-        "Relay must reap its own created resources"
-    );
-    assert!(
-        !mock
-            .panes
-            .lock()
+        backplane
+            .bindings()
+            .get_by_handle(&handle.handle_id)
             .unwrap()
-            .contains_key(&relay_handle.handle_id)
+            .state,
+        RuntimeBindingState::Interrupted
     );
-
-    // Binding is marked Disposed
-    let binding = backplane
-        .bindings()
-        .get_by_handle(&relay_handle.handle_id)
-        .unwrap();
-    assert_eq!(binding.state, RuntimeBindingState::Disposed);
 }
 
 #[tokio::test]
-async fn test_output_bounding_and_input_transmission() {
-    let mock = Arc::new(MockHerdrTransport::new());
-    let backplane = HerdrBackplane::new("herdr-test", mock.clone(), 8);
-    let tmp = unique_temp_dir("bounds");
-
-    // Output limit clamped to 15 bytes
-    let req = RuntimeProvisionRequest {
-        effect_key: EffectKey::new("eff-bound-1"),
-        role_attempt_id: "att-bound-1".to_string(),
-        trusted_cwd: tmp.clone(),
-        launch: LaunchSpecification::new("agent-cli", vec![]),
-        environment: SanitizedEnvironment::new(),
-        output_byte_limit: 15,
-        metadata: Some(RuntimeMetadata::new(
-            "att-bound-1",
-            EffectKey::new("eff-bound-1"),
-        )),
-    };
-    let handle = backplane.provision(req).await.expect("provision failed");
-
-    // Send input bytes
-    let send_receipt = backplane
-        .send(&handle, b"hello stdin\n")
+async fn dispose_closes_only_the_owned_tab_keeps_result_and_rejects_input() {
+    let ops = Arc::new(FakeHerdr::new());
+    let root = unique_temp_dir("dispose");
+    let role_host_dir = root.join("state/role-host");
+    let backplane = new_backplane(
+        ops.clone(),
+        role_host_dir.clone(),
+        PathBuf::from(r"C:\Relay\relay.exe"),
+    );
+    let handle = backplane
+        .provision(request(
+            root.clone(),
+            "attempt-dispose-1",
+            "effect-dispose-1",
+        ))
         .await
-        .expect("send failed");
-    assert_eq!(send_receipt.bytes_written, 12);
+        .unwrap();
+    assert!(backplane.interrupt(&handle).await.unwrap().initiated);
+    assert_eq!(
+        ops.pane_send_keys_calls(),
+        vec![(handle.handle_id.clone(), vec!["ctrl+c".into()])]
+    );
+    assert!(matches!(
+        backplane.send(&handle, b"text").await,
+        Err(BackplaneError::Unsupported(_))
+    ));
 
-    // Simulate stdout producing 50 bytes
-    let large_output = b"01234567890123456789012345678901234567890123456789";
-    mock.simulate_pane_output(&handle.handle_id, large_output, b"");
+    let result_path = role_host_result_path(&role_host_dir, "attempt-dispose-1").unwrap();
+    std::fs::write(
+        &result_path,
+        serde_json::to_vec(&RoleHostResult {
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            interrupted: false,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let spec_path = role_host_spec_path(&role_host_dir, "attempt-dispose-1").unwrap();
+    let receipt = backplane.dispose(&handle).await.unwrap();
+    assert!(receipt.reaped);
+    assert!(ops.pane_get(&handle.handle_id).await.unwrap().is_none());
+    assert!(!spec_path.exists());
+    assert!(result_path.exists());
+}
 
-    // Observe captures only up to 15 bytes!
-    let obs = backplane.observe(&handle).await.expect("observe failed");
-    assert_eq!(obs.stdout_chunk.len(), 15);
-    assert_eq!(obs.total_bytes_captured, 15);
-    assert_eq!(&obs.stdout_chunk, &large_output[..15]);
+#[tokio::test]
+async fn disposing_an_unowned_user_pane_does_not_close_it() {
+    let ops = Arc::new(FakeHerdr::new());
+    let root = unique_temp_dir("user-pane");
+    let backplane = new_backplane(
+        ops.clone(),
+        root.join("state/role-host"),
+        PathBuf::from(r"C:\Relay\relay.exe"),
+    );
+    let user = ops.workspace_create(&root, "user workspace").await.unwrap();
+    let handle = RuntimeHandle {
+        handle_id: user.root_pane.pane_id.clone(),
+        backplane_id: BackplaneId::new("herdr-test"),
+        pid: Some(1),
+        created_at: "now".into(),
+    };
+    assert!(matches!(
+        backplane.dispose(&handle).await,
+        Err(BackplaneError::HandleNotFound(_))
+    ));
+    assert!(ops.pane_get(&handle.handle_id).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn result_file_supplies_the_existing_typed_role_result_parser() {
+    let ops = Arc::new(FakeHerdr::new());
+    let root = unique_temp_dir("result");
+    let role_host_dir = root.join("state/role-host");
+    let backplane = new_backplane(
+        ops,
+        role_host_dir.clone(),
+        PathBuf::from(r"C:\Relay\relay.exe"),
+    );
+    let handle = backplane
+        .provision(request(root, "attempt-result-1", "effect-result-1"))
+        .await
+        .unwrap();
+    let output = "{\"role_result\":\"implemented\",\"detail\":\"done\"}\n";
+    std::fs::write(
+        role_host_result_path(&role_host_dir, "attempt-result-1").unwrap(),
+        serde_json::to_vec(&RoleHostResult {
+            exit_code: Some(0),
+            stdout: output.into(),
+            stderr: "diagnostic".into(),
+            interrupted: false,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let observation = backplane.observe(&handle).await.unwrap();
+    assert_eq!(
+        observation.status,
+        ProcessStatus::ExitedSuccess { exit_code: 0 }
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&observation.stderr_chunk),
+        "diagnostic"
+    );
+    let published = observed_role_result(&observation).unwrap();
+    assert_eq!(published.payload.kind(), "implemented");
 }

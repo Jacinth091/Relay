@@ -568,7 +568,7 @@ async fn orchestrator_fixture(
         store.clone(),
         Arc::new(SchedulerV2::new(SchedulerV2Config::default())),
         Arc::clone(&backplane),
-        Arc::new(ArtifactStore::new(&artifact_root).unwrap()),
+        ArtifactStore::new(&artifact_root).unwrap(),
     );
 
     (store, orchestrator, repo, workflow_run, fence)
@@ -748,7 +748,7 @@ async fn restart_reconciliation_uses_the_recorded_runtime_handle() {
         store.clone(),
         Arc::new(SchedulerV2::new(SchedulerV2Config::default())),
         Arc::clone(&backplane),
-        Arc::new(ArtifactStore::new(&artifact_root).unwrap()),
+        ArtifactStore::new(&artifact_root).unwrap(),
     );
 
     orchestrator.reconcile_on_startup(&fence).await.unwrap();
@@ -1045,7 +1045,7 @@ async fn a_daemon_that_lost_its_lease_cannot_start_or_drive_a_run() {
         store.clone(),
         Arc::new(SchedulerV2::new(SchedulerV2Config::default())),
         Arc::new(FakeBackplane::new()),
-        Arc::new(ArtifactStore::new(base.join("artifacts")).unwrap()),
+        ArtifactStore::new(base.join("artifacts")).unwrap(),
     );
     let project_id = ProjectId::parse("wave-b-proj").unwrap();
     let checkout_id = CheckoutId::generate();

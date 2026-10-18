@@ -11,11 +11,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    Relay, SqliteStore, StoredTask, SubmissionTransport, TaskId, durable_state::list_stored_tasks,
+    ApprovedIntentId, ConfigSnapshotId, ExecutionGrantId, Relay, SqliteStore, StoredTask,
+    SubmissionTransport, TaskId, TaskState, WorkflowRunId, durable_state::list_stored_tasks,
 };
 use relay_store::{
     CommandRecord, DaemonFence, DaemonLeaseRecord, EventRecord, NewPendingEffectRecord,
-    PendingEffectRecord, StoreError,
+    NewWorkflowRunRecord, PendingEffectRecord, StoreError, WorkflowRunStart,
 };
 
 pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
@@ -223,6 +224,10 @@ pub enum DaemonCommand {
         outcome: String,
         result_json: String,
     },
+    /// Explicit human Run approval for a durable `Ready` task. Records the v2
+    /// workflow run (with the approved intent, grant and snapshot it executes
+    /// under), moves the task to `running`, and wakes the workflow driver.
+    RunTask { task_id: String, granted_by: String },
 }
 
 /// Full daemon state snapshot for client synchronization.
@@ -256,6 +261,10 @@ pub struct DaemonServer {
     /// once it has lost the lease. While it is `Some`, every request fails closed
     /// so a stale daemon cannot keep mutating state it no longer owns.
     authority_lost: std::sync::Mutex<Option<String>>,
+    // Wakes the v2 workflow driver when a run is approved. `Notify` stores one
+    // permit when no driver is waiting, so an approval that lands mid-drive is
+    // never lost (unlike `notify_waiters`).
+    workflow_wakeup: Arc<tokio::sync::Notify>,
 }
 
 impl DaemonServer {
@@ -312,7 +321,21 @@ impl DaemonServer {
             lease_record: std::sync::Mutex::new(lease_record),
             state_identity,
             authority_lost: std::sync::Mutex::new(None),
+            workflow_wakeup: Arc::new(tokio::sync::Notify::new()),
         })
+    }
+
+    /// Wakes the v2 workflow driver, if one is attached to this daemon.
+    ///
+    /// Called after a Run approval is durably recorded, so the driver looks at
+    /// the run instead of the daemon trying to execute it inline.
+    pub fn wake_workflow_driver(&self) {
+        self.workflow_wakeup.notify_one();
+    }
+
+    /// Handle the workflow driver waits on for new approved runs.
+    pub fn workflow_wakeup(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.workflow_wakeup)
     }
 
     pub fn store(&self) -> &SqliteStore {
@@ -547,6 +570,7 @@ impl DaemonServer {
             DaemonCommand::UpdateTaskState { .. } => "update_task_state",
             DaemonCommand::QueuePendingEffect { .. } => "queue_pending_effect",
             DaemonCommand::CompleteEffect { .. } => "complete_effect",
+            DaemonCommand::RunTask { .. } => "run_task",
         }
     }
 
@@ -946,6 +970,137 @@ impl DaemonServer {
                     .to_string(),
                 ))
             }
+            DaemonCommand::RunTask {
+                task_id,
+                granted_by,
+            } => {
+                let task_id_parsed = TaskId::parse(task_id)
+                    .map_err(|e| DaemonError::Command(format!("invalid task id: {e}")))?;
+                let stored_task =
+                    crate::durable_state::get_stored_task(&self.store, task_id_parsed)
+                        .await
+                        .map_err(|e| DaemonError::Command(e.to_string()))?
+                        .ok_or_else(|| {
+                            DaemonError::Command(format!("task '{task_id}' not found"))
+                        })?;
+
+                let run_id = WorkflowRunId(format!(
+                    "wfrun-{}",
+                    deterministic_command_id(command_id, "run")
+                ));
+
+                // A recorded approval is identified by the command id, so a
+                // replay reports the durable run rather than recomputing (and
+                // possibly reinterpreting) what the human approved.
+                if let Some(existing_run) = self
+                    .store
+                    .get_workflow_run(&run_id.0)
+                    .await
+                    .map_err(map_store_error)?
+                {
+                    return Ok(Some(
+                        serde_json::json!({
+                            "task_id": existing_run.task_id,
+                            "workflow_run_id": existing_run.id,
+                            "execution_grant_id": existing_run.execution_grant_id,
+                            "state": existing_run.state,
+                        })
+                        .to_string(),
+                    ));
+                }
+
+                if stored_task.state != TaskState::Ready {
+                    return Err(DaemonError::Command(format!(
+                        "task '{task_id}' is in state '{}', expected 'ready'",
+                        stored_task.state.as_str()
+                    )));
+                }
+
+                let mut intent =
+                    crate::adapt_v1_handoff_to_approved_intent(&stored_task, granted_by)
+                        .map_err(|e| DaemonError::Command(e.to_string()))?;
+                intent.id = ApprovedIntentId(format!(
+                    "intent-{}",
+                    deterministic_command_id(command_id, "intent")
+                ));
+
+                let default_budget = crate::ExecutionBudget::default();
+                let (mut grant, mut run, mut snapshot) = crate::create_v1_compatibility_run(
+                    &stored_task,
+                    &intent,
+                    default_budget,
+                    granted_by,
+                )
+                .map_err(|e| DaemonError::Command(e.to_string()))?;
+
+                grant.id = ExecutionGrantId(format!(
+                    "grant-{}",
+                    deterministic_command_id(command_id, "grant")
+                ));
+                snapshot.id = ConfigSnapshotId(format!(
+                    "cfg-{}",
+                    deterministic_command_id(command_id, "snapshot")
+                ));
+                run.id = run_id.clone();
+                run.execution_grant_id = grant.id.clone();
+                run.config_snapshot_id = snapshot.id.clone();
+
+                let run_record = NewWorkflowRunRecord {
+                    id: run.id.0.clone(),
+                    task_id: run.task_id.to_string(),
+                    execution_grant_id: run.execution_grant_id.0.clone(),
+                    workflow_definition_id: run.workflow_definition_id.0.clone(),
+                    state: "running".to_owned(),
+                    config_snapshot_id: run.config_snapshot_id.0.clone(),
+                };
+                let intent_json = serde_json::to_string(&intent)?;
+                let grant_json = serde_json::to_string(&grant)?;
+                let snapshot_json = serde_json::to_string(&snapshot)?;
+                let event_json = serde_json::json!({
+                    "task_id": task_id,
+                    "workflow_run_id": run.id.0,
+                    "execution_grant_id": grant.id.0,
+                    "config_snapshot_id": snapshot.id.0,
+                    "state": "running",
+                })
+                .to_string();
+
+                // One fenced transaction: the run and its authority, the task's
+                // `ready -> running` transition, and the single start event. A
+                // crash leaves either the whole approval or none of it,
+                // never a task that is running with no run to execute.
+                let started = self
+                    .store
+                    .start_workflow_run_fenced(
+                        &WorkflowRunStart {
+                            run: &run_record,
+                            approved_intent_json: &intent_json,
+                            execution_grant_json: &grant_json,
+                            config_snapshot_json: &snapshot_json,
+                            task_expected_state: "ready",
+                            task_new_state: "running",
+                            event_kind: "workflow_run_started",
+                            event_json: Some(&event_json),
+                        },
+                        &fence,
+                    )
+                    .await
+                    .map_err(map_store_error)?;
+
+                // The run is durable; execution belongs to the workflow driver,
+                // never to the command handler.
+                self.wake_workflow_driver();
+
+                Ok(Some(
+                    serde_json::json!({
+                        "task_id": started.task_id,
+                        "workflow_run_id": started.id,
+                        "execution_grant_id": started.execution_grant_id,
+                        "state": started.state,
+                    })
+                    .to_string(),
+                ))
+            }
         }
     }
 }
@@ -1096,6 +1251,20 @@ fn map_persistence_error(error: crate::durable_state::TaskPersistenceError) -> D
         }) => DaemonError::AuthorityLost(lease_id),
         other => DaemonError::Command(other.to_string()),
     }
+}
+
+/// Deterministic id segment for a Run approval.
+///
+/// The run, intent, grant and snapshot identities are derived from the approving
+/// command id, so replaying that command cannot invent a second run for the same
+/// approval.
+fn deterministic_command_id(command_id: &str, label: &str) -> String {
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("{command_id}:{label}").as_bytes(),
+    )
+    .simple()
+    .to_string()
 }
 
 fn hostname() -> String {

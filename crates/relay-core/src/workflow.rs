@@ -821,6 +821,8 @@ impl RoleInstance {
             result_artifact_id: None,
             started_at: Some(now_timestamp()),
             ended_at: None,
+            runtime_handle_id: None,
+            runtime_backplane_id: None,
         })
     }
 
@@ -880,6 +882,11 @@ pub struct RoleAttempt {
     pub result_artifact_id: Option<String>,
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
+    /// Backplane handle this attempt was launched as, once known. Durable so a
+    /// restarted daemon can reconcile the process it really launched.
+    pub runtime_handle_id: Option<String>,
+    /// Backplane that owns `runtime_handle_id`.
+    pub runtime_backplane_id: Option<String>,
 }
 
 impl RoleAttempt {

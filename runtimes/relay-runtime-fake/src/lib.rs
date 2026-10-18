@@ -272,22 +272,86 @@ use relay_runtime::{
     RuntimeObservation, RuntimeProvisionRequest, SendReceipt,
 };
 
+/// Scripted behavior of one fake provider process launched through the
+/// backplane: what it prints, how it exits, and which files it writes into
+/// its trusted working directory (a real provider process would edit the
+/// worktree; the fake does it through the same launch path, not via the test).
+#[derive(Debug, Clone)]
+pub struct FakeProcessBehavior {
+    pub status: ProcessStatus,
+    pub stdout: Vec<u8>,
+    pub write_files: Vec<(PathBuf, Vec<u8>)>,
+}
+
+impl Default for FakeProcessBehavior {
+    fn default() -> Self {
+        Self {
+            status: ProcessStatus::ExitedSuccess { exit_code: 0 },
+            stdout: b"fake backplane execution output\n".to_vec(),
+            write_files: Vec::new(),
+        }
+    }
+}
+
+impl FakeProcessBehavior {
+    /// Exits 0 and prints `stdout`.
+    pub fn succeeding_with(stdout: impl Into<Vec<u8>>) -> Self {
+        Self {
+            stdout: stdout.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Exits with a non-zero code and prints nothing useful.
+    pub fn crashing(exit_code: i32) -> Self {
+        Self {
+            status: ProcessStatus::ExitedFailure {
+                exit_code: Some(exit_code),
+            },
+            stdout: Vec::new(),
+            write_files: Vec::new(),
+        }
+    }
+
+    /// Adds a file the process writes (relative to its trusted cwd) on launch.
+    pub fn writing_file(
+        mut self,
+        relative: impl Into<PathBuf>,
+        contents: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.write_files.push((relative.into(), contents.into()));
+        self
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct FakeBackplane {
     inner: FakeRuntime,
     active_handles: Arc<Mutex<HashMap<String, RuntimeProvisionRequest>>>,
     sent_inputs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    /// Queued behaviors per launch executable name, consumed one per launch.
+    scripts: Arc<Mutex<HashMap<String, VecDeque<FakeProcessBehavior>>>>,
+    /// Behavior chosen for each live handle at provision time.
+    behaviors: Arc<Mutex<HashMap<String, FakeProcessBehavior>>>,
 }
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Component, PathBuf};
 
 impl FakeBackplane {
     pub fn new() -> Self {
-        Self {
-            inner: FakeRuntime::default(),
-            active_handles: Arc::new(Mutex::new(HashMap::new())),
-            sent_inputs: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self::default()
+    }
+
+    /// Queues the behavior for the next launch of `executable`. Launches with
+    /// no queued behavior fall back to [`FakeProcessBehavior::default`].
+    pub fn script_process(&self, executable: impl Into<String>, behavior: FakeProcessBehavior) {
+        self.scripts
+            .lock()
+            .unwrap()
+            .entry(executable.into())
+            .or_default()
+            .push_back(behavior);
     }
 
     pub fn inner(&self) -> &FakeRuntime {
@@ -307,12 +371,43 @@ impl RuntimeBackplane for FakeBackplane {
     fn provision<'a>(&'a self, req: RuntimeProvisionRequest) -> BackplaneFuture<'a, RuntimeHandle> {
         Box::pin(async move {
             let handle_id = format!("fake-h-{}", req.role_attempt_id);
+            let executable = req.launch.executable.to_string_lossy().into_owned();
+            let behavior = self
+                .scripts
+                .lock()
+                .unwrap()
+                .get_mut(&executable)
+                .and_then(VecDeque::pop_front)
+                .unwrap_or_default();
+
+            // The fake process's file effects happen at launch, confined to
+            // its trusted working directory like a real backplane would.
+            for (relative, contents) in &behavior.write_files {
+                let escapes = relative.is_absolute()
+                    || relative
+                        .components()
+                        .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)));
+                if escapes {
+                    return Err(BackplaneError::UnauthorizedCwd(relative.clone()));
+                }
+                let target = req.trusted_cwd.join(relative);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| BackplaneError::Io(e.to_string()))?;
+                }
+                std::fs::write(&target, contents).map_err(|e| BackplaneError::Io(e.to_string()))?;
+            }
+
             let handle = RuntimeHandle {
                 handle_id: handle_id.clone(),
                 backplane_id: self.id(),
                 pid: Some(42),
                 created_at: "now".to_owned(),
             };
+            self.behaviors
+                .lock()
+                .unwrap()
+                .insert(handle_id.clone(), behavior);
             self.active_handles.lock().unwrap().insert(handle_id, req);
             Ok(handle)
         })
@@ -322,12 +417,19 @@ impl RuntimeBackplane for FakeBackplane {
         Box::pin(async move {
             let active = self.active_handles.lock().unwrap();
             if active.contains_key(&handle.handle_id) {
+                let behavior = self
+                    .behaviors
+                    .lock()
+                    .unwrap()
+                    .get(&handle.handle_id)
+                    .cloned()
+                    .unwrap_or_default();
                 Ok(RuntimeObservation {
                     handle_id: handle.handle_id.clone(),
-                    status: ProcessStatus::ExitedSuccess { exit_code: 0 },
-                    stdout_chunk: b"fake backplane execution output\n".to_vec(),
+                    status: behavior.status,
+                    total_bytes_captured: behavior.stdout.len(),
+                    stdout_chunk: behavior.stdout,
                     stderr_chunk: Vec::new(),
-                    total_bytes_captured: 32,
                 })
             } else {
                 Err(BackplaneError::HandleNotFound(handle.handle_id.clone()))
@@ -364,6 +466,7 @@ impl RuntimeBackplane for FakeBackplane {
         Box::pin(async move {
             let mut active = self.active_handles.lock().unwrap();
             let reaped = active.remove(&handle.handle_id).is_some();
+            self.behaviors.lock().unwrap().remove(&handle.handle_id);
             Ok(DisposeReceipt { reaped })
         })
     }

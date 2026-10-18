@@ -18,6 +18,7 @@ pub mod exchange;
 mod execution;
 mod execution_planning;
 pub mod legacy_adapter;
+pub mod orchestrator_v2;
 pub mod policy;
 pub mod portable_config;
 pub mod privileged;
@@ -53,7 +54,9 @@ pub use daemon::{
 };
 #[cfg(windows)]
 pub use daemon_runtime::{
-    DaemonClientHandle, EmbeddedDaemon, connect_or_embed, new_command_id, run_full_daemon,
+    DaemonClientHandle, EmbeddedDaemon, WorkflowDriverContext, WorkflowRunContextResolver,
+    connect_or_embed, new_command_id, run_full_daemon, run_full_daemon_with_workflow_driver,
+    run_workflow_driver,
 };
 #[cfg(windows)]
 pub use daemon_transport::{NamedPipeDaemonClient, default_pipe_name};
@@ -71,8 +74,27 @@ pub use delegation::{
 };
 pub use digest::sha256_digest;
 pub use durable_state::{
-    SqliteStore, StoredTask, TaskPersistenceError, TaskState, default_database_path,
-    get_stored_task, list_stored_tasks, list_stored_tasks_with_quarantined,
+    SqliteStore,
+    StoredTask,
+    TaskPersistenceError,
+    TaskState,
+    default_database_path,
+    // v2 orchestration persistence (Wave B / R12-02): the durable state the
+    // Run path writes and reconciles.
+    get_durable_workflow_run,
+    get_stored_task,
+    list_active_workflow_runs,
+    list_role_attempts_for_instance,
+    list_role_instances_for_run,
+    list_stored_tasks,
+    list_stored_tasks_with_quarantined,
+    persist_role_attempt_if_absent,
+    persist_role_instance_if_absent,
+    persist_workflow_run_if_absent,
+    record_role_attempt_runtime_handle,
+    update_durable_role_attempt,
+    update_durable_role_instance,
+    update_durable_workflow_run_state,
     update_stored_task_state,
 };
 pub use effect_worker::{EffectHandler, EffectOutcome, EffectWorkerRegistry, run_effect_worker};
@@ -94,6 +116,7 @@ pub use legacy_adapter::{
     LegacyAdapterError, adapt_v1_handoff_to_approved_intent, create_v1_compatibility_run,
     v1_compatibility_workflow_definition,
 };
+pub use orchestrator_v2::{OrchestratorError, OrchestratorV2, PhaseContext};
 pub use policy::{
     Capability, EnforcementClass, PolicyCompiler, PolicyDecision, PolicyDisposition, PolicyLayer,
     built_in_safety_floor,

@@ -405,10 +405,6 @@ pub async fn release_durable_lease(
 // These wrappers map between the v2 domain types and the store DTOs. Every
 // write goes through the store's `*_fenced` variant with the daemon fence, so a
 // stale daemon cannot land a workflow write after a successor took the lease.
-// `record_role_attempt_runtime_handle` is intentionally not ported here yet:
-// it needs the `RoleAttempt.runtime_handle_id` / `runtime_backplane_id` domain
-// fields, which live with the orchestrator cutover (a separate task); the store
-// already persists and reloads both columns.
 // ---------------------------------------------------------------------------
 
 pub async fn persist_workflow_run_if_absent(
@@ -591,6 +587,30 @@ pub async fn record_role_attempt_lease(
     Ok(())
 }
 
+/// Records the backplane handle an attempt was actually launched as, so a
+/// restarted daemon can reconcile that exact process instead of guessing.
+pub async fn record_role_attempt_runtime_handle(
+    store: &SqliteStore,
+    attempt: &RoleAttempt,
+    fence: &DaemonFence,
+) -> Result<(), TaskPersistenceError> {
+    let (Some(handle_id), Some(backplane_id)) = (
+        attempt.runtime_handle_id.as_deref(),
+        attempt.runtime_backplane_id.as_deref(),
+    ) else {
+        return Ok(());
+    };
+    store
+        .set_role_attempt_runtime_handle_fenced(
+            &attempt.id.to_string(),
+            handle_id,
+            backplane_id,
+            fence,
+        )
+        .await?;
+    Ok(())
+}
+
 pub fn record_to_workflow_run(
     record: WorkflowRunRecord,
 ) -> Result<WorkflowRun, TaskPersistenceError> {
@@ -698,6 +718,8 @@ pub fn record_to_role_attempt(
         result_artifact_id: record.result_artifact_id,
         started_at: record.started_at,
         ended_at: record.ended_at,
+        runtime_handle_id: record.runtime_handle_id,
+        runtime_backplane_id: record.runtime_backplane_id,
     })
 }
 

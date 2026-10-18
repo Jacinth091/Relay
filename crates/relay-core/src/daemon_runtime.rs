@@ -9,6 +9,8 @@ use std::{sync::Arc, time::Duration};
 
 use tokio::sync::watch;
 
+use relay_store::StoreError;
+
 use crate::{
     Relay, SqliteStore,
     daemon::{
@@ -114,8 +116,8 @@ impl DaemonClient for DaemonClientHandle {
 
 /// A running embedded daemon (this process is acting as the daemon). Holds
 /// the background task handles and a shutdown signal; dropping or calling
-/// [`EmbeddedDaemon::shutdown`] stops the heartbeat, pipe listener, and
-/// effect worker cleanly.
+/// [`EmbeddedDaemon::shutdown`] stops the heartbeat, pipe listener, effect
+/// worker, and (when one is attached) the v2 workflow driver cleanly.
 pub struct EmbeddedDaemon {
     server: Arc<DaemonServer>,
     shutdown_tx: watch::Sender<bool>,
@@ -125,6 +127,7 @@ pub struct EmbeddedDaemon {
     heartbeat: tokio::task::JoinHandle<()>,
     listener: tokio::task::JoinHandle<()>,
     effect_worker: tokio::task::JoinHandle<()>,
+    workflow_driver: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl EmbeddedDaemon {
@@ -145,12 +148,198 @@ impl EmbeddedDaemon {
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
         let _ = tokio::join!(self.heartbeat, self.listener, self.effect_worker);
+        // The driver must stop before the lease is released: after release its
+        // writes would be refused as authority-lost, which is a refusal it
+        // should never have to observe during an orderly shutdown.
+        if let Some(driver) = self.workflow_driver {
+            let _ = driver.await;
+        }
         // Release the lease only after the heartbeat loop has fully stopped,
         // so nothing can renew the row right after this deletes it - a
         // subsequent process does not have to wait out the full TTL before
         // it can become the daemon.
         if let Err(err) = self.server.release_lease().await {
             tracing::warn!(error = %err, "failed to release daemon lease on shutdown");
+        }
+    }
+}
+
+/// The trusted execution context one approved workflow run executes in.
+///
+/// `working_directory` comes from the registered project, never from task
+/// input, matching the ingress rule that remote tasks cannot supply paths.
+#[derive(Debug, Clone)]
+pub struct WorkflowDriverContext {
+    pub project_id: crate::ProjectId,
+    pub checkout_id: crate::CheckoutId,
+    pub working_directory: std::path::PathBuf,
+    pub execution_target: crate::ExecutionTarget,
+    pub budget: crate::ExecutionBudget,
+}
+
+/// Resolves the trusted execution context for an approved workflow run.
+///
+/// The host supplies this because only the host knows how a frozen
+/// `ConfigSnapshot` maps onto a registered project and a concrete provider
+/// target. The driver never invents a workspace.
+pub trait WorkflowRunContextResolver: Send + Sync {
+    fn resolve(&self, run: &crate::WorkflowRun) -> Result<WorkflowDriverContext, String>;
+}
+
+/// Drives approved v2 workflow runs until shutdown.
+///
+/// Owns the orchestration loop for every active `WorkflowRun`: on each wakeup it
+/// re-scans durable state and hands each active run to the orchestrator. The
+/// daemon never executes roles inline, so a slow or blocked run cannot stall
+/// command handling, and a crash mid-run leaves the run durable for the next
+/// driver to reconcile.
+///
+/// Every write is fenced on this daemon instance's lease. Losing authority is
+/// not a run failure: the successor owns the run now, so the driver stops
+/// instead of recording a false failure against it.
+pub async fn run_workflow_driver<B, R>(
+    server: Arc<DaemonServer>,
+    orchestrator: Arc<crate::OrchestratorV2<B>>,
+    resolver: Arc<R>,
+    mut shutdown: watch::Receiver<bool>,
+) where
+    B: relay_runtime::RuntimeBackplane + 'static,
+    R: WorkflowRunContextResolver + 'static,
+{
+    // Anything already active from a previous process is reconciled before the
+    // first drive, so a restarted daemon resumes rather than duplicates.
+    if let Err(err) = orchestrator.reconcile_on_startup(&server.fence()).await {
+        if err.is_authority_lost() {
+            tracing::warn!(
+                error = %err,
+                "workflow driver lost daemon authority before its first drive; stopping"
+            );
+            return;
+        }
+        tracing::error!(error = %err, "workflow reconcile on startup failed");
+    }
+
+    let wakeup = server.workflow_wakeup();
+    let store = server.store().clone();
+
+    loop {
+        // Re-read authority each iteration: the fence is only proof for the
+        // daemon instance that acquired it, and a driver that outlived its
+        // authority must be refused at its next write, not race the successor.
+        let fence = server.fence();
+
+        match crate::durable_state::list_active_workflow_runs(&store).await {
+            Ok(runs) => {
+                for run in runs {
+                    if *shutdown.borrow() {
+                        return;
+                    }
+
+                    let context = match resolver.resolve(&run) {
+                        Ok(context) => context,
+                        Err(reason) => {
+                            tracing::warn!(
+                                run = %run.id.0,
+                                %reason,
+                                "no execution context for workflow run"
+                            );
+                            continue;
+                        }
+                    };
+
+                    let driven = orchestrator
+                        .run_compatibility_workflow(
+                            &run.id,
+                            &context.project_id,
+                            &context.checkout_id,
+                            &context.working_directory,
+                            &context.execution_target,
+                            &context.budget,
+                            &fence,
+                        )
+                        .await;
+
+                    match driven {
+                        Ok(crate::WorkflowRunState::Completed) => {
+                            // A completed run publishes the task's user-facing
+                            // state, so the handoff the human approved does not
+                            // stay 'running' after its run has finished. The
+                            // transition is fenced like every other driver write.
+                            let task_id = run.task_id.to_string();
+                            match store
+                                .update_task_state_fenced(
+                                    task_id.as_str(),
+                                    "running",
+                                    "done",
+                                    &fence,
+                                )
+                                .await
+                            {
+                                Ok(_) => {}
+                                // A replay of a completion that already
+                                // published `done` converges instead of failing.
+                                Err(StoreError::StateConflict { actual_state, .. })
+                                    if actual_state == "done" => {}
+                                Err(err) => {
+                                    tracing::error!(
+                                        run = %run.id.0,
+                                        error = %err,
+                                        "failed to publish completed task state"
+                                    );
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) if err.is_authority_lost() => {
+                            tracing::warn!(
+                                run = %run.id.0,
+                                error = %err,
+                                "workflow driver lost daemon authority; stopping instead of recording a false failure"
+                            );
+                            return;
+                        }
+                        Err(err) => {
+                            // A run that cannot complete stays active and durable;
+                            // the failure is recorded rather than swallowed.
+                            tracing::warn!(
+                                run = %run.id.0,
+                                error = %err,
+                                "workflow drive attempt failed"
+                            );
+                            let task_id = run.task_id.to_string();
+                            let payload =
+                                serde_json::json!({ "error": err.to_string() }).to_string();
+                            if let Err(append_err) = store
+                                .append_event_fenced(
+                                    Some(task_id.as_str()),
+                                    Some(&run.id.0),
+                                    "workflow_drive_failed",
+                                    Some(&payload),
+                                    &fence,
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    error = %append_err,
+                                    "failed to record workflow drive failure"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "failed to list active workflow runs");
+            }
+        }
+
+        tokio::select! {
+            _ = wakeup.notified() => {}
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    return;
+                }
+            }
         }
     }
 }
@@ -162,12 +351,93 @@ impl EmbeddedDaemon {
 /// The transport address is derived from the durable identity of the database
 /// this daemon serves, so a client configured for a different database looks
 /// somewhere else entirely.
+///
+/// No v2 workflow driver is attached: approving a Run through this daemon
+/// records a durable workflow run and leaves it for a driver to pick up.
 pub async fn run_full_daemon(
     store: SqliteStore,
     relay: Relay,
     lease_id: &str,
     lease_ttl: Duration,
 ) -> Result<(Arc<DaemonServer>, EmbeddedDaemon), DaemonError> {
+    let (server, handles) = start_daemon_tasks(store, relay, lease_id, lease_ttl).await?;
+    Ok((server, handles.into_embedded(None)))
+}
+
+/// Starts a full daemon and attaches the v2 workflow driver.
+///
+/// Separate from [`run_full_daemon`] because the driver is generic over the
+/// runtime backplane while the daemon itself is not: this is the seam where a
+/// host composes a concrete backplane with the orchestration loop.
+pub async fn run_full_daemon_with_workflow_driver<B, R>(
+    store: SqliteStore,
+    relay: Relay,
+    lease_id: &str,
+    lease_ttl: Duration,
+    artifact_root: impl Into<std::path::PathBuf>,
+    backplane: Arc<B>,
+    resolver: Arc<R>,
+) -> Result<(Arc<DaemonServer>, EmbeddedDaemon), DaemonError>
+where
+    B: relay_runtime::RuntimeBackplane + 'static,
+    R: WorkflowRunContextResolver + 'static,
+{
+    let orchestrator = Arc::new(crate::OrchestratorV2::new(
+        store.clone(),
+        Arc::new(crate::SchedulerV2::new(crate::SchedulerV2Config::default())),
+        backplane,
+        crate::ArtifactStore::new(artifact_root)
+            .map_err(|err| DaemonError::Command(err.to_string()))?,
+    ));
+
+    let (server, handles) = start_daemon_tasks(store, relay, lease_id, lease_ttl).await?;
+
+    let driver = {
+        let driver_server = Arc::clone(&server);
+        let driver_shutdown = handles.shutdown_rx();
+        tokio::spawn(async move {
+            run_workflow_driver(driver_server, orchestrator, resolver, driver_shutdown).await;
+        })
+    };
+
+    Ok((server, handles.into_embedded(Some(driver))))
+}
+
+/// Background tasks that make an embedded daemon a daemon, before the optional
+/// workflow driver is attached to them.
+struct DaemonTaskHandles {
+    server: Arc<DaemonServer>,
+    shutdown_tx: watch::Sender<bool>,
+    shutdown_rx: watch::Receiver<bool>,
+    heartbeat: tokio::task::JoinHandle<()>,
+    listener: tokio::task::JoinHandle<()>,
+    effect_worker: tokio::task::JoinHandle<()>,
+}
+
+impl DaemonTaskHandles {
+    fn shutdown_rx(&self) -> watch::Receiver<bool> {
+        self.shutdown_rx.clone()
+    }
+
+    fn into_embedded(self, workflow_driver: Option<tokio::task::JoinHandle<()>>) -> EmbeddedDaemon {
+        EmbeddedDaemon {
+            server: self.server,
+            shutdown_tx: self.shutdown_tx,
+            shutdown: self.shutdown_rx,
+            heartbeat: self.heartbeat,
+            listener: self.listener,
+            effect_worker: self.effect_worker,
+            workflow_driver,
+        }
+    }
+}
+
+async fn start_daemon_tasks(
+    store: SqliteStore,
+    relay: Relay,
+    lease_id: &str,
+    lease_ttl: Duration,
+) -> Result<(Arc<DaemonServer>, DaemonTaskHandles), DaemonError> {
     let daemon = DaemonServer::start(store, relay, lease_id, lease_ttl).await?;
 
     if let Err(err) = daemon.reconcile_on_startup().await {
@@ -248,10 +518,10 @@ pub async fn run_full_daemon(
 
     Ok((
         Arc::clone(&server),
-        EmbeddedDaemon {
+        DaemonTaskHandles {
             server,
             shutdown_tx,
-            shutdown: shutdown_rx,
+            shutdown_rx,
             heartbeat,
             listener,
             effect_worker,

@@ -678,6 +678,70 @@ pub async fn connect_or_embed(
     lease_id: &str,
     lease_ttl: Duration,
 ) -> Result<(DaemonClientHandle, Option<EmbeddedDaemon>), DaemonError> {
+    connect_or_embed_inner(
+        store,
+        relay,
+        lease_id.to_owned(),
+        lease_ttl,
+        |store, relay, lease_id, lease_ttl| async move {
+            run_full_daemon(store, relay, &lease_id, lease_ttl).await
+        },
+    )
+    .await
+}
+
+/// Connects to an already-running daemon over the local pipe; if none is
+/// running, embeds a daemon with its v2 workflow driver attached. This is the
+/// production client path for hosts that approve Run commands.
+#[allow(clippy::too_many_arguments)]
+pub async fn connect_or_embed_with_workflow_driver<B, R>(
+    store: SqliteStore,
+    relay: Relay,
+    lease_id: &str,
+    lease_ttl: Duration,
+    artifact_root: impl Into<std::path::PathBuf>,
+    backplane: Arc<B>,
+    resolver: Arc<R>,
+    provider_adapters: Vec<Arc<dyn relay_runtime::ProviderAdapter>>,
+) -> Result<(DaemonClientHandle, Option<EmbeddedDaemon>), DaemonError>
+where
+    B: relay_runtime::RuntimeBackplane + 'static,
+    R: WorkflowRunContextResolver + 'static,
+{
+    let artifact_root = artifact_root.into();
+    connect_or_embed_inner(
+        store,
+        relay,
+        lease_id.to_owned(),
+        lease_ttl,
+        move |store, relay, lease_id, lease_ttl| async move {
+            run_full_daemon_with_workflow_driver(
+                store,
+                relay,
+                &lease_id,
+                lease_ttl,
+                artifact_root,
+                backplane,
+                resolver,
+                provider_adapters,
+            )
+            .await
+        },
+    )
+    .await
+}
+
+async fn connect_or_embed_inner<F, Fut>(
+    store: SqliteStore,
+    relay: Relay,
+    lease_id: String,
+    lease_ttl: Duration,
+    start_embedded: F,
+) -> Result<(DaemonClientHandle, Option<EmbeddedDaemon>), DaemonError>
+where
+    F: FnOnce(SqliteStore, Relay, String, Duration) -> Fut,
+    Fut: Future<Output = Result<(Arc<DaemonServer>, EmbeddedDaemon), DaemonError>>,
+{
     let state_identity = store.store_identity().await?;
     let pipe_client = NamedPipeDaemonClient::new(
         daemon_transport::default_pipe_name(&state_identity),
@@ -689,7 +753,7 @@ pub async fn connect_or_embed(
         Err(other) => return Err(other),
     }
 
-    match run_full_daemon(store, relay, lease_id, lease_ttl).await {
+    match start_embedded(store, relay, lease_id, lease_ttl).await {
         Ok((server, embedded)) => Ok((
             DaemonClientHandle::InProcess(InProcessDaemonClient::new(server)),
             Some(embedded),
@@ -718,6 +782,35 @@ pub async fn connect_or_embed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connect_or_embed_with_workflow_driver_embeds_the_driver_when_no_pipe_is_running() {
+        let database_dir =
+            std::env::temp_dir().join(format!("relay-embedded-driver-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&database_dir).unwrap();
+        let store = SqliteStore::open(database_dir.join("relay.sqlite3"))
+            .await
+            .unwrap();
+        let resolver = Arc::new(crate::TrustedRunContextResolver::new(None, store.clone()));
+
+        let (client, embedded) = connect_or_embed_with_workflow_driver(
+            store,
+            Relay::new(),
+            "test-embedded-workflow-driver",
+            Duration::from_secs(30),
+            database_dir.join("artifacts"),
+            Arc::new(relay_runtime::LocalProcessBackplane::default()),
+            resolver,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(client, DaemonClientHandle::InProcess(_)));
+        let embedded = embedded.expect("an absent pipe daemon must be embedded");
+        assert!(embedded.workflow_driver.is_some());
+        embedded.shutdown().await;
+    }
 
     /// FLOW-19-03: a readiness signal published after the shared shutdown was
     /// already signalled is not readiness. The host re-checks that state before it

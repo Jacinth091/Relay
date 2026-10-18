@@ -19,8 +19,8 @@ use relay_runtime_codex::CodexRuntimeHealth;
 use crate::commands::execute_relay_command;
 use crate::input::{command_mode_available, handle_key};
 use crate::state::{
-    AddProjectForm, AppState, DoctorCheckStatus, RuntimeDetailSubmenu, Screen, TaskReviewSubmenu,
-    ToolHealth,
+    AddProjectForm, AppState, DoctorCheckStatus, RunPath, RuntimeDetailSubmenu, Screen,
+    TaskReviewSubmenu, ToolHealth,
 };
 use crate::ui::execution::{render_execution, render_result};
 use crate::util::{
@@ -35,6 +35,7 @@ fn empty_relay_maps_to_expected_dashboard_message() {
         unique_temp_path("config").join("relay.toml"),
         true,
         "ready".to_owned(),
+        RunPath::DaemonV2,
     );
 
     assert!(dashboard_status(&state).starts_with("No projects configured.\nNo durable tasks."));
@@ -192,6 +193,7 @@ async fn durable_tasks_are_visible_after_reopen_without_reviewed_task() {
         Some(store),
         durable_tasks,
         "ready".to_owned(),
+        RunPath::DaemonV2,
     );
 
     assert!(reopened.relay.reviewed_task().is_none());
@@ -537,6 +539,7 @@ async fn adding_project_rebinds_idle_scheduler_to_current_registry() {
         Some(store),
         Vec::new(),
         "ready".to_owned(),
+        RunPath::LegacyV1,
     );
     let before = state.scheduler.as_ref().unwrap().clone();
     state.add_project = AddProjectForm {
@@ -586,6 +589,7 @@ async fn project_registered_after_the_daemon_started_is_immediately_usable() {
         Some(store),
         Vec::new(),
         "ready".to_owned(),
+        RunPath::DaemonV2,
     );
     state.attach_daemon(Some(daemon));
 
@@ -686,6 +690,180 @@ async fn active_registry_rebind_blocks_run_until_the_scheduler_is_rebound() {
 }
 
 #[tokio::test]
+async fn daemon_v2_run_uses_the_daemon_and_refreshes_durable_state() {
+    let mut state = app_state_with_eligible_project_with_store_for(RunPath::DaemonV2).await;
+    let store = state.store.as_ref().unwrap().clone();
+    assert!(state.scheduler.is_none());
+    assert!(state.scheduler_events.is_none());
+    assert!(state.scheduler_driver.is_none());
+
+    state.start_paste_task();
+    state.paste_text = task_json();
+    state.submit_paste_task();
+    state.confirm_task_import().await;
+    let task_id = state.selected_task.unwrap();
+    assert_eq!(
+        state.selected_stored_task().unwrap().state,
+        TaskState::Ready
+    );
+
+    state.submit_selected_task().await;
+
+    assert_eq!(state.feedback, "Run approved. Sent to the Relay daemon.");
+    assert_eq!(state.screen, Screen::TaskReview);
+    assert!(state.scheduler.is_none());
+    assert_eq!(
+        relay_core::get_stored_task(&store, task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        TaskState::Running
+    );
+    assert!(
+        relay_core::list_active_workflow_runs(&store)
+            .await
+            .unwrap()
+            .iter()
+            .any(|run| run.task_id == task_id)
+    );
+}
+
+#[tokio::test]
+async fn daemon_v2_run_refuses_one_run_model_and_effort_overrides() {
+    let mut state = app_state_with_eligible_project_with_store_for(RunPath::DaemonV2).await;
+    let store = state.store.as_ref().unwrap().clone();
+    state.start_paste_task();
+    state.paste_text = task_json();
+    state.submit_paste_task();
+    state.confirm_task_import().await;
+    let task_id = state.selected_task.unwrap();
+
+    state.one_run_model_override = Some("test-model".to_owned());
+    state.submit_selected_task().await;
+    assert!(
+        state
+            .feedback
+            .contains("does not apply one-run model or effort overrides")
+    );
+    assert!(state.feedback.contains("RELAY_LEGACY_V1_RUN=1"));
+    assert_eq!(
+        state.selected_stored_task().unwrap().state,
+        TaskState::Ready
+    );
+
+    state.one_run_model_override = None;
+    state.one_run_reasoning_override = Some("high".to_owned());
+    state.submit_selected_task().await;
+    assert!(
+        state
+            .feedback
+            .contains("does not apply one-run model or effort overrides")
+    );
+    assert_eq!(
+        relay_core::get_stored_task(&store, task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        TaskState::Ready
+    );
+    assert!(
+        relay_core::list_active_workflow_runs(&store)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn daemon_v2_run_reports_unavailable_daemon_and_cancel_confirmation() {
+    let mut state = app_state_with_eligible_project_with_store_for(RunPath::DaemonV2).await;
+    state.start_paste_task();
+    state.paste_text = task_json();
+    state.submit_paste_task();
+    state.confirm_task_import().await;
+    let task_id = state.selected_task.unwrap();
+    state.attach_daemon(None);
+
+    state.submit_selected_task().await;
+    assert_eq!(
+        state.feedback,
+        "Run is unavailable until the daemon is reachable."
+    );
+    assert_eq!(
+        state.selected_stored_task().unwrap().state,
+        TaskState::Ready
+    );
+
+    state.cancel_confirmation = Some(task_id);
+    state.confirm_cancel().await;
+    assert_eq!(
+        state.feedback,
+        "Cancel is not available for daemon v2 runs yet."
+    );
+}
+
+#[tokio::test]
+async fn legacy_v1_run_path_constructs_the_scheduler() {
+    let state = AppState::new_with_store(
+        Relay::new(),
+        unique_temp_path("legacy-config").join("relay.toml"),
+        true,
+        unique_temp_path("legacy-state").join("relay.sqlite3"),
+        Some(SqliteStore::in_memory().await.unwrap()),
+        Vec::new(),
+        "ready".to_owned(),
+        RunPath::LegacyV1,
+    );
+
+    assert!(state.scheduler.is_some());
+    assert!(state.scheduler_events.is_some());
+}
+
+#[test]
+fn legacy_v1_run_path_requires_the_exact_environment_value() {
+    assert_eq!(RunPath::from_env_value(Some("1")), RunPath::LegacyV1);
+    for value in [
+        None,
+        Some(""),
+        Some("0"),
+        Some("true"),
+        Some(" 1"),
+        Some("01"),
+    ] {
+        assert_eq!(RunPath::from_env_value(value), RunPath::DaemonV2);
+    }
+}
+
+#[test]
+fn legacy_v1_run_path_is_visible_in_the_status_bar() {
+    let state = AppState::new(
+        Relay::new(),
+        unique_temp_path("legacy-label-config").join("relay.toml"),
+        true,
+        String::new(),
+        RunPath::LegacyV1,
+    );
+    let backend = ratatui::backend::TestBackend::new(100, 10);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| crate::ui::render(frame, &state))
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let rendered_text: String = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered_text.contains("Legacy v1 Run path (RELAY_LEGACY_V1_RUN)"));
+}
+
+#[tokio::test]
 async fn submit_replaces_a_driver_that_finishes_during_queue_submission() {
     let mut state = app_state_with_eligible_project_with_store().await;
     state.start_paste_task();
@@ -776,6 +954,7 @@ fn add_project_does_not_overwrite_invalid_existing_config() {
         config_path.clone(),
         false,
         "Config error".to_owned(),
+        RunPath::DaemonV2,
     );
     state.add_project = AddProjectForm {
         key: "relay".to_owned(),
@@ -1040,6 +1219,7 @@ fn app_state_with_project() -> AppState {
         unique_temp_path("config").join("relay.toml"),
         true,
         "ready".to_owned(),
+        RunPath::DaemonV2,
     );
     state.runtime_health = CodexRuntimeHealth::Available {
         version: "test runtime".to_owned(),
@@ -1060,6 +1240,7 @@ async fn app_state_with_project_with_store() -> AppState {
         Some(store),
         Vec::new(),
         "ready".to_owned(),
+        RunPath::LegacyV1,
     );
     state.attach_daemon(Some(daemon));
     state.runtime_health = CodexRuntimeHealth::Available {
@@ -1088,6 +1269,10 @@ async fn embedded_daemon_for(store: &SqliteStore, relay: &Relay) -> relay_core::
 }
 
 async fn app_state_with_eligible_project_with_store() -> AppState {
+    app_state_with_eligible_project_with_store_for(RunPath::LegacyV1).await
+}
+
+async fn app_state_with_eligible_project_with_store_for(run_path: RunPath) -> AppState {
     let path = unique_temp_path("eligible-project");
     fs::create_dir_all(&path).unwrap();
     for args in [
@@ -1139,6 +1324,7 @@ async fn app_state_with_eligible_project_with_store() -> AppState {
         Some(store),
         Vec::new(),
         "ready".to_owned(),
+        run_path,
     );
     state.attach_daemon(Some(daemon));
     state.runtime_health = CodexRuntimeHealth::Available {
@@ -1391,6 +1577,7 @@ fn settings_test_state() -> AppState {
         unique_temp_path("settings-config").join("relay.toml"),
         true,
         "ready".to_owned(),
+        RunPath::DaemonV2,
     );
     // Route persistence at a temp path so tests never touch real user config.
     state.runtime_config_path = unique_temp_path("settings-save").join("runtimes.toml");

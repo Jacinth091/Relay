@@ -115,8 +115,13 @@ fn render_top_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     // The right segment is sized to exactly fit its content so the provider
     // name and health marker are never truncated; when space is tight the
     // left title shortens instead.
-    let right_width =
-        (state.active_runtime_provider.chars().count() + 1 + marker.chars().count()) as u16;
+    let run_path_label = state.legacy_run_path_label();
+    let right_width = (state.active_runtime_provider.chars().count()
+        + 1
+        + marker.chars().count()
+        + run_path_label
+            .map(|label| label.chars().count() + 3)
+            .unwrap_or(0)) as u16;
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(right_width)])
@@ -142,12 +147,16 @@ fn render_top_bar(frame: &mut Frame, state: &AppState, area: Rect) {
         ])),
         columns[0],
     );
+    let mut status = vec![
+        Span::styled(format!("{} ", state.active_runtime_provider), theme.muted()),
+        Span::styled(marker, marker_style),
+    ];
+    if let Some(label) = run_path_label {
+        status.push(Span::styled(" · ", theme.muted()));
+        status.push(Span::styled(label, theme.warning()));
+    }
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(format!("{} ", state.active_runtime_provider), theme.muted()),
-            Span::styled(marker, marker_style),
-        ]))
-        .alignment(Alignment::Right),
+        Paragraph::new(Line::from(status)).alignment(Alignment::Right),
         columns[1],
     );
 }

@@ -58,8 +58,8 @@ pub use daemon::{
 #[cfg(windows)]
 pub use daemon_runtime::{
     DaemonClientHandle, EmbeddedDaemon, WorkflowDriverContext, WorkflowRunContextFuture,
-    WorkflowRunContextResolver, connect_or_embed, new_command_id, run_full_daemon,
-    run_full_daemon_with_workflow_driver, run_workflow_driver,
+    WorkflowRunContextResolver, connect_or_embed, connect_or_embed_with_workflow_driver,
+    new_command_id, run_full_daemon, run_full_daemon_with_workflow_driver, run_workflow_driver,
 };
 #[cfg(windows)]
 pub use daemon_transport::{NamedPipeDaemonClient, default_pipe_name};

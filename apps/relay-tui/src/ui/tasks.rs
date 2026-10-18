@@ -6,7 +6,7 @@ use ratatui::{
 
 use relay_core::TaskState;
 
-use crate::state::{AppState, TaskReviewSubmenu, reasoning_effort_label};
+use crate::state::{AppState, RunPath, TaskReviewSubmenu, reasoning_effort_label};
 use crate::util::{handoff_summary_text, task_preview_text, task_selection_listing};
 
 pub(crate) fn render_tasks(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -136,8 +136,13 @@ pub(crate) fn render_task_review(frame: &mut Frame, state: &AppState, area: Rect
             let effective_stack = state
                 .effective_stack(task)
                 .unwrap_or("missing or unsupported");
+            let feedback = if state.run_path == RunPath::DaemonV2 && !state.feedback.is_empty() {
+                format!("\n\n{}", state.feedback)
+            } else {
+                String::new()
+            };
             format!(
-                "Task Review\n\nTask: {}\nProject: {}\nRequested stack: {}\nEffective stack: {}\nRuntime availability: {}\nState: {}\nRepository: {}\n\n{}{}",
+                "Task Review\n\nTask: {}\nProject: {}\nRequested stack: {}\nEffective stack: {}\nRuntime availability: {}\nState: {}\nRepository: {}\n\n{}{}{}",
                 task.id,
                 task.project_key,
                 requested_stack,
@@ -158,7 +163,8 @@ pub(crate) fn render_task_review(frame: &mut Frame, state: &AppState, area: Rect
                         .ok()
                         .and_then(|p| p.name())
                 ),
-                action
+                action,
+                feedback
             )
         })
         .unwrap_or_else(|| "No durable task selected.".to_owned());

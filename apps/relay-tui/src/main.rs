@@ -19,12 +19,13 @@ mod util;
 mod tests;
 
 pub(crate) use input::handle_key;
-pub(crate) use state::AppState;
+pub(crate) use state::{AppState, RunPath};
 pub(crate) use ui::render;
 
 use std::{
     error::Error,
     io::{self, Stdout},
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -35,15 +36,45 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use relay_core::{
-    DEFAULT_LEASE_ID, DEFAULT_LEASE_TTL, Relay, connect_or_embed, default_config_path,
-    default_database_path,
+    DEFAULT_LEASE_ID, DEFAULT_LEASE_TTL, Relay, connect_or_embed_with_workflow_driver,
+    default_config_path, default_database_path,
 };
-use relay_runtime::{CodexProviderAdapter, LocalProcessBackplane};
+use relay_runtime::{CodexProviderAdapter, LocalProcessBackplane, ProviderAdapter};
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
+struct ProductionWorkflowDriver {
+    artifact_root: PathBuf,
+    backplane: Arc<LocalProcessBackplane>,
+    resolver: Arc<relay_core::TrustedRunContextResolver>,
+    provider_adapters: Vec<Arc<dyn ProviderAdapter>>,
+}
+
+fn production_workflow_driver(
+    config_path: &Path,
+    database_path: &Path,
+    store: &relay_core::SqliteStore,
+) -> ProductionWorkflowDriver {
+    let resolver_config_path = config_path.is_file().then(|| config_path.to_path_buf());
+    let artifact_root = database_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("artifacts");
+    ProductionWorkflowDriver {
+        artifact_root,
+        backplane: Arc::new(LocalProcessBackplane::default()),
+        resolver: Arc::new(relay_core::TrustedRunContextResolver::new(
+            resolver_config_path,
+            store.clone(),
+        )),
+        provider_adapters: vec![Arc::new(CodexProviderAdapter::new())],
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let run_path_setting = std::env::var("RELAY_LEGACY_V1_RUN").ok();
+    let run_path = RunPath::from_env_value(run_path_setting.as_deref());
     let command = match cli::parse_cli(std::env::args_os()) {
         Ok(command) => command,
         Err(error) => error.exit(),
@@ -73,23 +104,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (store, durable_tasks, database_feedback) = bootstrap::open_store(&database_path).await;
 
     let (daemon, embedded_daemon, daemon_feedback) = match &store {
-        Some(store) => match connect_or_embed(
-            store.clone(),
-            relay.clone(),
-            DEFAULT_LEASE_ID,
-            DEFAULT_LEASE_TTL,
-        )
-        .await
-        {
-            Ok((handle, embedded)) => (Some(handle), embedded, String::new()),
-            Err(error) => (
-                None,
-                None,
-                format!(
-                    "Daemon error: {error}\nTask import is disabled until the daemon is reachable."
+        Some(store) => {
+            let driver = production_workflow_driver(&config_path, &database_path, store);
+            match connect_or_embed_with_workflow_driver(
+                store.clone(),
+                relay.clone(),
+                DEFAULT_LEASE_ID,
+                DEFAULT_LEASE_TTL,
+                driver.artifact_root,
+                driver.backplane,
+                driver.resolver,
+                driver.provider_adapters,
+            )
+            .await
+            {
+                Ok((handle, embedded)) => (Some(handle), embedded, String::new()),
+                Err(error) => (
+                    None,
+                    None,
+                    format!(
+                        "Daemon error: {error}\nTask import is disabled until the daemon is reachable."
+                    ),
                 ),
-            ),
-        },
+            }
+        }
         None => (None, None, String::new()),
     };
 
@@ -107,6 +145,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         store,
         durable_tasks,
         combined_feedback,
+        run_path,
     );
     state.attach_daemon(daemon);
     state.refresh_durable_tasks().await;
@@ -152,11 +191,16 @@ async fn serve_mcp() -> Result<(), Box<dyn Error>> {
         error
     })?;
 
-    let (daemon, embedded_daemon) = connect_or_embed(
+    let driver = production_workflow_driver(&config_path, &database_path, &store);
+    let (daemon, embedded_daemon) = connect_or_embed_with_workflow_driver(
         store.clone(),
         relay.clone(),
         DEFAULT_LEASE_ID,
         DEFAULT_LEASE_TTL,
+        driver.artifact_root,
+        driver.backplane,
+        driver.resolver,
+        driver.provider_adapters,
     )
     .await
     .map_err(|error| {
@@ -199,24 +243,16 @@ async fn run_daemon(lease_id: String, lease_ttl_secs: u64) -> Result<(), Box<dyn
     })?;
 
     let ttl = std::time::Duration::from_secs(lease_ttl_secs);
-    let resolver_config_path = config_path.is_file().then(|| config_path.clone());
-    let artifact_root = database_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("artifacts");
-    let resolver = Arc::new(relay_core::TrustedRunContextResolver::new(
-        resolver_config_path,
-        store.clone(),
-    ));
+    let driver = production_workflow_driver(&config_path, &database_path, &store);
     let (daemon, mut embedded) = relay_core::run_full_daemon_with_workflow_driver(
         store,
         relay,
         &lease_id,
         ttl,
-        artifact_root,
-        Arc::new(LocalProcessBackplane::default()),
-        resolver,
-        vec![Arc::new(CodexProviderAdapter::new())],
+        driver.artifact_root,
+        driver.backplane,
+        driver.resolver,
+        driver.provider_adapters,
     )
     .await
     .map_err(|error| {

@@ -200,6 +200,33 @@ pub struct WorkflowRunRecord {
     pub config_snapshot_id: String,
     pub started_at: String,
     pub completed_at: Option<String>,
+    /// The approved intent this run executes, as JSON. Empty only for rows that
+    /// predate authority capture (migration 0012).
+    pub approved_intent_json: String,
+    /// The execution grant derived from `approved_intent_json`, as JSON.
+    pub execution_grant_json: String,
+    /// The frozen configuration snapshot the run was approved under, as JSON.
+    pub config_snapshot_json: String,
+}
+
+/// Everything one atomic Run approval writes: the workflow run (including the
+/// authority it executes under), the task's `ready -> running` transition, and
+/// the single `workflow_run_started` event.
+///
+/// These belong to one transaction because they are one fact. Split into
+/// separate writes, a crash between them leaves a run whose task is still
+/// `ready` (or a task marked `running` with no run), and a replay of the same
+/// command cannot tell whether it is fixing that state or duplicating it.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkflowRunStart<'a> {
+    pub run: &'a NewWorkflowRunRecord,
+    pub approved_intent_json: &'a str,
+    pub execution_grant_json: &'a str,
+    pub config_snapshot_json: &'a str,
+    pub task_expected_state: &'a str,
+    pub task_new_state: &'a str,
+    pub event_kind: &'a str,
+    pub event_json: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -500,6 +527,47 @@ impl SqliteStore {
             self.append_event_once(task_id, execution_id, event_kind, event_json)
         })
         .await
+    }
+
+    /// Fenced variant of [`SqliteStore::append_event`] used by the daemon-owned
+    /// v2 workflow driver, whose writes are not command-handler writes.
+    ///
+    /// The authority assertion shares the event's transaction, so a stale
+    /// daemon cannot append a workflow event after a successor took the lease.
+    pub async fn append_event_fenced(
+        &self,
+        task_id: Option<&str>,
+        execution_id: Option<&str>,
+        event_kind: &str,
+        event_json: Option<&str>,
+        fence: &DaemonFence,
+    ) -> Result<(), StoreError> {
+        retry_on_transient_lock(|| {
+            self.append_event_fenced_once(task_id, execution_id, event_kind, event_json, fence)
+        })
+        .await
+    }
+
+    async fn append_event_fenced_once(
+        &self,
+        task_id: Option<&str>,
+        execution_id: Option<&str>,
+        event_kind: &str,
+        event_json: Option<&str>,
+        fence: &DaemonFence,
+    ) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        assert_daemon_fence(&mut *transaction, fence).await?;
+        insert_event(
+            &mut transaction,
+            task_id,
+            execution_id,
+            event_kind,
+            event_json,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     async fn append_event_once(
@@ -2473,7 +2541,8 @@ impl SqliteStore {
         let row = sqlx::query(
             r#"
             SELECT id, task_id, execution_grant_id, workflow_definition_id, state,
-                   config_snapshot_id, started_at, completed_at
+                   config_snapshot_id, started_at, completed_at,
+                   approved_intent_json, execution_grant_json, config_snapshot_json
             FROM workflow_runs
             WHERE id = ?1
             "#,
@@ -2483,6 +2552,119 @@ impl SqliteStore {
         .await?;
 
         row.map(row_to_workflow_run_record).transpose()
+    }
+
+    /// Start of a Run approval: insert the run with its authority, transition
+    /// the task `ready -> running`, and append the single start event, all in
+    /// one fenced transaction.
+    ///
+    /// Convergence: on a replay the run already exists and the task is already
+    /// `running`, so the transition matches its desired end state, no second
+    /// event is appended, and the committed run is returned. A task in any other
+    /// state is a genuine conflict and refuses the write, which also rolls back
+    /// the run insert.
+    pub async fn start_workflow_run_fenced(
+        &self,
+        start: &WorkflowRunStart<'_>,
+        fence: &DaemonFence,
+    ) -> Result<WorkflowRunRecord, StoreError> {
+        retry_on_transient_lock(|| self.start_workflow_run_once(start, fence)).await
+    }
+
+    async fn start_workflow_run_once(
+        &self,
+        start: &WorkflowRunStart<'_>,
+        fence: &DaemonFence,
+    ) -> Result<WorkflowRunRecord, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+
+        assert_daemon_fence(&mut *transaction, fence).await?;
+
+        let inserted = sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO workflow_runs (
+                id, task_id, execution_grant_id, workflow_definition_id, state,
+                config_snapshot_id, approved_intent_json, execution_grant_json,
+                config_snapshot_json
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+        )
+        .bind(&start.run.id)
+        .bind(&start.run.task_id)
+        .bind(&start.run.execution_grant_id)
+        .bind(&start.run.workflow_definition_id)
+        .bind(&start.run.state)
+        .bind(&start.run.config_snapshot_id)
+        .bind(start.approved_intent_json)
+        .bind(start.execution_grant_json)
+        .bind(start.config_snapshot_json)
+        .execute(&mut *transaction)
+        .await?;
+
+        let first_start = inserted.rows_affected() == 1;
+
+        let transitioned = sqlx::query(
+            r#"
+            UPDATE tasks
+            SET state = ?1,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?2
+              AND state = ?3
+            "#,
+        )
+        .bind(start.task_new_state)
+        .bind(&start.run.task_id)
+        .bind(start.task_expected_state)
+        .execute(&mut *transaction)
+        .await?;
+
+        if transitioned.rows_affected() == 0 {
+            let actual_state =
+                sqlx::query_scalar::<_, String>("SELECT state FROM tasks WHERE id = ?1")
+                    .bind(&start.run.task_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+
+            match actual_state {
+                // Already converged: a replay of a committed approval.
+                Some(actual_state) if actual_state == start.task_new_state => {}
+                Some(actual_state) => {
+                    return Err(StoreError::StateConflict {
+                        id: start.run.task_id.clone(),
+                        expected_state: start.task_expected_state.to_owned(),
+                        actual_state,
+                    });
+                }
+                None => {
+                    return Err(StoreError::TaskNotFound {
+                        id: start.run.task_id.clone(),
+                    });
+                }
+            }
+        }
+
+        // Exactly one start event per run: only the call that created the run
+        // appends it, and that call's insert, transition and event share this
+        // transaction.
+        if first_start {
+            insert_event(
+                &mut transaction,
+                Some(&start.run.task_id),
+                Some(&start.run.id),
+                start.event_kind,
+                start.event_json,
+            )
+            .await?;
+        }
+
+        transaction.commit().await?;
+
+        self.get_workflow_run(&start.run.id)
+            .await?
+            .ok_or_else(|| StoreError::ExecutionNotFound {
+                id: start.run.id.clone(),
+            })
     }
 
     /// Authority-unchecked workflow-run state transition (store tests only).
@@ -3003,7 +3185,8 @@ impl SqliteStore {
         let rows = sqlx::query(
             r#"
             SELECT id, task_id, execution_grant_id, workflow_definition_id, state,
-                   config_snapshot_id, started_at, completed_at
+                   config_snapshot_id, started_at, completed_at,
+                   approved_intent_json, execution_grant_json, config_snapshot_json
             FROM workflow_runs
             WHERE state IN ('pending', 'running')
             ORDER BY started_at ASC
@@ -3408,6 +3591,9 @@ fn row_to_workflow_run_record(
         config_snapshot_id: row.try_get("config_snapshot_id")?,
         started_at: row.try_get("started_at")?,
         completed_at: row.try_get("completed_at")?,
+        approved_intent_json: row.try_get("approved_intent_json")?,
+        execution_grant_json: row.try_get("execution_grant_json")?,
+        config_snapshot_json: row.try_get("config_snapshot_json")?,
     })
 }
 
@@ -4959,6 +5145,25 @@ mod tests {
             columns.iter().any(|name| name == "runtime_backplane_id"),
             "role_attempts must carry runtime_backplane_id after migration 0011"
         );
+
+        let run_rows = sqlx::query("PRAGMA table_info(workflow_runs)")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        let run_columns = run_rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("name").unwrap())
+            .collect::<Vec<_>>();
+        for column in [
+            "approved_intent_json",
+            "execution_grant_json",
+            "config_snapshot_json",
+        ] {
+            assert!(
+                run_columns.iter().any(|name| name == column),
+                "workflow_runs must carry {column} after migration 0012"
+            );
+        }
     }
 
     /// R12-02 part 1: insert-if-absent is idempotent for workflow runs, role
@@ -5174,6 +5379,129 @@ mod tests {
                 .unwrap()
                 .state,
             "queued"
+        );
+    }
+
+    /// R12-02 part 2: approving a Run is one durable fact. The run (with the
+    /// approved intent, grant and snapshot it executes under), the task's
+    /// transition and the single start event commit together, and a replay
+    /// converges instead of duplicating any of them.
+    #[tokio::test]
+    async fn start_workflow_run_is_atomic_and_its_replay_converges() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let lease = store
+            .acquire_or_renew_daemon_lease(
+                "daemon-start",
+                5001,
+                "host-a",
+                "inst-5001",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        let fence = DaemonFence {
+            lease_id: "daemon-start".to_owned(),
+            holder_pid: lease.holder_pid,
+            holder_instance: lease.holder_instance.clone(),
+            fencing_token: lease.fencing_token,
+        };
+
+        store
+            .insert_task(&task_record("task-start", "start"))
+            .await
+            .unwrap();
+
+        let intent_json = r#"{"id":"intent-1","generation":1}"#;
+        let grant_json = r#"{"id":"grant-1"}"#;
+        let snapshot_json = r#"{"id":"snapshot-1","workflow_version":1}"#;
+        let event_json = r#"{"task_id":"task-start","workflow_run_id":"run-start"}"#;
+
+        let mut run_record = workflow_run_record("run-start", "task-start");
+        run_record.state = "running".to_owned();
+        let start = WorkflowRunStart {
+            run: &run_record,
+            approved_intent_json: intent_json,
+            execution_grant_json: grant_json,
+            config_snapshot_json: snapshot_json,
+            task_expected_state: "ready",
+            task_new_state: "running",
+            event_kind: "workflow_run_started",
+            event_json: Some(event_json),
+        };
+
+        let run = store
+            .start_workflow_run_fenced(&start, &fence)
+            .await
+            .unwrap();
+        assert_eq!(run.state, "running");
+        assert_eq!(run.approved_intent_json, intent_json);
+        assert_eq!(run.execution_grant_json, grant_json);
+        assert_eq!(run.config_snapshot_json, snapshot_json);
+        assert_eq!(
+            store.get_workflow_run("run-start").await.unwrap().unwrap(),
+            run,
+            "the stored authority must round-trip through the read path"
+        );
+        assert_eq!(
+            store.get_task("task-start").await.unwrap().unwrap().state,
+            "running"
+        );
+
+        // Replay of the same approval converges: same run, task already running,
+        // and no second start event.
+        let replay = store
+            .start_workflow_run_fenced(&start, &fence)
+            .await
+            .unwrap();
+        assert_eq!(replay, run);
+
+        let events = store.get_events_after(0, 100).await.unwrap();
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_kind == "workflow_run_started")
+            .collect();
+        assert_eq!(
+            starts.len(),
+            1,
+            "a replayed approval must not append a second start event, got {events:?}"
+        );
+        assert_eq!(starts[0].task_id.as_deref(), Some("task-start"));
+        assert_eq!(starts[0].execution_id.as_deref(), Some("run-start"));
+
+        // A task in any other state is a genuine conflict, and the run row that
+        // would have accompanied it is rolled back with the refusal.
+        store
+            .insert_task(&task_record("task-done", "done"))
+            .await
+            .unwrap();
+        store
+            .update_task_state("task-done", "ready", "done")
+            .await
+            .unwrap();
+        let mut late_record = workflow_run_record("run-late-start", "task-done");
+        late_record.state = "running".to_owned();
+        let late = WorkflowRunStart {
+            run: &late_record,
+            approved_intent_json: intent_json,
+            execution_grant_json: grant_json,
+            config_snapshot_json: snapshot_json,
+            task_expected_state: "ready",
+            task_new_state: "running",
+            event_kind: "workflow_run_started",
+            event_json: None,
+        };
+        let refused = store.start_workflow_run_fenced(&late, &fence).await;
+        assert!(
+            matches!(refused, Err(StoreError::StateConflict { .. })),
+            "a Task that is not ready must refuse the approval, got {refused:?}"
+        );
+        assert!(
+            store
+                .get_workflow_run("run-late-start")
+                .await
+                .unwrap()
+                .is_none(),
+            "the run insert must roll back with the refused transition"
         );
     }
 

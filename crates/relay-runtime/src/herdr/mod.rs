@@ -15,11 +15,9 @@ pub use binding::RuntimeBindingStore;
 pub use cli::{
     HerdrCli, HerdrCliPaneInfo, HerdrCommandOutput, HerdrCommandRunner, HerdrCompatibility,
     HerdrOps, HerdrPaneProcess, HerdrProcessInfo, HerdrSplitDirection, HerdrTab, HerdrTabCreation,
-    HerdrVersion, HerdrWorkspace, HerdrWorkspaceCreation, ProcessHerdrRunner, check_compatibility,
+    HerdrVersion, HerdrWorkspace, HerdrWorkspaceCreation, ProcessHerdrRunner, TrustedToken,
+    check_compatibility,
 };
-pub use client::{
-    HerdrCapabilities, HerdrClient, HerdrClientError, HerdrOutputChunk, HerdrPaneInfo,
-    HerdrPaneStatus, HerdrTransport, MockHerdrTransport,
-};
+pub use client::HerdrClientError;
 pub use fake::FakeHerdr;
 pub use topology::{HerdrTopologyPlan, HerdrTopologyPlanner};

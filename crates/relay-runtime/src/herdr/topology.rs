@@ -19,51 +19,30 @@ impl HerdrTopologyPlanner {
         Self
     }
 
-    /// Derives the Herdr workspace ID for a checkout or working directory.
-    pub fn workspace_id(&self, checkout_id: Option<&str>, trusted_cwd: &Path) -> String {
+    /// Derives the display label for a checkout workspace.
+    pub fn workspace_label(&self, checkout_id: Option<&str>, trusted_cwd: &Path) -> String {
         if let Some(cid) = checkout_id {
-            format!("ws-relay-{}", sanitize_id(cid))
+            format!("Relay Workspace [{}]", sanitize_id(cid))
         } else {
-            // Hash or sanitize path name
             let folder_name = trusted_cwd
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("default");
-            format!("ws-relay-{}", sanitize_id(folder_name))
+            format!("Relay Workspace [{}]", sanitize_id(folder_name))
         }
-    }
-
-    /// Derives the Herdr tab ID for a Relay task.
-    pub fn tab_id(&self, task_id: Option<&str>, role_attempt_id: &str) -> String {
-        if let Some(tid) = task_id {
-            format!("tab-relay-{}", sanitize_id(tid))
-        } else {
-            format!("tab-relay-att-{}", sanitize_id(role_attempt_id))
-        }
-    }
-
-    /// Derives the Herdr pane ID for a Relay role attempt.
-    pub fn pane_id(&self, role_attempt_id: &str) -> String {
-        format!("pane-relay-{}", sanitize_id(role_attempt_id))
     }
 
     /// Builds the internal topology plan for a provisioning request.
     pub fn plan(&self, req: &RuntimeProvisionRequest) -> HerdrTopologyPlan {
         let checkout_id = req.metadata.as_ref().and_then(|m| m.checkout_id.as_deref());
-        let task_id = req.metadata.as_ref().and_then(|m| m.task_id.as_deref());
-
-        let workspace_id = self.workspace_id(checkout_id, &req.trusted_cwd);
-        let tab_id = self.tab_id(task_id, &req.role_attempt_id);
-        let pane_id = self.pane_id(&req.role_attempt_id);
+        let workspace_label = self.workspace_label(checkout_id, &req.trusted_cwd);
+        let tab_label = format!("Relay Attempt [{}]", sanitize_id(&req.role_attempt_id));
 
         let metadata_tags = self.encode_metadata(req);
 
         HerdrTopologyPlan {
-            workspace_id,
-            workspace_title: format!("Relay Workspace [{}]", checkout_id.unwrap_or("local")),
-            tab_id,
-            tab_title: format!("Relay Task [{}]", task_id.unwrap_or(&req.role_attempt_id)),
-            pane_id,
+            workspace_label,
+            tab_label,
             metadata_tags,
         }
     }
@@ -124,11 +103,8 @@ impl HerdrTopologyPlanner {
 /// Planned internal physical resources in Herdr.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HerdrTopologyPlan {
-    pub workspace_id: String,
-    pub workspace_title: String,
-    pub tab_id: String,
-    pub tab_title: String,
-    pub pane_id: String,
+    pub workspace_label: String,
+    pub tab_label: String,
     pub metadata_tags: HashMap<String, String>,
 }
 
@@ -171,9 +147,8 @@ mod tests {
         };
 
         let plan = planner.plan(&req);
-        assert_eq!(plan.workspace_id, "ws-relay-chk-main");
-        assert_eq!(plan.tab_id, "tab-relay-task-99");
-        assert_eq!(plan.pane_id, "pane-relay-attempt-42");
+        assert_eq!(plan.workspace_label, "Relay Workspace [chk-main]");
+        assert_eq!(plan.tab_label, "Relay Attempt [attempt-42]");
 
         // Verify tags
         assert_eq!(

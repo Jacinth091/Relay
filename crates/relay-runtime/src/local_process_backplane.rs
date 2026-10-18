@@ -28,49 +28,7 @@ use crate::process_tree::{
 /// Bound how long inherited output handles can delay a terminal observation.
 const TERMINAL_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Standard non-secret OS plumbing inherited by local provider processes.
-///
-/// The child environment starts cleared so arbitrary parent variables cannot
-/// leak. This list preserves OS paths, shell and module lookup, and machine and
-/// user identity values needed by Windows, PowerShell, and common local CLIs to
-/// start. Every other parent variable is dropped. Request-sanitized variables
-/// override inherited values.
-const PARENT_ENV_ALLOW_LIST: [&str; 34] = [
-    "SystemRoot",
-    "SYSTEMDRIVE",
-    "windir",
-    "TEMP",
-    "TMP",
-    "PATH",
-    "PATHEXT",
-    "COMSPEC",
-    "USERPROFILE",
-    "LOCALAPPDATA",
-    "APPDATA",
-    "HOME",
-    "USER",
-    "LANG",
-    "ProgramFiles",
-    "ProgramFiles(x86)",
-    "ProgramW6432",
-    "ProgramData",
-    "CommonProgramFiles",
-    "CommonProgramFiles(x86)",
-    "CommonProgramW6432",
-    "PSModulePath",
-    "PROCESSOR_ARCHITECTURE",
-    "PROCESSOR_IDENTIFIER",
-    "NUMBER_OF_PROCESSORS",
-    "OS",
-    "HOMEDRIVE",
-    "HOMEPATH",
-    "USERNAME",
-    "USERDOMAIN",
-    "COMPUTERNAME",
-    "PUBLIC",
-    "ALLUSERSPROFILE",
-    "SystemDrive",
-];
+use crate::environment::resolved_child_environment;
 
 fn now_timestamp() -> String {
     SystemTime::now()
@@ -146,15 +104,8 @@ impl RuntimeBackplane for LocalProcessBackplane {
 
             // Start cleared: inherit only the OS allow-list from the parent,
             // then let the sanitized vars override anything.
-            cmd.env_clear();
-            for name in PARENT_ENV_ALLOW_LIST {
-                if let Some(value) = std::env::var_os(name) {
-                    cmd.env(name, value);
-                }
-            }
-            for (k, v) in &req.environment.vars {
-                cmd.env(k, v);
-            }
+            cmd.env_clear()
+                .envs(resolved_child_environment(&req.environment));
 
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::piped());

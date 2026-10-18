@@ -29,6 +29,10 @@ pub enum CliCommand {
         #[arg(long, default_value_t = 15)]
         lease_ttl: u64,
     },
+    RoleHost {
+        #[arg(long)]
+        attempt: String,
+    },
 }
 
 pub fn parse_cli<I, T>(args: I) -> Result<CliCommand, clap::Error>
@@ -90,6 +94,17 @@ mod tests {
                 lease_ttl: 30,
             }
         );
+    }
+
+    #[test]
+    fn role_host_subcommand_requires_an_attempt_id() {
+        assert_eq!(
+            parse_cli(args(&["role-host", "--attempt", "attempt-1"])).unwrap(),
+            CliCommand::RoleHost {
+                attempt: "attempt-1".into(),
+            }
+        );
+        assert!(parse_cli(args(&["role-host"])).is_err());
     }
 
     #[test]

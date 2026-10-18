@@ -12,7 +12,7 @@ use std::{
 use super::{
     HerdrCliPaneInfo, HerdrClientError, HerdrOps, HerdrPaneProcess, HerdrProcessInfo,
     HerdrSplitDirection, HerdrTab, HerdrTabCreation, HerdrVersion, HerdrWorkspace,
-    HerdrWorkspaceCreation,
+    HerdrWorkspaceCreation, TrustedToken,
 };
 
 #[derive(Default)]
@@ -25,6 +25,10 @@ struct FakeHerdrState {
     panes: BTreeMap<String, HerdrCliPaneInfo>,
     pane_text: HashMap<String, String>,
     process_info: HashMap<String, HerdrProcessInfo>,
+    pane_run_trusted_calls: Vec<(String, Vec<TrustedToken>)>,
+    pane_send_keys_calls: Vec<(String, Vec<String>)>,
+    version: Option<HerdrVersion>,
+    protocol: Option<u32>,
 }
 
 /// Deterministic in-memory implementation of the typed Herdr operations.
@@ -32,6 +36,7 @@ struct FakeHerdrState {
 pub struct FakeHerdr {
     state: Mutex<FakeHerdrState>,
     server_down: AtomicBool,
+    operation_count: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeHerdr {
@@ -41,6 +46,21 @@ impl FakeHerdr {
 
     pub fn set_server_down(&self, down: bool) {
         self.server_down.store(down, Ordering::SeqCst);
+    }
+
+    pub fn set_version(&self, version: HerdrVersion) {
+        self.state.lock().expect("FakeHerdr mutex poisoned").version = Some(version);
+    }
+
+    pub fn set_protocol(&self, protocol: u32) {
+        self.state
+            .lock()
+            .expect("FakeHerdr mutex poisoned")
+            .protocol = Some(protocol);
+    }
+
+    pub fn operation_count(&self) -> usize {
+        self.operation_count.load(Ordering::SeqCst)
     }
 
     pub fn set_pane_read_text(&self, pane: &str, text: impl Into<String>) {
@@ -59,7 +79,24 @@ impl FakeHerdr {
             .insert(pane.to_owned(), info);
     }
 
+    pub fn pane_run_trusted_calls(&self) -> Vec<(String, Vec<TrustedToken>)> {
+        self.state
+            .lock()
+            .expect("FakeHerdr mutex poisoned")
+            .pane_run_trusted_calls
+            .clone()
+    }
+
+    pub fn pane_send_keys_calls(&self) -> Vec<(String, Vec<String>)> {
+        self.state
+            .lock()
+            .expect("FakeHerdr mutex poisoned")
+            .pane_send_keys_calls
+            .clone()
+    }
+
     fn check_server(&self) -> Result<(), HerdrClientError> {
+        self.operation_count.fetch_add(1, Ordering::SeqCst);
         if self.server_down.load(Ordering::SeqCst) {
             Err(HerdrClientError::Transport(
                 "FakeHerdr server is unavailable".into(),
@@ -96,22 +133,32 @@ fn resource_not_found(kind: &str, id: &str) -> HerdrClientError {
     HerdrClientError::ResourceNotFound(format!("{kind} {id} not found"))
 }
 
-#[allow(async_fn_in_trait)]
 impl HerdrOps for FakeHerdr {
     async fn version(&self) -> Result<HerdrVersion, HerdrClientError> {
         self.check_server()?;
-        Ok(HerdrVersion {
-            major: 0,
-            minor: 9,
-            patch: 5,
-            pre_release: None,
-            build: None,
-        })
+        Ok(self
+            .state
+            .lock()
+            .expect("FakeHerdr mutex poisoned")
+            .version
+            .clone()
+            .unwrap_or(HerdrVersion {
+                major: 0,
+                minor: 9,
+                patch: 5,
+                pre_release: None,
+                build: None,
+            }))
     }
 
     async fn protocol(&self) -> Result<u32, HerdrClientError> {
         self.check_server()?;
-        Ok(22)
+        Ok(self
+            .state
+            .lock()
+            .expect("FakeHerdr mutex poisoned")
+            .protocol
+            .unwrap_or(22))
     }
 
     async fn workspace_create(
@@ -247,6 +294,31 @@ impl HerdrOps for FakeHerdr {
             .collect())
     }
 
+    async fn tab_close(&self, tab: &str) -> Result<(), HerdrClientError> {
+        self.check_server()?;
+        let mut state = self.state.lock().expect("FakeHerdr mutex poisoned");
+        let closed = state
+            .tabs
+            .remove(tab)
+            .ok_or_else(|| resource_not_found("tab", tab))?;
+        let pane_ids = state
+            .panes
+            .values()
+            .filter(|pane| pane.tab_id == tab)
+            .map(|pane| pane.pane_id.clone())
+            .collect::<Vec<_>>();
+        for pane_id in pane_ids {
+            state.panes.remove(&pane_id);
+            state.pane_text.remove(&pane_id);
+            state.process_info.remove(&pane_id);
+        }
+        if let Some(workspace) = state.workspaces.get_mut(&closed.workspace_id) {
+            workspace.tab_count = workspace.tab_count.saturating_sub(1);
+            workspace.pane_count = workspace.pane_count.saturating_sub(closed.pane_count);
+        }
+        Ok(())
+    }
+
     async fn pane_get(&self, id: &str) -> Result<Option<HerdrCliPaneInfo>, HerdrClientError> {
         self.check_server()?;
         Ok(self
@@ -327,26 +399,47 @@ impl HerdrOps for FakeHerdr {
             .process_info
             .get(pane)
             .cloned()
-            .unwrap_or(HerdrProcessInfo {
+            .unwrap_or_else(|| HerdrProcessInfo {
                 pane_id: pane.to_owned(),
                 foreground_process_group_id: None,
-                foreground_processes: Vec::<HerdrPaneProcess>::new(),
-                shell_pid: None,
+                foreground_processes: vec![HerdrPaneProcess {
+                    pid: 1,
+                    name: "powershell.exe".into(),
+                    argv: Some(vec!["powershell.exe".into()]),
+                    argv0: Some("powershell.exe".into()),
+                    cmdline: Some("powershell.exe".into()),
+                    cwd: None,
+                }],
+                shell_pid: Some(1),
                 tty: None,
             }))
     }
 
-    async fn pane_send_keys(&self, pane: &str, _keys: &[String]) -> Result<(), HerdrClientError> {
+    async fn pane_send_keys(&self, pane: &str, keys: &[String]) -> Result<(), HerdrClientError> {
         self.check_server()?;
-        if !self
-            .state
-            .lock()
-            .expect("FakeHerdr mutex poisoned")
-            .panes
-            .contains_key(pane)
-        {
+        let mut state = self.state.lock().expect("FakeHerdr mutex poisoned");
+        if !state.panes.contains_key(pane) {
             return Err(resource_not_found("pane", pane));
         }
+        state
+            .pane_send_keys_calls
+            .push((pane.to_owned(), keys.to_vec()));
+        Ok(())
+    }
+
+    async fn pane_run_trusted(
+        &self,
+        pane: &str,
+        command: &[TrustedToken],
+    ) -> Result<(), HerdrClientError> {
+        self.check_server()?;
+        let mut state = self.state.lock().expect("FakeHerdr mutex poisoned");
+        if !state.panes.contains_key(pane) {
+            return Err(resource_not_found("pane", pane));
+        }
+        state
+            .pane_run_trusted_calls
+            .push((pane.to_owned(), command.to_vec()));
         Ok(())
     }
 
@@ -483,6 +576,7 @@ mod tests {
         fake.set_server_down(true);
         let pane = "w1:p1";
         let keys = vec!["enter".into()];
+        let command = vec![TrustedToken::new("role-host").unwrap()];
         let tokens = vec![("task".into(), "T01".into())];
         let results = [
             fake.version().await.map(|_| ()),
@@ -496,6 +590,7 @@ mod tests {
                 .await
                 .map(|_| ()),
             fake.tab_list("w1").await.map(|_| ()),
+            fake.tab_close("w1:t1").await,
             fake.pane_get(pane).await.map(|_| ()),
             fake.pane_list("w1").await.map(|_| ()),
             fake.pane_split(pane, HerdrSplitDirection::Right, Path::new(r"C:\work"))
@@ -504,6 +599,7 @@ mod tests {
             fake.pane_read(pane, 1).await.map(|_| ()),
             fake.pane_process_info(pane).await.map(|_| ()),
             fake.pane_send_keys(pane, &keys).await,
+            fake.pane_run_trusted(pane, &command).await,
             fake.pane_close(pane).await,
             fake.pane_report_metadata(pane, "relay", "title", &tokens)
                 .await,

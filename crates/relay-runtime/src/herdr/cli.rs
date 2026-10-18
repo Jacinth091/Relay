@@ -6,6 +6,7 @@
 use std::{
     collections::HashMap,
     fmt,
+    future::Future,
     path::{Path, PathBuf},
     str::FromStr,
     time::Duration,
@@ -30,7 +31,10 @@ pub struct HerdrCommandOutput {
 
 /// Runs a Herdr command with an argv vector (excluding the executable name).
 pub trait HerdrCommandRunner: Send + Sync {
-    async fn run(&self, argv: &[String]) -> Result<HerdrCommandOutput, HerdrClientError>;
+    fn run(
+        &self,
+        argv: &[String],
+    ) -> impl Future<Output = Result<HerdrCommandOutput, HerdrClientError>> + Send;
 }
 
 /// Production runner. It starts `herdr` directly and never invokes a shell.
@@ -315,43 +319,97 @@ impl HerdrSplitDirection {
 }
 
 /// Typed operations supported by the Herdr CLI transport.
-#[allow(async_fn_in_trait)]
 pub trait HerdrOps: Send + Sync {
-    async fn version(&self) -> Result<HerdrVersion, HerdrClientError>;
-    async fn protocol(&self) -> Result<u32, HerdrClientError>;
-    async fn workspace_create(
+    fn version(&self) -> impl Future<Output = Result<HerdrVersion, HerdrClientError>> + Send;
+    fn protocol(&self) -> impl Future<Output = Result<u32, HerdrClientError>> + Send;
+    fn workspace_create(
         &self,
         cwd: &Path,
         label: &str,
-    ) -> Result<HerdrWorkspaceCreation, HerdrClientError>;
-    async fn workspace_get(&self, id: &str) -> Result<HerdrWorkspace, HerdrClientError>;
-    async fn workspace_list(&self) -> Result<Vec<HerdrWorkspace>, HerdrClientError>;
-    async fn tab_create(
+    ) -> impl Future<Output = Result<HerdrWorkspaceCreation, HerdrClientError>> + Send;
+    fn workspace_get(
+        &self,
+        id: &str,
+    ) -> impl Future<Output = Result<HerdrWorkspace, HerdrClientError>> + Send;
+    fn workspace_list(
+        &self,
+    ) -> impl Future<Output = Result<Vec<HerdrWorkspace>, HerdrClientError>> + Send;
+    fn tab_create(
         &self,
         workspace: &str,
         cwd: &Path,
         label: &str,
-    ) -> Result<HerdrTabCreation, HerdrClientError>;
-    async fn tab_list(&self, workspace: &str) -> Result<Vec<HerdrTab>, HerdrClientError>;
-    async fn pane_get(&self, id: &str) -> Result<Option<HerdrCliPaneInfo>, HerdrClientError>;
-    async fn pane_list(&self, workspace: &str) -> Result<Vec<HerdrCliPaneInfo>, HerdrClientError>;
-    async fn pane_split(
+    ) -> impl Future<Output = Result<HerdrTabCreation, HerdrClientError>> + Send;
+    fn tab_list(
+        &self,
+        workspace: &str,
+    ) -> impl Future<Output = Result<Vec<HerdrTab>, HerdrClientError>> + Send;
+    fn tab_close(&self, tab: &str) -> impl Future<Output = Result<(), HerdrClientError>> + Send;
+    fn pane_get(
+        &self,
+        id: &str,
+    ) -> impl Future<Output = Result<Option<HerdrCliPaneInfo>, HerdrClientError>> + Send;
+    fn pane_list(
+        &self,
+        workspace: &str,
+    ) -> impl Future<Output = Result<Vec<HerdrCliPaneInfo>, HerdrClientError>> + Send;
+    fn pane_split(
         &self,
         pane: &str,
         direction: HerdrSplitDirection,
         cwd: &Path,
-    ) -> Result<HerdrCliPaneInfo, HerdrClientError>;
-    async fn pane_read(&self, pane: &str, lines: usize) -> Result<String, HerdrClientError>;
-    async fn pane_process_info(&self, pane: &str) -> Result<HerdrProcessInfo, HerdrClientError>;
-    async fn pane_send_keys(&self, pane: &str, keys: &[String]) -> Result<(), HerdrClientError>;
-    async fn pane_close(&self, pane: &str) -> Result<(), HerdrClientError>;
-    async fn pane_report_metadata(
+    ) -> impl Future<Output = Result<HerdrCliPaneInfo, HerdrClientError>> + Send;
+    fn pane_read(
+        &self,
+        pane: &str,
+        lines: usize,
+    ) -> impl Future<Output = Result<String, HerdrClientError>> + Send;
+    fn pane_process_info(
+        &self,
+        pane: &str,
+    ) -> impl Future<Output = Result<HerdrProcessInfo, HerdrClientError>> + Send;
+    fn pane_send_keys(
+        &self,
+        pane: &str,
+        keys: &[String],
+    ) -> impl Future<Output = Result<(), HerdrClientError>> + Send;
+    fn pane_run_trusted(
+        &self,
+        pane: &str,
+        command: &[TrustedToken],
+    ) -> impl Future<Output = Result<(), HerdrClientError>> + Send;
+    fn pane_close(&self, pane: &str) -> impl Future<Output = Result<(), HerdrClientError>> + Send;
+    fn pane_report_metadata(
         &self,
         pane: &str,
         source: &str,
         title: &str,
         tokens: &[(String, String)],
-    ) -> Result<(), HerdrClientError>;
+    ) -> impl Future<Output = Result<(), HerdrClientError>> + Send;
+}
+
+/// One token safe to type through Herdr's raw `pane run` input path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedToken(String);
+
+impl TrustedToken {
+    pub fn new(value: impl Into<String>) -> Result<Self, HerdrClientError> {
+        let value = value.into();
+        if value.is_empty()
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._:/\\-".contains(&byte))
+        {
+            return Err(HerdrClientError::Transport(format!(
+                "unsafe token for Herdr pane run: {value:?}"
+            )));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Herdr CLI client using a command runner. The generic runner keeps tests
@@ -572,7 +630,6 @@ fn parse_protocol_output(output: HerdrCommandOutput) -> Result<u32, HerdrClientE
     )))
 }
 
-#[allow(async_fn_in_trait)]
 impl<R: HerdrCommandRunner> HerdrOps for HerdrCli<R> {
     async fn version(&self) -> Result<HerdrVersion, HerdrClientError> {
         parse_version_output(self.runner.run(&["--version".into()]).await?)
@@ -676,6 +733,17 @@ impl<R: HerdrCommandRunner> HerdrOps for HerdrCli<R> {
         Ok(result.tabs)
     }
 
+    async fn tab_close(&self, tab: &str) -> Result<(), HerdrClientError> {
+        let _: HerdrOk = self
+            .json_result(
+                vec!["tab".into(), "close".into(), tab.into()],
+                "tab close",
+                "tab_closed",
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn pane_get(&self, id: &str) -> Result<Option<HerdrCliPaneInfo>, HerdrClientError> {
         let output = self
             .runner
@@ -769,6 +837,23 @@ impl<R: HerdrCommandRunner> HerdrOps for HerdrCli<R> {
         let mut argv = vec!["pane".into(), "send-keys".into(), pane.into()];
         argv.extend(keys.iter().cloned());
         let _: HerdrOk = self.json_result(argv, "pane send-keys", "ok").await?;
+        Ok(())
+    }
+
+    async fn pane_run_trusted(
+        &self,
+        pane: &str,
+        command: &[TrustedToken],
+    ) -> Result<(), HerdrClientError> {
+        if command.is_empty() {
+            return Err(HerdrClientError::Transport(
+                "Herdr pane run requires a trusted command".into(),
+            ));
+        }
+        // Herdr joins these argv tokens and types the result raw into the pane.
+        let mut argv = vec!["pane".into(), "run".into(), pane.into()];
+        argv.extend(command.iter().map(|token| token.as_str().to_owned()));
+        let _: HerdrOk = self.json_result(argv, "pane run", "ok").await?;
         Ok(())
     }
 
@@ -1133,5 +1218,56 @@ mod tests {
         );
         let error = runner.run(&["--version".into()]).await.unwrap_err();
         assert!(matches!(error, HerdrClientError::ExecutableNotFound(_)));
+    }
+
+    #[test]
+    fn trusted_tokens_allow_only_the_raw_pane_charset() {
+        for token in [r"C:\x\relay.exe", "role-host", "--attempt", "wfatt-abc_1.2"] {
+            assert_eq!(TrustedToken::new(token).unwrap().as_str(), token);
+        }
+        for token in [
+            "", "a b", "a;b", "a'b", "$x", "`x", "%x%", "a&b", "a|b", "a(b)", "a<b>",
+        ] {
+            assert!(TrustedToken::new(token).is_err(), "accepted {token:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tab_close_and_trusted_run_use_the_typed_cli_argv() {
+        let runner = ScriptedRunner::new([
+            result("tab_closed", ",\"closed_tab_id\":\"w1:t2\""),
+            result("ok", ""),
+        ]);
+        let cli = HerdrCli::new(runner);
+        cli.tab_close("w1:t2").await.unwrap();
+        cli.pane_run_trusted(
+            "w1:p2",
+            &[
+                TrustedToken::new(r"C:\Relay\relay.exe").unwrap(),
+                TrustedToken::new("role-host").unwrap(),
+                TrustedToken::new("--attempt").unwrap(),
+                TrustedToken::new("wfatt-abc_1.2").unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cli.runner().calls(),
+            vec![
+                vec!["tab", "close", "w1:t2"],
+                vec![
+                    "pane",
+                    "run",
+                    "w1:p2",
+                    r"C:\Relay\relay.exe",
+                    "role-host",
+                    "--attempt",
+                    "wfatt-abc_1.2"
+                ],
+            ]
+            .into_iter()
+            .map(|argv| argv.into_iter().map(String::from).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+        );
     }
 }

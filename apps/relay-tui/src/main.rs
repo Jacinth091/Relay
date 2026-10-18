@@ -85,6 +85,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             lease_id,
             lease_ttl,
         } => return run_daemon(lease_id, lease_ttl).await,
+        cli::CliCommand::RoleHost { attempt } => {
+            let role_host_dir = default_database_path()
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("role-host");
+            let exit_code = relay_runtime::run_role_host(&role_host_dir, &attempt).await?;
+            std::process::exit(exit_code);
+        }
         cli::CliCommand::RunTui => {}
     }
 

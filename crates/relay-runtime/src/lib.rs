@@ -325,6 +325,7 @@ pub struct RuntimeDeadline {
 
 mod activity;
 pub mod backplane;
+mod environment;
 pub mod herdr;
 mod integration;
 pub mod local_process_backplane;
@@ -332,6 +333,7 @@ pub mod process_tree;
 mod profile;
 mod provider;
 mod resolver;
+mod role_host;
 mod role_result;
 mod router;
 pub mod sanitizer;
@@ -345,6 +347,7 @@ pub use process_tree::*;
 pub use profile::*;
 pub use provider::*;
 pub use resolver::*;
+pub use role_host::*;
 pub use role_result::*;
 pub use router::*;
 pub use sanitizer::*;

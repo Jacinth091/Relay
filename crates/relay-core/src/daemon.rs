@@ -1085,7 +1085,20 @@ impl DaemonServer {
                         &fence,
                     )
                     .await
-                    .map_err(map_store_error)?;
+                    // A second Run approval for a task that is no longer `ready`
+                    // is a refused command, never lost daemon authority: this
+                    // process still owns the lease, the *task* has moved on. The
+                    // store's compare-and-set is the guard even when two
+                    // approvals with different command ids race past the
+                    // `Ready` pre-check above.
+                    .map_err(|error| match error {
+                        StoreError::StateConflict {
+                            id, actual_state, ..
+                        } => DaemonError::Command(format!(
+                            "task '{id}' is in state '{actual_state}', expected 'ready'; refusing a second Run approval"
+                        )),
+                        other => map_store_error(other),
+                    })?;
 
                 // The run is durable; execution belongs to the workflow driver,
                 // never to the command handler.

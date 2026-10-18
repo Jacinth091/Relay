@@ -868,6 +868,91 @@ async fn a_replayed_run_approval_converges_on_one_run_and_one_start_event() {
 }
 
 #[tokio::test]
+async fn a_second_run_approval_for_a_running_task_is_refused() {
+    let base = unique_temp_dir("second-approval");
+    let repo = base.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+
+    let store = SqliteStore::in_memory().await.unwrap();
+    // No workflow driver: this proves the durable approval boundary, not the
+    // execution that follows it.
+    let (server, daemon) = run_full_daemon(
+        store.clone(),
+        test_relay(&repo),
+        "lease-waveb-second-approval",
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+
+    let (task_id, run_id) = approve_run(&server, "cmd-first").await;
+
+    // A second Run approval for the same task, under a *different* command id,
+    // so it is not a replay. Different command ids are not serialized, so both
+    // may pass the `Ready` pre-check and race; the store's compare-and-set is
+    // what must refuse the loser. Either way the second approval is refused
+    // fail-closed: an apply-time refusal is reported as a failed command result
+    // (a `DaemonResponse::Error` is reserved for a refusal before the command is
+    // recorded, such as lost authority or command-id reuse).
+    let (status, result) = submit(
+        &server,
+        "cmd-second-run",
+        DaemonCommand::RunTask {
+            task_id: task_id.clone(),
+            granted_by: "operator-alice".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(
+        status,
+        CommandStatus::Failed,
+        "a second Run approval for a running task must be refused, got {result:?}"
+    );
+    let refusal = result.unwrap_or_default();
+    assert!(
+        refusal.contains("running"),
+        "the refusal must name the state that blocked the second approval, got {refusal:?}"
+    );
+
+    // The refused approval left nothing durable behind: one task, one run, one
+    // start event.
+    let active = store.list_active_workflow_runs().await.unwrap();
+    assert_eq!(
+        active.len(),
+        1,
+        "a second approval must not create a second run, got {active:?}"
+    );
+    assert_eq!(active[0].id, run_id);
+    assert_eq!(
+        start_event_count(&store).await,
+        1,
+        "a second approval must not append a second start event"
+    );
+    assert_eq!(
+        stored_task_state(&store, &task_id).await,
+        TaskState::Running
+    );
+
+    // Replaying the original approval still converges on the same durable run.
+    let (status, replay_result) = submit(
+        &server,
+        "cmd-first-run",
+        DaemonCommand::RunTask {
+            task_id: task_id.clone(),
+            granted_by: "operator-alice".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(status, CommandStatus::Duplicate);
+    let replay_json: serde_json::Value =
+        serde_json::from_str(replay_result.as_deref().unwrap()).unwrap();
+    assert_eq!(replay_json["workflow_run_id"].as_str().unwrap(), run_id);
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_daemon_that_lost_its_lease_cannot_start_or_drive_a_run() {
     let base = unique_temp_dir("stale");
     let repo = base.join("repo");

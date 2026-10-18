@@ -2558,11 +2558,15 @@ impl SqliteStore {
     /// the task `ready -> running`, and append the single start event, all in
     /// one fenced transaction.
     ///
-    /// Convergence: on a replay the run already exists and the task is already
-    /// `running`, so the transition matches its desired end state, no second
-    /// event is appended, and the committed run is returned. A task in any other
-    /// state is a genuine conflict and refuses the write, which also rolls back
-    /// the run insert.
+    /// Convergence: on a replay the run already exists (`first_start == false`)
+    /// and the task is already `running`, so the transition matches its desired
+    /// end state, no second event is appended, and the committed run is
+    /// returned. Convergence is tolerated **only** for that replay. A call that
+    /// newly inserted the run (`first_start == true`) whose transition affected
+    /// zero rows is not convergence: it is a second Run approval for a task that
+    /// is no longer `ready`, and it is refused with [`StoreError::StateConflict`]
+    /// carrying the actual state. The transaction then drops uncommitted, so the
+    /// inserted run row rolls back.
     pub async fn start_workflow_run_fenced(
         &self,
         start: &WorkflowRunStart<'_>,
@@ -2627,8 +2631,10 @@ impl SqliteStore {
                     .await?;
 
             match actual_state {
-                // Already converged: a replay of a committed approval.
-                Some(actual_state) if actual_state == start.task_new_state => {}
+                // Already converged only for a replay of a committed approval:
+                // this call did not create the run and the task is already in
+                // the state the approval wants.
+                Some(actual_state) if !first_start && actual_state == start.task_new_state => {}
                 Some(actual_state) => {
                     return Err(StoreError::StateConflict {
                         id: start.run.task_id.clone(),
@@ -5502,6 +5508,136 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "the run insert must roll back with the refused transition"
+        );
+    }
+
+    /// R12-02 (T05): two Run approvals for one task never create two runs, even
+    /// when they race. A second approval carries its own run id, so it is not a
+    /// replay: the task is already `running`, the transition affects no row, and
+    /// the approval is refused. The run row it would have created rolls back with
+    /// the refusal, so one task still maps to exactly one run and one start
+    /// event. Only the original approval's replay converges.
+    #[tokio::test]
+    async fn a_second_run_approval_for_a_running_task_is_refused() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let lease = store
+            .acquire_or_renew_daemon_lease(
+                "daemon-dup",
+                5002,
+                "host-a",
+                "inst-5002",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        let fence = DaemonFence {
+            lease_id: "daemon-dup".to_owned(),
+            holder_pid: lease.holder_pid,
+            holder_instance: lease.holder_instance.clone(),
+            fencing_token: lease.fencing_token,
+        };
+
+        store
+            .insert_task(&task_record("task-dup", "dup"))
+            .await
+            .unwrap();
+
+        let intent_json = r#"{"id":"intent-dup","generation":1}"#;
+        let grant_json = r#"{"id":"grant-dup"}"#;
+        let snapshot_json = r#"{"id":"snapshot-dup","workflow_version":1}"#;
+
+        let mut run_a = workflow_run_record("run-dup-a", "task-dup");
+        run_a.state = "running".to_owned();
+        let start_a = WorkflowRunStart {
+            run: &run_a,
+            approved_intent_json: intent_json,
+            execution_grant_json: grant_json,
+            config_snapshot_json: snapshot_json,
+            task_expected_state: "ready",
+            task_new_state: "running",
+            event_kind: "workflow_run_started",
+            event_json: Some(r#"{"task_id":"task-dup","workflow_run_id":"run-dup-a"}"#),
+        };
+        let first = store
+            .start_workflow_run_fenced(&start_a, &fence)
+            .await
+            .unwrap();
+        assert_eq!(first.id, "run-dup-a");
+
+        // A *second* approval under a different run id. The task is already
+        // running, so the compare-and-set affects no row and this is not the
+        // replay case.
+        let mut run_b = workflow_run_record("run-dup-b", "task-dup");
+        run_b.state = "running".to_owned();
+        let start_b = WorkflowRunStart {
+            run: &run_b,
+            approved_intent_json: intent_json,
+            execution_grant_json: grant_json,
+            config_snapshot_json: snapshot_json,
+            task_expected_state: "ready",
+            task_new_state: "running",
+            event_kind: "workflow_run_started",
+            event_json: Some(r#"{"task_id":"task-dup","workflow_run_id":"run-dup-b"}"#),
+        };
+        let refused = store.start_workflow_run_fenced(&start_b, &fence).await;
+        match refused {
+            Err(StoreError::StateConflict {
+                ref id,
+                ref actual_state,
+                ..
+            }) => {
+                assert_eq!(id, "task-dup");
+                assert_eq!(
+                    actual_state, "running",
+                    "the refusal must report the state that blocked the approval"
+                );
+            }
+            other => panic!("a second Run approval must be refused, got {other:?}"),
+        }
+
+        // The refused approval left nothing behind: its run row rolled back with
+        // the refusal, and no second start event was appended.
+        assert!(
+            store.get_workflow_run("run-dup-b").await.unwrap().is_none(),
+            "the refused approval's run row must roll back"
+        );
+        let active = store.list_active_workflow_runs().await.unwrap();
+        assert_eq!(
+            active.len(),
+            1,
+            "one task must map to exactly one active run, got {active:?}"
+        );
+        assert_eq!(active[0].id, "run-dup-a");
+        let events = store.get_events_after(0, 100).await.unwrap();
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_kind == "workflow_run_started")
+            .collect();
+        assert_eq!(
+            starts.len(),
+            1,
+            "a refused approval must not append a start event, got {events:?}"
+        );
+        assert_eq!(
+            store.get_task("task-dup").await.unwrap().unwrap().state,
+            "running"
+        );
+
+        // The original approval is still a convergent replay: same run, no new
+        // event.
+        let replay = store
+            .start_workflow_run_fenced(&start_a, &fence)
+            .await
+            .unwrap();
+        assert_eq!(replay, first);
+        let events = store.get_events_after(0, 100).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_kind == "workflow_run_started")
+                .count(),
+            1,
+            "replaying the original approval must stay converged"
         );
     }
 

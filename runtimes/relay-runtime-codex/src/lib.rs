@@ -22,7 +22,7 @@ use relay_runtime::{
     RuntimeDescriptor, RuntimeError, RuntimeEvent, RuntimeIdentity, RuntimeIntegration,
     RuntimeModelCatalog, RuntimeModelInfo, RuntimeOutcome, RuntimeOutcomeKind, RuntimeOutputStream,
     RuntimeProbe, RuntimeProfile, RuntimeProfileDescriptor, RuntimeRequest, RuntimeSession,
-    RuntimeStartFuture, RuntimeText, RuntimeTextFormat,
+    RuntimeStartFuture, RuntimeText, RuntimeTextFormat, terminate_process_tree,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -1190,33 +1190,6 @@ async fn discover_app_server_models(executable: &Path) -> Result<RuntimeModelCat
         default_model,
         available_models,
     })
-}
-
-async fn terminate_process_tree(child: &mut tokio::process::Child) {
-    #[cfg(windows)]
-    if let Some(pid) = child.id() {
-        let pid = pid.to_string();
-        let mut taskkill = Command::new("taskkill");
-        taskkill
-            .args(["/T", "/F", "/PID", pid.as_str()])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        let _ = taskkill.status().await;
-        let _ = child.kill().await;
-    }
-    #[cfg(not(windows))]
-    {
-        if let Some(pid) = child.id() {
-            unsafe {
-                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-            }
-        } else {
-            let _ = child.kill().await;
-        }
-    }
-    let _ = child.wait().await;
 }
 
 async fn run_child(

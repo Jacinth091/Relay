@@ -11,9 +11,12 @@
 
 use std::{fs, path::PathBuf};
 
+#[cfg(windows)]
+use relay_runtime::process_is_alive;
 use relay_runtime::{
     BackplaneError, EffectKey, LaunchSpecification, LocalProcessBackplane, ProcessStatus,
-    ReconcileOutcome, RuntimeBackplane, RuntimeProvisionRequest, SanitizedEnvironment,
+    ReconcileOutcome, RuntimeBackplane, RuntimeHandle, RuntimeProvisionRequest,
+    SanitizedEnvironment,
 };
 use relay_runtime_fake::FakeBackplane;
 
@@ -229,4 +232,173 @@ async fn test_fake_backplane_deterministic_flow() {
 
     let reconcile = backplane.reconcile(&handle).await.unwrap();
     assert!(matches!(reconcile, ReconcileOutcome::ResourceNotFound));
+}
+
+#[cfg(windows)]
+fn spawn_long_running_probe() -> std::process::Child {
+    std::process::Command::new("ping")
+        .args(["-n", "60", "127.0.0.1"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn long-running probe process")
+}
+
+#[cfg(not(windows))]
+fn spawn_long_running_probe() -> std::process::Child {
+    std::process::Command::new("sleep")
+        .arg("60")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn long-running probe process")
+}
+
+fn handle_for_pid(backplane: &LocalProcessBackplane, handle_id: &str, pid: u32) -> RuntimeHandle {
+    RuntimeHandle {
+        handle_id: handle_id.to_owned(),
+        backplane_id: backplane.id(),
+        pid: Some(pid),
+        created_at: "test".to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn test_local_process_backplane_child_sees_only_sanitized_environment() {
+    // A secret in this test process must not reach the launched child.
+    unsafe {
+        std::env::set_var("RELAY_TEST_SECRET", "leaked-secret-value");
+    }
+
+    let backplane = LocalProcessBackplane::new("test-env-bp", 4);
+    let tmp = unique_temp_dir("env");
+
+    #[cfg(windows)]
+    let (program, args) = ("cmd", vec!["/C".to_owned(), "set".to_owned()]);
+    #[cfg(not(windows))]
+    let (program, args) = ("env", Vec::new());
+
+    let mut environment = SanitizedEnvironment::new();
+    environment.insert("RELAY_TEST_ALLOWED", "visible-value");
+
+    let req = RuntimeProvisionRequest {
+        effect_key: EffectKey::new("eff-env-1"),
+        role_attempt_id: "attempt-env".to_owned(),
+        trusted_cwd: tmp.clone(),
+        launch: LaunchSpecification::new(program, args),
+        environment,
+        output_byte_limit: 64 * 1024,
+        metadata: None,
+    };
+
+    let handle = backplane.provision(req).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let obs = backplane.observe(&handle).await.unwrap();
+    let stdout = String::from_utf8_lossy(&obs.stdout_chunk);
+
+    assert!(
+        !stdout.contains("RELAY_TEST_SECRET"),
+        "child inherited an unsanitized parent variable: {stdout}"
+    );
+    assert!(
+        stdout.contains("RELAY_TEST_ALLOWED=visible-value"),
+        "sanitized variable missing from child environment: {stdout}"
+    );
+    assert!(
+        stdout.contains("PATH="),
+        "allow-listed PATH should be inherited: {stdout}"
+    );
+
+    let _ = backplane.dispose(&handle).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn test_local_process_backplane_dispose_kills_grandchild() {
+    let backplane = LocalProcessBackplane::new("test-tree-bp", 4);
+    let tmp = unique_temp_dir("tree");
+    let pid_file = tmp.join("grandchild.pid");
+
+    let script = format!(
+        "$g = Start-Process -FilePath 'ping.exe' -ArgumentList '-n','60','127.0.0.1' \
+         -PassThru -WindowStyle Hidden; Set-Content -LiteralPath '{}' -Value $g.Id; \
+         Start-Sleep -Seconds 60",
+        pid_file.display()
+    );
+
+    let req = RuntimeProvisionRequest {
+        effect_key: EffectKey::new("eff-tree-1"),
+        role_attempt_id: "attempt-tree".to_owned(),
+        trusted_cwd: tmp.clone(),
+        launch: LaunchSpecification::new(
+            "powershell",
+            vec!["-NoProfile".to_owned(), "-Command".to_owned(), script],
+        ),
+        environment: SanitizedEnvironment::new(),
+        output_byte_limit: 4096,
+        metadata: None,
+    };
+
+    let handle = backplane.provision(req).await.unwrap();
+
+    // Wait for the child to publish its grandchild's PID.
+    let mut grandchild_pid = None;
+    for _ in 0..100 {
+        if let Ok(text) = fs::read_to_string(&pid_file) {
+            if let Ok(pid) = text.trim().parse::<u32>() {
+                grandchild_pid = Some(pid);
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let grandchild_pid = grandchild_pid.expect("grandchild PID was never published");
+
+    assert!(
+        process_is_alive(grandchild_pid).await,
+        "grandchild {grandchild_pid} should be running before dispose"
+    );
+
+    let receipt = backplane.dispose(&handle).await.unwrap();
+    assert!(receipt.reaped);
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !process_is_alive(grandchild_pid).await,
+        "dispose must kill the whole process tree; grandchild {grandchild_pid} survived"
+    );
+}
+
+#[tokio::test]
+async fn test_local_process_backplane_reconcile_reports_live_orphan() {
+    let mut probe = spawn_long_running_probe();
+    let pid = probe.id();
+
+    // A fresh backplane instance (as after a daemon restart) has no active slot
+    // for this handle, but the recorded PID is still running.
+    let backplane = LocalProcessBackplane::new("test-orphan-live-bp", 4);
+    let handle = handle_for_pid(&backplane, "orphan-live-handle", pid);
+
+    let outcome = backplane.reconcile(&handle).await.unwrap();
+    assert_eq!(outcome, ReconcileOutcome::Orphaned { pid });
+
+    let _ = probe.kill();
+    let _ = probe.wait();
+}
+
+#[tokio::test]
+async fn test_local_process_backplane_reconcile_dead_pid_is_not_found() {
+    let mut probe = spawn_long_running_probe();
+    let pid = probe.id();
+    probe.kill().expect("failed to kill probe process");
+    probe.wait().expect("failed to reap probe process");
+
+    let backplane = LocalProcessBackplane::new("test-orphan-dead-bp", 4);
+    let handle = handle_for_pid(&backplane, "orphan-dead-handle", pid);
+
+    let outcome = backplane.reconcile(&handle).await.unwrap();
+    assert_eq!(outcome, ReconcileOutcome::ResourceNotFound);
 }

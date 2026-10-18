@@ -255,6 +255,9 @@ pub enum ReconcileOutcome {
     Alive { pid: u32 },
     CleanlyExited { exit_code: Option<i32> },
     FailedExit { exit_code: Option<i32> },
+    // A process this backplane no longer owns is still running, typically left
+    // behind by a previous daemon instance.
+    Orphaned { pid: u32 },
     ResourceNotFound,
     Mismatched { reason: String },
 }

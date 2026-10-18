@@ -700,6 +700,20 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
                             Ok(ReconcileOutcome::Alive { .. }) => {
                                 // Still alive
                             }
+                            Ok(ReconcileOutcome::Orphaned { pid }) => {
+                                // The backplane no longer owns this process, but
+                                // a provider process from a previous daemon is
+                                // still alive. Terminate its whole tree before
+                                // marking the attempt lost so no orphan is left
+                                // running behind the new daemon.
+                                relay_runtime::terminate_pid_tree(pid).await;
+                                attempt.state = RoleAttemptState::Lost;
+                                attempt.runtime_outcome = Some(
+                                    "orphaned provider process from a previous daemon was terminated"
+                                        .to_owned(),
+                                );
+                                update_durable_role_attempt(&self.store, &attempt, fence).await?;
+                            }
                             _ => {
                                 // Process died or backplane was restarted: reconcile attempt state
                                 attempt.state = RoleAttemptState::Lost;

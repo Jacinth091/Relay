@@ -14,6 +14,9 @@ thiserror = "2.0.11"
 tokio = { version = "1.43.0", features = ["sync", "time", "process", "io-util", "rt", "net"] }
 uuid = { version = "1.12.1", features = ["v4"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.169"
+
 [dev-dependencies]
 relay-runtime-fake = { path = "../../runtimes/relay-runtime-fake" }
 tokio = { version = "1.43.0", features = ["macros", "rt", "rt-multi-thread", "time"] }

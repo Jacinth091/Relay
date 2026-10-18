@@ -1271,6 +1271,7 @@ dependencies = [
 name = "relay-runtime"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "relay-protocol",
  "relay-runtime-fake",
  "serde",

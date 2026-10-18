@@ -21,6 +21,30 @@ use crate::backplane::{
     InterruptReceipt, ProcessStatus, ReconcileOutcome, RuntimeBackplane, RuntimeHandle,
     RuntimeObservation, RuntimeProvisionRequest, SendReceipt,
 };
+use crate::process_tree::{process_is_alive, terminate_pid_tree, terminate_process_tree};
+
+/// OS-provided environment variables that are copied from the parent process.
+///
+/// The child environment starts cleared; these names alone are inherited
+/// because a process cannot start without them (Windows in particular needs
+/// `SystemRoot`, `windir` and `PATH`). Every other parent variable is dropped.
+/// A name present in the request's sanitized vars overrides the inherited value.
+const PARENT_ENV_ALLOW_LIST: [&str; 14] = [
+    "SystemRoot",
+    "SYSTEMDRIVE",
+    "windir",
+    "TEMP",
+    "TMP",
+    "PATH",
+    "PATHEXT",
+    "COMSPEC",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "HOME",
+    "USER",
+    "LANG",
+];
 
 fn now_timestamp() -> String {
     SystemTime::now()
@@ -87,7 +111,19 @@ impl RuntimeBackplane for LocalProcessBackplane {
             cmd.args(&req.launch.args);
             cmd.current_dir(&req.trusted_cwd);
 
-            // Apply sanitized environment
+            // On Unix, start the child as its own process-group leader so a
+            // later group kill reaches the whole process tree.
+            #[cfg(unix)]
+            cmd.process_group(0);
+
+            // Start cleared: inherit only the OS allow-list from the parent,
+            // then let the sanitized vars override anything.
+            cmd.env_clear();
+            for name in PARENT_ENV_ALLOW_LIST {
+                if let Some(value) = std::env::var_os(name) {
+                    cmd.env(name, value);
+                }
+            }
             for (k, v) in &req.environment.vars {
                 cmd.env(k, v);
             }
@@ -250,13 +286,22 @@ impl RuntimeBackplane for LocalProcessBackplane {
 
     fn interrupt<'a>(&'a self, handle: &'a RuntimeHandle) -> BackplaneFuture<'a, InterruptReceipt> {
         Box::pin(async move {
-            let mut active = self.active.lock().unwrap();
-            let slot = active
-                .get_mut(&handle.handle_id)
-                .ok_or_else(|| BackplaneError::HandleNotFound(handle.handle_id.clone()))?;
+            // Copy the PID out instead of holding the std::sync::Mutex guard
+            // across the termination await.
+            let pid = {
+                let mut active = self.active.lock().unwrap();
+                let slot = active
+                    .get_mut(&handle.handle_id)
+                    .ok_or_else(|| BackplaneError::HandleNotFound(handle.handle_id.clone()))?;
 
-            let _ = slot.child.start_kill();
-            slot.exited_code = Some(None);
+                slot.exited_code = Some(None);
+                slot.child.id()
+            };
+
+            if let Some(pid) = pid {
+                terminate_pid_tree(pid).await;
+            }
+
             Ok(InterruptReceipt { initiated: true })
         })
     }
@@ -269,7 +314,9 @@ impl RuntimeBackplane for LocalProcessBackplane {
             };
 
             if let Some(ref mut slot) = removed {
-                let _ = slot.child.kill().await;
+                // The slot is already out of the map, so the guard is not held
+                // across the await. Kill the whole tree, not just the child.
+                terminate_process_tree(&mut slot.child).await;
                 Ok(DisposeReceipt { reaped: true })
             } else {
                 Ok(DisposeReceipt { reaped: false })
@@ -290,20 +337,41 @@ impl RuntimeBackplane for LocalProcessBackplane {
 
     fn reconcile<'a>(&'a self, handle: &'a RuntimeHandle) -> BackplaneFuture<'a, ReconcileOutcome> {
         Box::pin(async move {
-            let mut active = self.active.lock().unwrap();
-            if let Some(slot) = active.get_mut(&handle.handle_id) {
-                if let Ok(Some(status)) = slot.child.try_wait() {
-                    Ok(ReconcileOutcome::CleanlyExited {
-                        exit_code: status.code(),
-                    })
-                } else if let Some(pid) = handle.pid {
-                    Ok(ReconcileOutcome::Alive { pid })
-                } else {
-                    Ok(ReconcileOutcome::ResourceNotFound)
+            // Classify the slot while the lock is held, then drop the guard
+            // before any await (the orphan liveness probe).
+            let state = {
+                let mut active = self.active.lock().unwrap();
+                match active.get_mut(&handle.handle_id) {
+                    Some(slot) => match slot.child.try_wait() {
+                        Ok(Some(status)) => SlotState::Exited(status.code()),
+                        _ => SlotState::Running(handle.pid),
+                    },
+                    None => SlotState::Absent,
                 }
-            } else {
-                Ok(ReconcileOutcome::ResourceNotFound)
+            };
+
+            match state {
+                SlotState::Exited(exit_code) => Ok(ReconcileOutcome::CleanlyExited { exit_code }),
+                SlotState::Running(Some(pid)) => Ok(ReconcileOutcome::Alive { pid }),
+                SlotState::Running(None) => Ok(ReconcileOutcome::ResourceNotFound),
+                // Not active in this backplane instance. A durable handle from
+                // a previous daemon may still be running: report it as an
+                // orphan so the orchestrator can terminate it and mark the
+                // attempt lost instead of silently ignoring it.
+                SlotState::Absent => match handle.pid {
+                    Some(pid) if process_is_alive(pid).await => {
+                        Ok(ReconcileOutcome::Orphaned { pid })
+                    }
+                    _ => Ok(ReconcileOutcome::ResourceNotFound),
+                },
             }
         })
     }
+}
+
+/// Classification of a handle against this backplane instance's active slots.
+enum SlotState {
+    Exited(Option<i32>),
+    Running(Option<u32>),
+    Absent,
 }

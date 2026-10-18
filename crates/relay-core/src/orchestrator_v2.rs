@@ -79,13 +79,13 @@ impl OrchestratorError {
     /// database. Such an error is not a run failure: the successor owns the run
     /// now, so the driver must stop instead of recording a false failure.
     pub fn is_authority_lost(&self) -> bool {
-        match self {
-            Self::Store(StoreError::DaemonAuthorityLost { .. }) => true,
-            Self::DurableState(TaskPersistenceError::Store(StoreError::DaemonAuthorityLost {
-                ..
-            })) => true,
-            _ => false,
-        }
+        matches!(
+            self,
+            Self::Store(StoreError::DaemonAuthorityLost { .. })
+                | Self::DurableState(TaskPersistenceError::Store(
+                    StoreError::DaemonAuthorityLost { .. }
+                ))
+        )
     }
 }
 
@@ -224,6 +224,7 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
     ///
     /// If verification fails, bounded remediation triggers:
     /// Implementer (Remediation) -> Candidate 2 -> Verifier (PASS) -> Complete.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_compatibility_workflow(
         &self,
         workflow_run_id: &WorkflowRunId,

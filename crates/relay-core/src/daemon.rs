@@ -11,9 +11,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    ApprovedIntentId, ConfigSnapshotId, ExecutionGrantId, ExecutionTarget, Relay, SqliteStore,
-    StoredTask, SubmissionTransport, TaskId, TaskState, WorkflowRunId,
-    durable_state::list_stored_tasks,
+    ApprovedIntentId, ConfigSnapshotId, ExecutionGrantId, Relay, SqliteStore, StoredTask,
+    SubmissionTransport, TaskId, TaskState, WorkflowRunId, durable_state::list_stored_tasks,
 };
 use relay_store::{
     CommandRecord, DaemonFence, DaemonLeaseRecord, EventRecord, NewPendingEffectRecord,
@@ -24,7 +23,6 @@ pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
 pub const DAEMON_PROTOCOL_NAME: &str = "relay.v2";
 pub const DEFAULT_LEASE_ID: &str = "relay-daemon-primary";
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(15);
-const FROZEN_PROVIDER_ADAPTER_VERSION: &str = "0.1.0";
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
@@ -1044,7 +1042,8 @@ impl DaemonServer {
                     .ok_or_else(|| {
                         DaemonError::Command("no runtime stack is configured".to_owned())
                     })?;
-                let execution_target = execution_target_for_stack(stack)?;
+                let execution_target = crate::legacy_adapter::execution_target_for_stack(stack)
+                    .map_err(|error| DaemonError::Command(error.to_string()))?;
 
                 let default_budget = crate::ExecutionBudget::default();
                 let (mut grant, mut run, mut snapshot) =
@@ -1302,24 +1301,6 @@ fn deterministic_command_id(command_id: &str, label: &str) -> String {
     )
     .simple()
     .to_string()
-}
-
-fn execution_target_for_stack(stack: &str) -> Result<ExecutionTarget, DaemonError> {
-    let (provider_id, runtime_profile_id) = match stack {
-        "chatgpt-codex" | "codex" => ("codex", "codex/default"),
-        "antigravity" | "agy" => ("antigravity", "antigravity/default"),
-        other => {
-            return Err(DaemonError::Command(format!(
-                "unsupported runtime stack '{other}'"
-            )));
-        }
-    };
-
-    Ok(ExecutionTarget {
-        provider_id: provider_id.to_owned(),
-        runtime_profile_id: runtime_profile_id.to_owned(),
-        provider_adapter_version: FROZEN_PROVIDER_ADAPTER_VERSION.to_owned(),
-    })
 }
 
 fn hostname() -> String {

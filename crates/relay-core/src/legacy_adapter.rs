@@ -32,6 +32,26 @@ pub enum LegacyAdapterError {
     UnsupportedRuntimeStack(String),
 }
 
+pub(crate) fn execution_target_for_stack(
+    stack: &str,
+) -> Result<ExecutionTarget, LegacyAdapterError> {
+    let (provider_id, runtime_profile_id) = match stack {
+        "chatgpt-codex" | "codex" => ("codex", "codex/default"),
+        "antigravity" | "agy" => ("antigravity", "antigravity/default"),
+        other => {
+            return Err(LegacyAdapterError::UnsupportedRuntimeStack(
+                other.to_owned(),
+            ));
+        }
+    };
+
+    Ok(ExecutionTarget {
+        provider_id: provider_id.to_owned(),
+        runtime_profile_id: runtime_profile_id.to_owned(),
+        provider_adapter_version: "0.1.0".to_owned(),
+    })
+}
+
 /// The standard v1 compatibility workflow definition:
 /// Implementer -> Verifier (no hidden planner role!)
 pub fn v1_compatibility_workflow_definition() -> WorkflowDefinition {
@@ -114,26 +134,8 @@ pub fn create_v1_compatibility_run(
     granted_by: &str,
 ) -> Result<(ExecutionGrant, WorkflowRun, ConfigSnapshot), LegacyAdapterError> {
     let stack = task.handoff.stack.as_deref().unwrap_or("codex");
-    let (provider_id, runtime_profile_id) = match stack {
-        "chatgpt-codex" | "codex" => ("codex", "codex/default"),
-        "antigravity" | "agy" => ("antigravity", "antigravity/default"),
-        other => {
-            return Err(LegacyAdapterError::UnsupportedRuntimeStack(
-                other.to_owned(),
-            ));
-        }
-    };
-    create_v1_compatibility_run_with_target(
-        task,
-        intent,
-        ExecutionTarget {
-            provider_id: provider_id.to_owned(),
-            runtime_profile_id: runtime_profile_id.to_owned(),
-            provider_adapter_version: "0.1.0".to_owned(),
-        },
-        budget,
-        granted_by,
-    )
+    let execution_target = execution_target_for_stack(stack)?;
+    create_v1_compatibility_run_with_target(task, intent, execution_target, budget, granted_by)
 }
 
 /// Creates a compatibility workflow run with the exact execution target frozen

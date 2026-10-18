@@ -275,7 +275,7 @@ fn existing_registered_worktree(
 
     Ok(Some(WorktreeHandle {
         id: worktree_name.to_owned(),
-        path: canonical_worktree,
+        path: worktree_path,
         base_commit,
         created_at: created_at.to_owned(),
     }))

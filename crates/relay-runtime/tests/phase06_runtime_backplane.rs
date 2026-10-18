@@ -82,6 +82,63 @@ async fn test_local_process_backplane_basic_execution_and_observe() {
     ));
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn test_local_process_backplane_bounds_inherited_output_pipe_drain() {
+    let backplane = LocalProcessBackplane::new("test-inherited-pipe-bp", 4);
+    let tmp = unique_temp_dir("inherited-pipe");
+    let script = "Start-Process -FilePath 'ping.exe' -ArgumentList '-n','60','127.0.0.1' -NoNewWindow; Write-Output 'provider finished'; exit 0";
+
+    let req = RuntimeProvisionRequest {
+        effect_key: EffectKey::new("eff-inherited-pipe-1"),
+        role_attempt_id: "attempt-inherited-pipe".to_owned(),
+        trusted_cwd: tmp,
+        launch: LaunchSpecification::new(
+            "powershell",
+            vec![
+                "-NoProfile".to_owned(),
+                "-Command".to_owned(),
+                script.to_owned(),
+            ],
+        ),
+        environment: SanitizedEnvironment::new(),
+        output_byte_limit: 4096,
+        metadata: None,
+    };
+
+    let handle = backplane.provision(req).await.expect("provisioning failed");
+    let observation = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let observation = backplane.observe(&handle).await.expect("observe failed");
+            if matches!(
+                &observation.status,
+                ProcessStatus::ExitedSuccess { .. } | ProcessStatus::ExitedFailure { .. }
+            ) {
+                return observation;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    let dispose = backplane.dispose(&handle).await;
+
+    let observation = observation.expect("observe hung on an inherited output pipe");
+    assert!(
+        matches!(
+            &observation.status,
+            ProcessStatus::ExitedSuccess { exit_code: 0 }
+        ),
+        "provider should exit successfully, got {:?}",
+        observation.status
+    );
+    let stdout = String::from_utf8_lossy(&observation.stdout_chunk);
+    assert!(
+        stdout.contains("provider finished"),
+        "expected provider output to be captured, got: {stdout}"
+    );
+    assert!(dispose.expect("dispose failed").reaped);
+}
+
 #[tokio::test]
 async fn test_local_process_backplane_output_limit_clamping() {
     let backplane = LocalProcessBackplane::new("test-limit-bp", 4);

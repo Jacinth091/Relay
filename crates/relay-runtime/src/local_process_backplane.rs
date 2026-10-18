@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     process::Stdio,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::{
@@ -24,6 +24,9 @@ use crate::backplane::{
 use crate::process_tree::{
     ProcessIdentity, process_identity, terminate_pid_tree, terminate_process_tree,
 };
+
+/// Bound how long inherited output handles can delay a terminal observation.
+const TERMINAL_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Standard non-secret OS plumbing inherited by local provider processes.
 ///
@@ -286,12 +289,13 @@ impl RuntimeBackplane for LocalProcessBackplane {
 
             // A terminal process closes both pipes. Drain their reader tasks
             // before returning the final observation so its typed result is not
-            // lost to a race between process exit and pipe capture.
+            // lost to a race between process exit and pipe capture. A descendant
+            // may keep an inherited handle open, so bound each drain wait.
             if let Some(reader) = readers.0 {
-                let _ = reader.await;
+                let _ = tokio::time::timeout(TERMINAL_OUTPUT_DRAIN_TIMEOUT, reader).await;
             }
             if let Some(reader) = readers.1 {
-                let _ = reader.await;
+                let _ = tokio::time::timeout(TERMINAL_OUTPUT_DRAIN_TIMEOUT, reader).await;
             }
 
             let active = self.active.lock().unwrap();

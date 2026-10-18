@@ -946,6 +946,7 @@ impl AppState {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_store(
         relay: Relay,
         config_path: PathBuf,

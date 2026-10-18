@@ -308,6 +308,7 @@ This evidence does **not** include a real Codex CLI invocation or any live-provi
 ### Known residual gaps carried into Wave D (and the separate Herdr run)
 
 - **Wave D findings remain open:** R12-12 Exchange state is memory-only and outbox ingestion is not idempotent; R12-13 delegation and Scheduler v2 remain nonrecoverable in-memory algorithms; R12-14 policy enforcement classes still overstate what Relay enforces.
+- The default v2 Run path cannot yet raise structured clarification or decision escalations required by AGENTS.md invariants 5–6 and §8: `OrchestratorV2` completes or fails with a typed error, and only the legacy v1 path escalates; this gap must be closed before the v1 path can be removed.
 - The v2 path has no cancel command, per-run model or effort selection (the TUI refuses overrides), live execution output on the execution screen, or provider-health display. The v1 `ExecutionScheduler` remains behind `RELAY_LEGACY_V1_RUN=1`; its removal is not done.
 - Only `CodexProviderAdapter` is wired into the local production composition. The Antigravity target has no production adapter and fails closed.
 - Production Herdr backplane work (R12-10) is a separate future run; the current Herdr shape is test-only.

@@ -307,6 +307,7 @@ Add focused integration tests for process boundaries, repository safety, recover
 2. **Wave A is LANDED** (governed re-review remains deferred). Wave B R12-02 is on draft PR #31; Wave C R12-09, R12-11, the local-process Run path, and TUI cutover are on stacked draft PR #32. Both PRs are unmerged and await the owner's merge decision; the governed re-review is also deferred. This stack is not a promoted production build.
 3. Next is **Wave D** (R12-12/13/14). Production Herdr backplane work, R12-10, is split into a separate future run.
 4. Residual gaps: Exchange/outbox idempotency, durable delegation and multi-project scheduler recovery, truthful policy enforcement, privileged/failure correctness, no v2 cancel command or per-run model/effort selection, no live execution output or provider-health display, only Codex is wired in the local composition, no real-provider smoke run, no production Herdr transport, and the v1 scheduler remains available behind its opt-in.
+   Additional gap: no clarification/decision escalation on the v2 path.
 5. If committed work on a branch contradicts `ROADMAP.md`, **report the drift to the maintainer**; do not rewrite the status tables yourself.
 
 ## 13. Working on this repository as a public project

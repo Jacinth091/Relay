@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    ApprovedIntentId, ConfigSnapshotId, ExecutionGrantId, Relay, SqliteStore, StoredTask,
-    SubmissionTransport, TaskId, TaskState, WorkflowRunId, durable_state::list_stored_tasks,
+    ApprovedIntentId, ConfigSnapshotId, ExecutionGrantId, ExecutionTarget, Relay, SqliteStore,
+    StoredTask, SubmissionTransport, TaskId, TaskState, WorkflowRunId,
+    durable_state::list_stored_tasks,
 };
 use relay_store::{
     CommandRecord, DaemonFence, DaemonLeaseRecord, EventRecord, NewPendingEffectRecord,
@@ -23,6 +24,7 @@ pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
 pub const DAEMON_PROTOCOL_NAME: &str = "relay.v2";
 pub const DEFAULT_LEASE_ID: &str = "relay-daemon-primary";
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(15);
+const FROZEN_PROVIDER_ADAPTER_VERSION: &str = "0.1.0";
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
@@ -1024,14 +1026,36 @@ impl DaemonServer {
                     deterministic_command_id(command_id, "intent")
                 ));
 
+                let trusted_relay = self.trusted_registry_for_submission()?;
+                let project = trusted_relay
+                    .project_registry()
+                    .get(stored_task.project_key.as_str())
+                    .map_err(|_| {
+                        DaemonError::Command(format!(
+                            "project '{}' is not registered",
+                            stored_task.project_key
+                        ))
+                    })?;
+                let stack = stored_task
+                    .handoff
+                    .stack
+                    .as_deref()
+                    .or_else(|| project.default_stack())
+                    .ok_or_else(|| {
+                        DaemonError::Command("no runtime stack is configured".to_owned())
+                    })?;
+                let execution_target = execution_target_for_stack(stack)?;
+
                 let default_budget = crate::ExecutionBudget::default();
-                let (mut grant, mut run, mut snapshot) = crate::create_v1_compatibility_run(
-                    &stored_task,
-                    &intent,
-                    default_budget,
-                    granted_by,
-                )
-                .map_err(|e| DaemonError::Command(e.to_string()))?;
+                let (mut grant, mut run, mut snapshot) =
+                    crate::create_v1_compatibility_run_with_target(
+                        &stored_task,
+                        &intent,
+                        execution_target,
+                        default_budget,
+                        granted_by,
+                    )
+                    .map_err(|e| DaemonError::Command(e.to_string()))?;
 
                 grant.id = ExecutionGrantId(format!(
                     "grant-{}",
@@ -1278,6 +1302,24 @@ fn deterministic_command_id(command_id: &str, label: &str) -> String {
     )
     .simple()
     .to_string()
+}
+
+fn execution_target_for_stack(stack: &str) -> Result<ExecutionTarget, DaemonError> {
+    let (provider_id, runtime_profile_id) = match stack {
+        "chatgpt-codex" | "codex" => ("codex", "codex/default"),
+        "antigravity" | "agy" => ("antigravity", "antigravity/default"),
+        other => {
+            return Err(DaemonError::Command(format!(
+                "unsupported runtime stack '{other}'"
+            )));
+        }
+    };
+
+    Ok(ExecutionTarget {
+        provider_id: provider_id.to_owned(),
+        runtime_profile_id: runtime_profile_id.to_owned(),
+        provider_adapter_version: FROZEN_PROVIDER_ADAPTER_VERSION.to_owned(),
+    })
 }
 
 fn hostname() -> String {

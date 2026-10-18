@@ -21,7 +21,7 @@
 //! 4. Unbounded remediation is strictly halted by execution budget limits.
 //! 5. Execution state transitions are persisted durably in SQLite for restart rehydration.
 
-use std::{collections::HashSet, path::Path, sync::Arc};
+use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
 
 use relay_runtime::{
     EffectKey, LaunchContext, LaunchSpecification, ProcessStatus, ProviderAdapter, ProviderError,
@@ -349,6 +349,7 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
         record_role_attempt_lease(&self.store, &attempt, fence).await?;
 
         // Provision on RuntimeBackplane
+        let executable = launch.executable.clone();
         let prov_req = RuntimeProvisionRequest::new(
             effect_key,
             attempt.id.to_string(),
@@ -358,11 +359,29 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
             1024 * 1024,
         );
 
-        let handle = self
-            .backplane
-            .provision(prov_req)
-            .await
-            .map_err(|e| OrchestratorError::Backplane(e.to_string()))?;
+        let handle = match self.backplane.provision(prov_req).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                let reason = match error {
+                    relay_runtime::BackplaneError::LaunchFailed(reason) => format!(
+                        "provider executable '{}' could not be started: {reason}",
+                        executable.display()
+                    ),
+                    other => other.to_string(),
+                };
+                self.fail_attempt_before_launch(
+                    &mut attempt,
+                    &mut implementer_instance,
+                    reason.clone(),
+                    fence,
+                )
+                .await?;
+                self.scheduler
+                    .release_slot(&slot.slot_id, &self.store)
+                    .await;
+                return Err(OrchestratorError::Backplane(reason));
+            }
+        };
 
         // Record the process identity durably so a restarted daemon can
         // reconcile the process this attempt actually launched.
@@ -371,11 +390,23 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
         record_role_attempt_runtime_handle(&self.store, &attempt, fence).await?;
 
         // Observe process execution
-        let observation = self
-            .backplane
-            .observe(&handle)
-            .await
-            .map_err(|e| OrchestratorError::Backplane(e.to_string()))?;
+        let observation = match self.observe_until_terminal(&handle, budget).await {
+            Ok(observation) => observation,
+            Err(error) => {
+                self.fail_attempt_before_launch(
+                    &mut attempt,
+                    &mut implementer_instance,
+                    error.to_string(),
+                    fence,
+                )
+                .await?;
+                let _ = self.backplane.dispose(&handle).await;
+                self.scheduler
+                    .release_slot(&slot.slot_id, &self.store)
+                    .await;
+                return Err(error);
+            }
+        };
 
         // INVARIANT: Process success alone NEVER completes a role instance!
         if !matches!(observation.status, ProcessStatus::ExitedSuccess { .. }) {
@@ -579,6 +610,7 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
         update_durable_role_attempt(&self.store, &attempt, fence).await?;
 
         // Backplane provision & observe
+        let executable = launch.executable.clone();
         let prov_req = RuntimeProvisionRequest::new(
             effect_key,
             attempt.id.to_string(),
@@ -588,11 +620,29 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
             1024 * 1024,
         );
 
-        let handle = self
-            .backplane
-            .provision(prov_req)
-            .await
-            .map_err(|e| OrchestratorError::Backplane(e.to_string()))?;
+        let handle = match self.backplane.provision(prov_req).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                let reason = match error {
+                    relay_runtime::BackplaneError::LaunchFailed(reason) => format!(
+                        "provider executable '{}' could not be started: {reason}",
+                        executable.display()
+                    ),
+                    other => other.to_string(),
+                };
+                self.fail_attempt_before_launch(
+                    &mut attempt,
+                    &mut verifier_instance,
+                    reason.clone(),
+                    fence,
+                )
+                .await?;
+                self.scheduler
+                    .release_slot(&slot.slot_id, &self.store)
+                    .await;
+                return Err(OrchestratorError::Backplane(reason));
+            }
+        };
 
         // Record the process identity durably so a restarted daemon can
         // reconcile the process this attempt actually launched.
@@ -600,11 +650,23 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
         attempt.runtime_backplane_id = Some(handle.backplane_id.to_string());
         record_role_attempt_runtime_handle(&self.store, &attempt, fence).await?;
 
-        let observation = self
-            .backplane
-            .observe(&handle)
-            .await
-            .map_err(|e| OrchestratorError::Backplane(e.to_string()))?;
+        let observation = match self.observe_until_terminal(&handle, budget).await {
+            Ok(observation) => observation,
+            Err(error) => {
+                self.fail_attempt_before_launch(
+                    &mut attempt,
+                    &mut verifier_instance,
+                    error.to_string(),
+                    fence,
+                )
+                .await?;
+                let _ = self.backplane.dispose(&handle).await;
+                self.scheduler
+                    .release_slot(&slot.slot_id, &self.store)
+                    .await;
+                return Err(error);
+            }
+        };
 
         let _ = self.backplane.dispose(&handle).await;
         self.scheduler
@@ -791,6 +853,42 @@ impl<B: RuntimeBackplane> OrchestratorV2<B> {
         role_instance.fail();
         update_durable_role_instance(&self.store, role_instance, fence).await?;
         Ok(())
+    }
+
+    async fn observe_until_terminal(
+        &self,
+        handle: &RuntimeHandle,
+        budget: &ExecutionBudget,
+    ) -> Result<relay_runtime::RuntimeObservation, OrchestratorError> {
+        let started = tokio::time::Instant::now();
+        loop {
+            let observation = self
+                .backplane
+                .observe(handle)
+                .await
+                .map_err(|error| OrchestratorError::Backplane(error.to_string()))?;
+            if !matches!(
+                observation.status,
+                ProcessStatus::Starting | ProcessStatus::Running
+            ) {
+                return Ok(observation);
+            }
+
+            let delay = match budget.max_wall_clock_secs {
+                Some(seconds) => {
+                    let limit = Duration::from_secs(seconds);
+                    let elapsed = started.elapsed();
+                    if elapsed >= limit {
+                        return Err(OrchestratorError::Backplane(format!(
+                            "provider process exceeded the wall-clock budget of {seconds} seconds"
+                        )));
+                    }
+                    Duration::from_millis(50).min(limit - elapsed)
+                }
+                None => Duration::from_millis(50),
+            };
+            tokio::time::sleep(delay).await;
+        }
     }
 
     /// Refuses an attempt whose published result cannot be accepted.

@@ -81,6 +81,8 @@ struct ProcessSlot {
     stdin_tx: Option<mpsc::Sender<Vec<u8>>>,
     stdout_buf: Arc<Mutex<Vec<u8>>>,
     stderr_buf: Arc<Mutex<Vec<u8>>>,
+    stdout_reader: Option<tokio::task::JoinHandle<()>>,
+    stderr_reader: Option<tokio::task::JoinHandle<()>>,
     exited_code: Option<Option<i32>>,
 }
 
@@ -172,7 +174,7 @@ impl RuntimeBackplane for LocalProcessBackplane {
             let stderr_buf = Arc::new(Mutex::new(Vec::new()));
 
             // Stream stdout in background task
-            if let Some(mut stdout) = child.stdout.take() {
+            let stdout_reader = child.stdout.take().map(|mut stdout| {
                 let sbuf = stdout_buf.clone();
                 let limit = req.output_byte_limit;
                 tokio::spawn(async move {
@@ -187,11 +189,11 @@ impl RuntimeBackplane for LocalProcessBackplane {
                             b.extend_from_slice(&chunk[..take]);
                         }
                     }
-                });
-            }
+                })
+            });
 
             // Stream stderr in background task
-            if let Some(mut stderr) = child.stderr.take() {
+            let stderr_reader = child.stderr.take().map(|mut stderr| {
                 let sbuf = stderr_buf.clone();
                 let limit = req.output_byte_limit;
                 tokio::spawn(async move {
@@ -206,8 +208,8 @@ impl RuntimeBackplane for LocalProcessBackplane {
                             b.extend_from_slice(&chunk[..take]);
                         }
                     }
-                });
-            }
+                })
+            });
 
             // Setup stdin channel to avoid holding mutex locks across async writes
             let stdin_tx = if let Some(mut stdin) = child.stdin.take() {
@@ -233,6 +235,8 @@ impl RuntimeBackplane for LocalProcessBackplane {
                 stdin_tx,
                 stdout_buf,
                 stderr_buf,
+                stdout_reader,
+                stderr_reader,
                 exited_code: None,
             };
 
@@ -248,25 +252,52 @@ impl RuntimeBackplane for LocalProcessBackplane {
 
     fn observe<'a>(&'a self, handle: &'a RuntimeHandle) -> BackplaneFuture<'a, RuntimeObservation> {
         Box::pin(async move {
-            let mut active = self.active.lock().unwrap();
-            let slot = active
-                .get_mut(&handle.handle_id)
-                .ok_or_else(|| BackplaneError::HandleNotFound(handle.handle_id.clone()))?;
+            let (status, readers) = {
+                let mut active = self.active.lock().unwrap();
+                let slot = active
+                    .get_mut(&handle.handle_id)
+                    .ok_or_else(|| BackplaneError::HandleNotFound(handle.handle_id.clone()))?;
 
-            // Poll child exit status non-blockingly
-            if slot.exited_code.is_none() {
-                if let Ok(Some(status)) = slot.child.try_wait() {
-                    slot.exited_code = Some(status.code());
+                // Poll child exit status non-blockingly.
+                if slot.exited_code.is_none() {
+                    if let Ok(Some(status)) = slot.child.try_wait() {
+                        slot.exited_code = Some(status.code());
+                    }
                 }
-            }
 
-            let status = match slot.exited_code {
-                Some(Some(0)) => ProcessStatus::ExitedSuccess { exit_code: 0 },
-                Some(Some(c)) => ProcessStatus::ExitedFailure { exit_code: Some(c) },
-                Some(None) => ProcessStatus::ExitedFailure { exit_code: None },
-                None => ProcessStatus::Running,
+                let status = match slot.exited_code {
+                    Some(Some(0)) => ProcessStatus::ExitedSuccess { exit_code: 0 },
+                    Some(Some(code)) => ProcessStatus::ExitedFailure {
+                        exit_code: Some(code),
+                    },
+                    Some(None) => ProcessStatus::ExitedFailure { exit_code: None },
+                    None => ProcessStatus::Running,
+                };
+                let readers = if matches!(
+                    status,
+                    ProcessStatus::ExitedSuccess { .. } | ProcessStatus::ExitedFailure { .. }
+                ) {
+                    (slot.stdout_reader.take(), slot.stderr_reader.take())
+                } else {
+                    (None, None)
+                };
+                (status, readers)
             };
 
+            // A terminal process closes both pipes. Drain their reader tasks
+            // before returning the final observation so its typed result is not
+            // lost to a race between process exit and pipe capture.
+            if let Some(reader) = readers.0 {
+                let _ = reader.await;
+            }
+            if let Some(reader) = readers.1 {
+                let _ = reader.await;
+            }
+
+            let active = self.active.lock().unwrap();
+            let slot = active
+                .get(&handle.handle_id)
+                .ok_or_else(|| BackplaneError::HandleNotFound(handle.handle_id.clone()))?;
             let stdout_chunk = slot.stdout_buf.lock().unwrap().clone();
             let stderr_chunk = slot.stderr_buf.lock().unwrap().clone();
             let total = stdout_chunk.len() + stderr_chunk.len();

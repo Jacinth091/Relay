@@ -34,16 +34,20 @@ use relay_core::{
     OrchestratorError, OrchestratorV2, PhaseContext, ProjectId, ProjectKey, ProjectRegistry,
     RegisterProject, Relay, RoleAttemptState, RoleDefinitionId, RoleInstance, SchedulerV2,
     SchedulerV2Config, SqliteStore, StoredTask, SubmissionTransport, TaskId, TaskState,
-    WorkflowDriverContext, WorkflowRun, WorkflowRunContextResolver, WorkflowRunId,
-    WorkflowRunState, adapt_v1_handoff_to_approved_intent, create_v1_compatibility_run,
-    get_durable_workflow_run, get_stored_task, list_role_attempts_for_instance,
-    list_role_instances_for_run, persist_role_attempt_if_absent, persist_role_instance_if_absent,
-    record_role_attempt_runtime_handle, run_full_daemon, run_full_daemon_with_workflow_driver,
+    TrustedRunContextResolver, WorkflowDriverContext, WorkflowRun, WorkflowRunContextFuture,
+    WorkflowRunContextResolver, WorkflowRunId, WorkflowRunState,
+    adapt_v1_handoff_to_approved_intent, create_v1_compatibility_run,
+    create_v1_compatibility_run_with_target, get_durable_workflow_run, get_stored_task,
+    list_role_attempts_for_instance, list_role_instances_for_run, persist_role_attempt_if_absent,
+    persist_role_instance_if_absent, record_role_attempt_runtime_handle, run_full_daemon,
+    run_full_daemon_with_workflow_driver,
 };
 use relay_protocol::{AmbiguityPolicy, HandoffTask, TaskSpec};
 use relay_runtime::{
-    EffectKey, LaunchSpecification, MockProviderAdapter, ProviderAdapter, ProviderCapabilities,
-    RuntimeBackplane, RuntimeProvisionRequest, SanitizedEnvironment,
+    CodexProviderAdapter, EffectKey, LaunchSpecification, LocalProcessBackplane,
+    MockProviderAdapter, ProcessStatus, ProviderAdapter, ProviderCapabilities, ProviderError,
+    ProviderHealthSnapshot, ProviderId, ProviderReadiness, RuntimeBackplane, RuntimeObservation,
+    RuntimeProvisionRequest, SanitizedEnvironment,
 };
 use relay_runtime_fake::{FakeBackplane, FakeProcessBehavior};
 use relay_store::{DaemonFence, NewTaskRecord, NewWorkflowRunRecord, WorkflowRunStart};
@@ -77,6 +81,21 @@ fn init_git_repo(path: &Path) {
     run(&["commit", "-m", "initial commit"]);
 }
 
+fn run_git(path: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .expect("git command failed");
+    assert!(
+        output.status.success(),
+        "git command {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
 fn budget() -> ExecutionBudget {
     ExecutionBudget {
         max_role_activations: 5,
@@ -107,13 +126,15 @@ struct FixedContextResolver {
 }
 
 impl WorkflowRunContextResolver for FixedContextResolver {
-    fn resolve(&self, _run: &WorkflowRun) -> Result<WorkflowDriverContext, String> {
-        Ok(WorkflowDriverContext {
-            project_id: self.project_id.clone(),
-            checkout_id: CheckoutId::generate(),
-            working_directory: self.working_directory.clone(),
-            execution_target: fake_target(),
-            budget: budget(),
+    fn resolve<'a>(&'a self, _run: &'a WorkflowRun) -> WorkflowRunContextFuture<'a> {
+        Box::pin(async move {
+            Ok(WorkflowDriverContext {
+                project_id: self.project_id.clone(),
+                checkout_id: CheckoutId::generate(),
+                working_directory: self.working_directory.clone(),
+                execution_target: fake_target(),
+                budget: budget(),
+            })
         })
     }
 }
@@ -134,7 +155,7 @@ fn test_relay(project_path: &Path) -> Relay {
             name: None,
             local_path: project_path.to_path_buf(),
             expected_remote: None,
-            default_stack: None,
+            default_stack: Some("codex".to_owned()),
             github: None,
         })
         .unwrap();
@@ -308,6 +329,127 @@ fn test_provider_adapters() -> Vec<Arc<dyn ProviderAdapter>> {
     vec![adapter]
 }
 
+struct LocalEchoProvider;
+
+impl ProviderAdapter for LocalEchoProvider {
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::new("codex")
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supported_roles: ["implementer", "verifier"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            filesystem_write: true,
+            network: false,
+            streaming_output: true,
+            cancellation: true,
+            supported_models: vec!["default".to_owned()],
+        }
+    }
+
+    fn health_check(&self) -> ProviderHealthSnapshot {
+        ProviderHealthSnapshot::Healthy
+    }
+
+    fn build_launch(
+        &self,
+        _target: &relay_runtime::ExecutionTarget,
+        _attempt: &relay_runtime::RoleAttempt,
+        context: &relay_runtime::LaunchContext,
+    ) -> Result<LaunchSpecification, ProviderError> {
+        let role = context
+            .role_prompt
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("Role: "))
+            .ok_or_else(|| {
+                ProviderError::LaunchBuildFailed("missing role prompt kind".to_owned())
+            })?;
+        let result = match role {
+            "implementer" => r#"{"role_result":"implemented","detail":"local provider completed"}"#,
+            "verifier" => r#"{"role_result":"verification_passed"}"#,
+            other => {
+                return Err(ProviderError::LaunchBuildFailed(format!(
+                    "unsupported local test role '{other}'"
+                )));
+            }
+        };
+
+        Ok(LaunchSpecification::new(
+            "powershell.exe",
+            vec![
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-Command".to_owned(),
+                format!("Write-Output '{result}'"),
+            ],
+        ))
+    }
+
+    fn interpret_observation(&self, observation: &RuntimeObservation) -> ProviderReadiness {
+        match &observation.status {
+            ProcessStatus::ExitedSuccess { .. } => ProviderReadiness::ResultPublished,
+            ProcessStatus::ExitedFailure { exit_code } => ProviderReadiness::ProviderError {
+                reason: format!("local provider exited with {exit_code:?}"),
+            },
+            ProcessStatus::Interrupted => ProviderReadiness::ProviderError {
+                reason: "local provider was interrupted".to_owned(),
+            },
+            ProcessStatus::Lost => ProviderReadiness::ProviderError {
+                reason: "local provider was lost".to_owned(),
+            },
+            ProcessStatus::Starting | ProcessStatus::Running => {
+                ProviderReadiness::ReadyForAssignment
+            }
+        }
+    }
+}
+
+fn codex_target() -> ExecutionTarget {
+    ExecutionTarget {
+        provider_id: "codex".to_owned(),
+        runtime_profile_id: "codex/default".to_owned(),
+        provider_adapter_version: "0.1.0".to_owned(),
+    }
+}
+
+fn save_project_registry(config_path: &Path, project_path: &Path, expected_remote: Option<&str>) {
+    let mut registry = ProjectRegistry::empty();
+    registry
+        .register(RegisterProject {
+            key: "wave-b-proj".to_owned(),
+            name: None,
+            local_path: project_path.to_path_buf(),
+            expected_remote: expected_remote.map(str::to_owned),
+            default_stack: Some("codex".to_owned()),
+            github: None,
+        })
+        .unwrap();
+    registry.save(config_path).unwrap();
+}
+
+async fn persist_context_test_run(
+    store: &SqliteStore,
+    task: &StoredTask,
+    fence: &DaemonFence,
+) -> WorkflowRun {
+    persist_task_row(store, task, fence).await;
+    let intent = adapt_v1_handoff_to_approved_intent(task, "operator-alice").unwrap();
+    let (grant, run, snapshot) = create_v1_compatibility_run_with_target(
+        task,
+        &intent,
+        codex_target(),
+        budget(),
+        "operator-alice",
+    )
+    .unwrap();
+    persist_approved_workflow_run(store, task, &intent, &grant, &run, &snapshot, fence).await;
+    run
+}
+
 /// Submits a daemon command and returns the raw response.
 ///
 /// `DaemonClient::submit_command` only reports the status, so these tests go
@@ -410,6 +552,100 @@ where
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("timed out waiting for {what}");
+}
+
+#[tokio::test]
+async fn trusted_run_context_creates_and_reuses_a_registered_git_worktree() {
+    let base = unique_temp_dir("trusted-run-context");
+    let repo = base.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    let config_path = base.join("config.toml");
+    save_project_registry(&config_path, &repo, None);
+
+    let store = SqliteStore::in_memory().await.unwrap();
+    let fence = lease_fence(&store, "lease-trusted-run-context", 7101).await;
+    let task = sample_task();
+    let run = persist_context_test_run(&store, &task, &fence).await;
+    let resolver = TrustedRunContextResolver::new(Some(config_path), store);
+
+    let first = resolver.resolve(&run).await.unwrap();
+    assert_eq!(first.execution_target, codex_target());
+    assert_eq!(first.budget, budget());
+    let allowed_root = repo.join(".relay").join("worktrees");
+    assert!(first.working_directory.starts_with(&allowed_root));
+    assert!(first.working_directory.join(".git").is_file());
+    let git_root = run_git(&first.working_directory, &["rev-parse", "--show-toplevel"]);
+    assert_eq!(
+        PathBuf::from(git_root).canonicalize().unwrap(),
+        first.working_directory.canonicalize().unwrap()
+    );
+
+    let second = resolver.resolve(&run).await.unwrap();
+    assert_eq!(second.working_directory, first.working_directory);
+}
+
+#[tokio::test]
+async fn trusted_run_context_rejects_unregistered_project() {
+    let base = unique_temp_dir("unregistered-run-context");
+    let repo = base.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    let config_path = base.join("config.toml");
+    ProjectRegistry::empty().save(&config_path).unwrap();
+
+    let store = SqliteStore::in_memory().await.unwrap();
+    let fence = lease_fence(&store, "lease-unregistered-run-context", 7102).await;
+    let task = sample_task();
+    let run = persist_context_test_run(&store, &task, &fence).await;
+    let resolver = TrustedRunContextResolver::new(Some(config_path), store);
+
+    let error = resolver.resolve(&run).await.unwrap_err();
+    assert_eq!(error, "project 'wave-b-proj' is not registered");
+}
+
+#[tokio::test]
+async fn trusted_run_context_fails_closed_without_a_registry_path() {
+    let store = SqliteStore::in_memory().await.unwrap();
+    let fence = lease_fence(&store, "lease-missing-registry-run-context", 7104).await;
+    let task = sample_task();
+    let run = persist_context_test_run(&store, &task, &fence).await;
+    let resolver = TrustedRunContextResolver::new(None, store);
+
+    let error = resolver.resolve(&run).await.unwrap_err();
+    assert_eq!(error, "no trusted project registry is configured");
+}
+
+#[tokio::test]
+async fn trusted_run_context_rejects_registered_remote_mismatch() {
+    let base = unique_temp_dir("remote-mismatch-run-context");
+    let repo = base.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    run_git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/actual/repo.git",
+        ],
+    );
+    let config_path = base.join("config.toml");
+    save_project_registry(
+        &config_path,
+        &repo,
+        Some("https://github.com/expected/repo.git"),
+    );
+
+    let store = SqliteStore::in_memory().await.unwrap();
+    let fence = lease_fence(&store, "lease-remote-mismatch-run-context", 7103).await;
+    let task = sample_task();
+    let run = persist_context_test_run(&store, &task, &fence).await;
+    let resolver = TrustedRunContextResolver::new(Some(config_path), store);
+
+    let error = resolver.resolve(&run).await.unwrap_err();
+    assert!(error.contains("remote fingerprint mismatch"), "{error}");
 }
 
 /// Every artifact blob payload stored under `root`, so assertions can prove the
@@ -543,6 +779,139 @@ async fn a_ready_handoff_reaches_complete_through_daemon_and_backplane() {
             .iter()
             .any(|payload| payload.contains("\"detail\":\"wrote feature.txt\"")),
         "the implementation artifact must store the result the role published, not a summary"
+    );
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn approved_run_completes_through_local_process_backplane_and_trusted_resolver() {
+    let base = unique_temp_dir("local-process-run");
+    let repo = base.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    let config_path = base.join("config.toml");
+    save_project_registry(&config_path, &repo, None);
+
+    let store = SqliteStore::in_memory().await.unwrap();
+    let relay = Relay::load_from_config_path(&config_path).unwrap();
+    let resolver = Arc::new(TrustedRunContextResolver::new(
+        Some(config_path),
+        store.clone(),
+    ));
+    let (server, daemon) = run_full_daemon_with_workflow_driver(
+        store.clone(),
+        relay,
+        "lease-local-process-run",
+        Duration::from_secs(60),
+        base.join("artifacts"),
+        Arc::new(LocalProcessBackplane::default()),
+        resolver,
+        vec![Arc::new(LocalEchoProvider)],
+    )
+    .await
+    .unwrap();
+
+    let (task_id, run_id) = approve_run(&server, "cmd-local-process-run").await;
+    let poll_store = store.clone();
+    let poll_task = task_id.clone();
+    let poll_run = run_id.clone();
+    wait_for(
+        || {
+            let store = poll_store.clone();
+            let task_id = poll_task.clone();
+            let run_id = poll_run.clone();
+            async move {
+                stored_task_state(&store, &task_id).await == TaskState::Done
+                    && run_state(&store, &run_id).await == "completed"
+            }
+        },
+        "the production-style local provider run to complete",
+    )
+    .await;
+
+    let worktree = repo
+        .join(".relay")
+        .join("worktrees")
+        .join(format!("relay-run-{run_id}"));
+    assert!(worktree.join(".git").is_file());
+    let canonical_worktree = worktree.canonicalize().unwrap();
+    let registered_worktree = run_git(&repo, &["worktree", "list", "--porcelain"])
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .any(|path| PathBuf::from(path).canonicalize().ok() == Some(canonical_worktree.clone()));
+    assert!(
+        registered_worktree,
+        "run worktree should be registered with Git"
+    );
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn missing_codex_executable_fails_the_attempt_and_run_with_a_clear_reason() {
+    let base = unique_temp_dir("missing-codex-executable");
+    let repo = base.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    let config_path = base.join("config.toml");
+    save_project_registry(&config_path, &repo, None);
+
+    let store = SqliteStore::in_memory().await.unwrap();
+    let relay = Relay::load_from_config_path(&config_path).unwrap();
+    let resolver = Arc::new(TrustedRunContextResolver::new(
+        Some(config_path),
+        store.clone(),
+    ));
+    let missing_executable = base.join("missing-codex.exe");
+    let (server, daemon) = run_full_daemon_with_workflow_driver(
+        store.clone(),
+        relay,
+        "lease-missing-codex-executable",
+        Duration::from_secs(60),
+        base.join("artifacts"),
+        Arc::new(LocalProcessBackplane::default()),
+        resolver,
+        vec![Arc::new(CodexProviderAdapter::with_executable(
+            missing_executable.to_string_lossy().into_owned(),
+        ))],
+    )
+    .await
+    .unwrap();
+
+    let (task_id, run_id) = approve_run(&server, "cmd-missing-codex-executable").await;
+    let poll_store = store.clone();
+    let poll_task = task_id.clone();
+    let poll_run = run_id.clone();
+    wait_for(
+        || {
+            let store = poll_store.clone();
+            let task_id = poll_task.clone();
+            let run_id = poll_run.clone();
+            async move {
+                stored_task_state(&store, &task_id).await == TaskState::Failed
+                    && run_state(&store, &run_id).await == "failed"
+            }
+        },
+        "the missing Codex executable to fail the approved run",
+    )
+    .await;
+
+    let instances = list_role_instances_for_run(&store, &WorkflowRunId(run_id))
+        .await
+        .unwrap();
+    let implementer = instances
+        .iter()
+        .find(|instance| instance.role_definition_id.0 == "implementer")
+        .expect("the implementer attempt should be recorded");
+    let attempts = list_role_attempts_for_instance(&store, &implementer.id)
+        .await
+        .unwrap();
+    assert!(
+        attempts[0]
+            .runtime_outcome
+            .as_deref()
+            .is_some_and(|reason| reason.contains("provider executable '")
+                && reason.contains("could not be started:"))
     );
 
     daemon.shutdown().await;

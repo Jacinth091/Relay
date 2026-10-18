@@ -5,7 +5,7 @@
 //! connecting to an already-running daemon or embedding one in-process when
 //! none is running yet.
 
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use tokio::sync::watch;
 
@@ -177,13 +177,16 @@ pub struct WorkflowDriverContext {
     pub budget: crate::ExecutionBudget,
 }
 
+pub type WorkflowRunContextFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<WorkflowDriverContext, String>> + Send + 'a>>;
+
 /// Resolves the trusted execution context for an approved workflow run.
 ///
 /// The host supplies this because only the host knows how a frozen
 /// `ConfigSnapshot` maps onto a registered project and a concrete provider
 /// target. The driver never invents a workspace.
 pub trait WorkflowRunContextResolver: Send + Sync {
-    fn resolve(&self, run: &crate::WorkflowRun) -> Result<WorkflowDriverContext, String>;
+    fn resolve<'a>(&'a self, run: &'a crate::WorkflowRun) -> WorkflowRunContextFuture<'a>;
 }
 
 /// Drives approved v2 workflow runs until shutdown.
@@ -235,14 +238,37 @@ pub async fn run_workflow_driver<B, R>(
                         return;
                     }
 
-                    let context = match resolver.resolve(&run) {
+                    let context = match resolver.resolve(&run).await {
                         Ok(context) => context,
                         Err(reason) => {
+                            let failure = format!("execution context resolution failed: {reason}");
                             tracing::warn!(
                                 run = %run.id.0,
-                                %reason,
-                                "no execution context for workflow run"
+                                error = %failure,
+                                "workflow run cannot resolve a trusted execution context"
                             );
+                            if let Err(err) = fail_workflow_run(
+                                &store,
+                                &run,
+                                &fence,
+                                "execution_context",
+                                &failure,
+                            )
+                            .await
+                            {
+                                if matches!(err, StoreError::DaemonAuthorityLost { .. }) {
+                                    tracing::warn!(
+                                        error = %err,
+                                        "workflow driver lost daemon authority while recording context failure; stopping"
+                                    );
+                                    return;
+                                }
+                                tracing::error!(
+                                    run = %run.id.0,
+                                    error = %err,
+                                    "failed to persist workflow context failure"
+                                );
+                            }
                             continue;
                         }
                     };
@@ -289,6 +315,30 @@ pub async fn run_workflow_driver<B, R>(
                                 }
                             }
                         }
+                        Ok(crate::WorkflowRunState::Failed) => {
+                            if let Err(err) = fail_workflow_run(
+                                &store,
+                                &run,
+                                &fence,
+                                "workflow_execution",
+                                "workflow orchestrator returned a failed state",
+                            )
+                            .await
+                            {
+                                if matches!(err, StoreError::DaemonAuthorityLost { .. }) {
+                                    tracing::warn!(
+                                        error = %err,
+                                        "workflow driver lost daemon authority while publishing failure; stopping"
+                                    );
+                                    return;
+                                }
+                                tracing::error!(
+                                    run = %run.id.0,
+                                    error = %err,
+                                    "failed to publish workflow failure"
+                                );
+                            }
+                        }
                         Ok(_) => {}
                         Err(err) if err.is_authority_lost() => {
                             tracing::warn!(
@@ -299,34 +349,33 @@ pub async fn run_workflow_driver<B, R>(
                             return;
                         }
                         Err(err) => {
-                            // A run that cannot complete stays active and durable;
-                            // the failure is recorded rather than swallowed.
+                            // A provider/orchestration failure is terminal for this
+                            // compatibility run; leave a durable typed state and
+                            // user-facing task failure instead of retrying forever.
                             tracing::warn!(
                                 run = %run.id.0,
                                 error = %err,
                                 "workflow drive attempt failed"
                             );
-                            let task_id = run.task_id.to_string();
-                            // The event JSON carries the workflow run id. The
-                            // `execution_id` column keys the v1 `executions`
-                            // table, so it stays NULL for a v2 workflow event.
-                            let payload = serde_json::json!({
-                                "workflow_run_id": run.id.0,
-                                "error": err.to_string(),
-                            })
-                            .to_string();
-                            if let Err(append_err) = store
-                                .append_event_fenced(
-                                    Some(task_id.as_str()),
-                                    None,
-                                    "workflow_drive_failed",
-                                    Some(&payload),
-                                    &fence,
-                                )
-                                .await
+                            if let Err(persist_err) = fail_workflow_run(
+                                &store,
+                                &run,
+                                &fence,
+                                "workflow_execution",
+                                &err.to_string(),
+                            )
+                            .await
                             {
+                                if matches!(persist_err, StoreError::DaemonAuthorityLost { .. }) {
+                                    tracing::warn!(
+                                        error = %persist_err,
+                                        "workflow driver lost daemon authority while recording execution failure; stopping"
+                                    );
+                                    return;
+                                }
                                 tracing::error!(
-                                    error = %append_err,
+                                    run = %run.id.0,
+                                    error = %persist_err,
                                     "failed to record workflow drive failure"
                                 );
                             }
@@ -348,6 +397,46 @@ pub async fn run_workflow_driver<B, R>(
             }
         }
     }
+}
+
+async fn fail_workflow_run(
+    store: &SqliteStore,
+    run: &crate::WorkflowRun,
+    fence: &relay_store::DaemonFence,
+    failure_kind: &str,
+    reason: &str,
+) -> Result<(), StoreError> {
+    store
+        .update_workflow_run_state_fenced(&run.id.0, "failed", fence)
+        .await?;
+
+    let task_id = run.task_id.to_string();
+    match store
+        .update_task_state_fenced(&task_id, "running", "failed", fence)
+        .await
+    {
+        Ok(_) => {}
+        Err(StoreError::StateConflict { actual_state, .. }) if actual_state == "failed" => {}
+        Err(error) => return Err(error),
+    }
+
+    let payload = serde_json::json!({
+        "workflow_run_id": run.id.0,
+        "failure_kind": failure_kind,
+        "error": reason,
+        "state": "failed",
+    })
+    .to_string();
+    store
+        .append_event_fenced(
+            Some(task_id.as_str()),
+            None,
+            "workflow_drive_failed",
+            Some(&payload),
+            fence,
+        )
+        .await?;
+    Ok(())
 }
 
 /// Starts a full daemon: acquires the exclusive lease, runs startup command

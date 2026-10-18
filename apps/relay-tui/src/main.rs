@@ -25,6 +25,7 @@ pub(crate) use ui::render;
 use std::{
     error::Error,
     io::{self, Stdout},
+    sync::Arc,
 };
 
 use crossterm::{
@@ -37,6 +38,7 @@ use relay_core::{
     DEFAULT_LEASE_ID, DEFAULT_LEASE_TTL, Relay, connect_or_embed, default_config_path,
     default_database_path,
 };
+use relay_runtime::{CodexProviderAdapter, LocalProcessBackplane};
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -197,12 +199,30 @@ async fn run_daemon(lease_id: String, lease_ttl_secs: u64) -> Result<(), Box<dyn
     })?;
 
     let ttl = std::time::Duration::from_secs(lease_ttl_secs);
-    let (daemon, mut embedded) = relay_core::run_full_daemon(store, relay, &lease_id, ttl)
-        .await
-        .map_err(|error| {
-            eprintln!("relay: failed to start daemon: {error}");
-            error
-        })?;
+    let resolver_config_path = config_path.is_file().then(|| config_path.clone());
+    let artifact_root = database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("artifacts");
+    let resolver = Arc::new(relay_core::TrustedRunContextResolver::new(
+        resolver_config_path,
+        store.clone(),
+    ));
+    let (daemon, mut embedded) = relay_core::run_full_daemon_with_workflow_driver(
+        store,
+        relay,
+        &lease_id,
+        ttl,
+        artifact_root,
+        Arc::new(LocalProcessBackplane::default()),
+        resolver,
+        vec![Arc::new(CodexProviderAdapter::new())],
+    )
+    .await
+    .map_err(|error| {
+        eprintln!("relay: failed to start daemon: {error}");
+        error
+    })?;
 
     tracing::info!(
         lease_id = %lease_id,

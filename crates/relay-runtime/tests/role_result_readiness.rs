@@ -25,12 +25,13 @@ fn implementer_caps() -> ProviderCapabilities {
 
 /// Every adapter that derives readiness from `ProcessStatus` + stdout.
 fn adapters() -> Vec<(&'static str, Box<dyn ProviderAdapter>)> {
-    let mut adapters: Vec<(&'static str, Box<dyn ProviderAdapter>)> = Vec::new();
-    adapters.push((
-        "mock",
-        Box::new(MockProviderAdapter::new("mock", implementer_caps())),
-    ));
-    adapters.push(("codex", Box::new(CodexProviderAdapter::new())));
+    let adapters: Vec<(&'static str, Box<dyn ProviderAdapter>)> = vec![
+        (
+            "mock",
+            Box::new(MockProviderAdapter::new("mock", implementer_caps())),
+        ),
+        ("codex", Box::new(CodexProviderAdapter::new())),
+    ];
     adapters
 }
 
